@@ -33,7 +33,17 @@ std::vector<PointT> windowOf(const std::vector<PointT>& points, int width) {
 // chart's top line. Overflow-safe: the value is clamped to max first, then
 // scaled via a division-first long-double form, because even a clamped
 // value * span multiply overflows uint64 when both near UINT64_MAX.
+// Regression (ASan heap-buffer-overflow, intermittent TUI crashes during
+// long dialog drives): with rows == 1 the span below is max(1, rows - 1) == 1,
+// so every value below the max scaled to 0 and the returned row was 1 — one
+// PAST the single-row grid. sparkGrid then wrote `grid[1][column] = '*'`,
+// up to `width` bytes past a 24-byte heap buffer: random heap corruption
+// (crash victims elsewhere: proto string headers, malloc freelist, ftxui
+// std::functions). A one-row grid can only ever paint row 0.
 int rowFor(uint64_t value, uint64_t max, int rows) {
+  if (rows <= 1) {
+    return 0;
+  }
   const int span = std::max(1, rows - 1);
   const uint64_t ceiling = std::max<uint64_t>(max, 1);
   const uint64_t clamped = std::min(value, ceiling);

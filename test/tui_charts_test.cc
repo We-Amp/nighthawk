@@ -263,6 +263,41 @@ TEST(ChartsTest, ChartsTolerateDegenerateWidthsAndExtremeValues) {
   RenderCounterLine({CounterPoint{1, 5}}, "benchmark.http_2xx", -5, 10);
 }
 
+TEST(ChartsTest, CounterLineSingleRowGridStaysInBounds) {
+  // Regression (ASan heap-buffer-overflow): a 1-row grid (pane height 2) made
+  // rowFor return row 1 for every point below the max — grid[1] past the end
+  // of a 1-element vector<string>. This is the live-run crash signature: many
+  // counter series give each counter line a 1-row sparkline, and the OOB
+  // writes trash unrelated heap (later victims: proto string headers,
+  // malloc freelist, ftxui std::functions).
+  std::vector<CounterPoint> points;
+  for (uint64_t i = 0; i < 40; ++i) {
+    points.push_back(CounterPoint{i, 1000 - i}); // values below the max
+  }
+  // height = 2 → sparkGrid rows = max(1, height - 1) = 1. Under ASan the
+  // unfixed renderer aborts here.
+  std::vector<std::string> lines = screenLines(RenderCounterLine(points, "benchmark.http_2xx", 60, 2), 60, 2);
+  ASSERT_GE(lines.size(), 1u);
+  // Every glyph lands inside the single chart row: nothing is drawn off-grid.
+  for (const std::string& line : lines) {
+    ASSERT_LE(line.size(), 61u);
+  }
+}
+
+TEST(ChartsTest, PercentileBandSingleRowGridStaysInBounds) {
+  // Same regression for the band: height 2 → band_rows = 1; every p50/p90/p99
+  // below the window max must stay inside the single row.
+  std::vector<PercentilePoint> points;
+  for (uint64_t i = 0; i < 40; ++i) {
+    points.push_back(PercentilePoint{i, /*p50_ns=*/1000, /*p90_ns=*/2000, /*p99_ns=*/3000});
+  }
+  std::vector<std::string> lines = screenLines(RenderPercentileBand(points, 60, 2), 60, 2);
+  ASSERT_GE(lines.size(), 1u);
+  for (const std::string& line : lines) {
+    ASSERT_LE(line.size(), 61u);
+  }
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client
