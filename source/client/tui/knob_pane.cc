@@ -45,10 +45,12 @@ std::vector<KnobDisplay> KnobsFromOptions(const nighthawk::client::CommandLineOp
                    KnobSteering::kLiveM3});
 
   // Spec §3 live set, knob 2: the ramp, carried by rate_limiter_plugin_config
-  // (the linear-ramping-rate-limiter plugin is M3's ramping vehicle).
+  // (the linear-ramping-rate-limiter plugin is M3's ramping vehicle). A
+  // present-but-empty plugin name is treated the same as absent: the vocabulary
+  // has no bare "configured" value.
   if (options.has_rate_limiter_plugin_config()) {
     const std::string& plugin_name = options.rate_limiter_plugin_config().name();
-    knobs.push_back({"ramp", plugin_name.empty() ? std::string("configured") : plugin_name,
+    knobs.push_back({"ramp", plugin_name.empty() ? std::string(kRampUnconfigured) : plugin_name,
                      KnobSteering::kLiveM3});
   } else {
     knobs.push_back({"ramp", kRampUnconfigured, KnobSteering::kLiveM3});

@@ -7,6 +7,8 @@
 #include "ftxui/dom/elements.hpp"
 #include "ftxui/screen/screen.hpp"
 
+#include "api/client/options.pb.h"
+
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/layout.h"
 #include "source/client/tui/run_view_model.h"
@@ -131,6 +133,36 @@ TEST(StatusBarTest, ShowsPhaseEpochPlaceholders) {
     empty_epoch += line + "\n";
   }
   EXPECT_NE(empty_epoch.find("epoch: (none)"), std::string::npos);
+}
+
+// Tab 1 renders the real knob pane from the run options (fix round: the k key
+// used to expose Task 5's static placeholder while the pane was test-only).
+TEST(LayoutTest, KnobsTabRendersTheKnobPane) {
+  nighthawk::client::CommandLineOptions options;
+  options.mutable_requests_per_second()->set_value(100);
+  ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate,
+                                        runningModel(), filledDialog(), kSessionPath, options);
+  std::string text;
+  for (const std::string& line : screenLines(element, 100, 30)) {
+    text += line + "\n";
+  }
+  EXPECT_NE(text.find("steering lands in M3"), std::string::npos);
+  EXPECT_NE(text.find("LIVE (M3)"), std::string::npos);
+  EXPECT_NE(text.find("PHASE-GATED"), std::string::npos);
+  EXPECT_NE(text.find("100"), std::string::npos);
+  EXPECT_EQ(text.find("knobs (M0b Task 6)"), std::string::npos);
+
+  // Before any run (defaulted empty options): the unset vocabulary, still no
+  // placeholder.
+  ftxui::Element defaults = RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate,
+                                         runningModel(), filledDialog(), kSessionPath);
+  std::string defaults_text;
+  for (const std::string& line : screenLines(defaults, 100, 30)) {
+    defaults_text += line + "\n";
+  }
+  EXPECT_NE(defaults_text.find("unset"), std::string::npos);
+  EXPECT_NE(defaults_text.find("not configured"), std::string::npos);
+  EXPECT_EQ(defaults_text.find("knobs (M0b Task 6)"), std::string::npos);
 }
 
 } // namespace

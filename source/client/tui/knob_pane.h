@@ -34,9 +34,10 @@ struct KnobDisplay {
 
 // The five knobs from the run options, in the canonical order above. "ramp"
 // reflects the rate_limiter_plugin_config (the linear-ramping-rate-limiter
-// plugin is M3's ramping vehicle); "queue bounds" folds max_pending_requests
-// and max_active_requests into one line. Values never render empty: unset
-// fields say "unset", an absent plugin says "not configured".
+// plugin is M3's ramping vehicle; a present-but-empty plugin name counts as
+// unconfigured); "queue bounds" folds max_pending_requests and
+// max_active_requests into one line. Values never render empty: unset fields
+// say "unset", an unconfigured ramp says "not configured".
 std::vector<KnobDisplay> KnobsFromOptions(const nighthawk::client::CommandLineOptions& options);
 
 // The knobs tab (tab 1): a display-only banner row followed by one line per

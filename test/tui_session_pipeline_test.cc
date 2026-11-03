@@ -31,6 +31,7 @@
 #include "source/client/tui/session_conversion.h"
 #include "source/client/tui/session_reader.h"
 #include "source/client/tui/session_writer.h"
+#include "source/client/tui/tui_app.h"
 
 using namespace std::chrono_literals;
 
@@ -442,6 +443,87 @@ TEST_F(SessionPipelineTest, CompletedRunWritesOutput) {
   }
   EXPECT_GT(counter_count, 0u);
   EXPECT_GT(series_count, 0u);
+}
+
+// The Ctrl-C / EOF teardown (fix round, regression test): the controller is
+// destroyed with the run live and finishSession never ran. ~RunController
+// cancels and joins the feed FIRST (feed_ is declared last, so members are
+// destroyed in the safe order), and the final read-thread callbacks — a last
+// onSnapshot enqueuing into the writer, a last onFinished locking the mutex —
+// find every other member alive. Pre-fix, the writer and the notification were
+// destroyed before the feed, so a live-run teardown raced destroyed objects.
+TEST_F(SessionPipelineTest, ControllerTeardownWhileRunIsLiveIsSafe) {
+  const StartRequest request = makeStartRequest(listener().uri(), /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  const std::string prefix = tempPath("tui-pipeline-teardown");
+
+  auto controller = std::make_unique<RunController>(channel(), prefix);
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+
+  // The session file pair opened before the run: "<prefix>-<unix_ns>.nhsession".
+  const std::string session_path = controller->sessionPath();
+  EXPECT_NE(session_path.find(prefix), std::string::npos);
+  EXPECT_NE(session_path.find(".nhsession"), std::string::npos);
+
+  // The run is demonstrably live and snapshots are flowing (startRun stores
+  // the reset model up front, so the real signal is a stored counter point).
+  // Note the wait is on the counter series, not the latency band: the live
+  // aggregator's statistics order is unspecified (per-worker flat_hash_map
+  // fold), so statistics[0] — the band's v0 source — is often a zero-count
+  // response-class statistic even under load. Flagged in the task report.
+  bool have_snapshot = false;
+  for (int i = 0; i < 100 && !have_snapshot; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller->model();
+    have_snapshot = model != nullptr && !model->counters.empty();
+    if (!have_snapshot) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(have_snapshot);
+  EXPECT_TRUE(controller->runInProgress());
+
+  // Destroy with the run hot: the destructor cancels the RPC, joins the read
+  // thread (letting the last callbacks fire into still-alive members), then
+  // drains the open session without a run end record. Completing this
+  // destruction — promptly, and without crashing — is the assertion.
+  controller.reset();
+
+  // The drained session still parses: header + at least one metric series,
+  // and (unlike every close() path) no run end record.
+  auto reader_or = SessionReader::open(session_path);
+  ASSERT_TRUE(reader_or.status().ok());
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+
+  bool have_header = false;
+  bool have_run_end = false;
+  size_t series_count = 0;
+  SessionHeader header;
+  while (true) {
+    auto record_or = reader->next();
+    ASSERT_TRUE(record_or.status().ok());
+    if (!record_or->has_value()) {
+      break;
+    }
+    switch ((*record_or)->record_case()) {
+    case SessionRecord::kHeader:
+      have_header = true;
+      header = (*record_or)->header();
+      break;
+    case SessionRecord::kMetricSeries:
+      series_count++;
+      break;
+    case SessionRecord::kRunEnd:
+      have_run_end = true;
+      break;
+    default:
+      ADD_FAILURE() << "unexpected unset record frame";
+      break;
+    }
+  }
+  ASSERT_TRUE(have_header);
+  EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(header.start_request(), request));
+  EXPECT_GT(series_count, 0u);
+  EXPECT_FALSE(have_run_end);
 }
 
 // Conversion: a snapshot's fields land on the record verbatim — including the

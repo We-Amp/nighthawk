@@ -3,6 +3,8 @@
 #include "absl/strings/string_view.h"
 #include "ftxui/dom/elements.hpp"
 
+#include "api/client/options.pb.h"
+
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/start_run_dialog.h"
@@ -26,12 +28,14 @@ inline constexpr int kMinTerminalHeight = 30;
 
 // The full frame for one redraw: min-size gate, then status bar over the
 // active tab's pane. `width`/`height` are the terminal dimensions — Task 6
-// feeds them from ftxui::ScreenInteractive's terminal size each frame.
-// Tabs: 0 = charts, 1 = knobs (placeholder until Task 6's RenderKnobPane).
-// The dialog's uri feeds the status bar's target field.
+// feeds them from the terminal size each frame. Tabs: 0 = charts, 1 = knobs
+// (rendered from `knob_options`, the most recent run's options; unset defaults
+// before any run). The dialog's uri feeds the status bar's target field.
 ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mode,
                             const RunViewModel& model, const StartRunDialogModel& dialog,
-                            absl::string_view session_path);
+                            absl::string_view session_path,
+                            const nighthawk::client::CommandLineOptions& knob_options =
+                                nighthawk::client::CommandLineOptions{});
 
 // The charts tab (tab 0): percentile band on top, one sparkline per counter
 // series below (sorted by name for deterministic frames). `width`/`height`

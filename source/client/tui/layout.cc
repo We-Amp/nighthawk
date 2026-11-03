@@ -8,6 +8,7 @@
 #include "ftxui/dom/elements.hpp"
 
 #include "source/client/tui/charts.h"
+#include "source/client/tui/knob_pane.h"
 #include "source/client/tui/status_bar.h"
 
 namespace Nighthawk {
@@ -45,7 +46,8 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
 
 ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mode,
                             const RunViewModel& model, const StartRunDialogModel& dialog,
-                            absl::string_view session_path) {
+                            absl::string_view session_path,
+                            const nighthawk::client::CommandLineOptions& knob_options) {
   // The min-size gate wraps everything: below the declared minimum, render
   // the message and nothing else — no partial status bar, no wrapped charts.
   if (width < kMinTerminalWidth || height < kMinTerminalHeight) {
@@ -58,9 +60,11 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
     pane = RenderChartsPane(model, width, height - 3);
     break;
   case 1:
-    // Tab 1 is Task 6's RenderKnobPane; a static placeholder holds the screen
-    // until then.
-    pane = ftxui::text("knobs (M0b Task 6)");
+    // Tab 1 is the knob pane, rendered from the most recent run's options
+    // (unset defaults before any run). Empty options never render an empty
+    // pane: KnobsFromOptions yields the five knobs with "unset"/"not
+    // configured" values.
+    pane = RenderKnobPane(KnobsFromOptions(knob_options), width, height - 3);
     break;
   default:
     pane = ftxui::text(absl::StrCat("unknown tab ", active_tab));

@@ -37,9 +37,14 @@ public:
   // @param session_prefix prefix for the session file naming
   // ("<prefix>-<unix_ns>.nhsession", plus the ".jsonl" sidecar).
   RunController(const std::shared_ptr<grpc::ChannelInterface>& channel, std::string session_prefix);
-  // Cancels an in-flight run and joins the feed's read thread. An open
-  // session (close() never called) drains its queued records in the writer's
-  // destructor, but writes no run end record — prefer finishSession().
+  // Cancels an in-flight run and joins the feed's read thread. Because feed_
+  // is declared LAST, it is destroyed FIRST: the teardown callbacks (a final
+  // onSnapshot/onFinished on the read thread while the destructor cancels and
+  // joins) find every other member — the store, the writer, the mutex — still
+  // alive, so destruction is safe even with the run live (the Ctrl-C/EOF path,
+  // where finishSession never ran). An open session (close() never called)
+  // drains its queued records in the writer's destructor, but writes no run
+  // end record — prefer finishSession().
   ~RunController();
 
   RunController(const RunController&) = delete;
@@ -74,7 +79,11 @@ public:
   std::shared_ptr<const RunViewModel> model() const;
 
   // The open session's data file path (empty when none is open).
-  const std::string& sessionPath() const;
+  std::string sessionPath() const;
+
+  // The options of the most recent startRun (empty when none has happened) —
+  // the layout's knob pane renders from these.
+  const nighthawk::client::CommandLineOptions& knobOptions() const;
 
   // The quit / end-of-session path, single-call: stops an in-flight run, waits
   // (bounded) for its on_finished, then closes the session writer exactly once
@@ -91,12 +100,6 @@ private:
   void onCompleted(const nighthawk::client::Output& output);
   void onFinished(const absl::Status& status);
 
-  // The view model is only ever mutated on the feed's read thread; the render
-  // side reads immutable copies through the store.
-  RunViewModel model_;
-  SnapshotStore store_;
-  RunFeed feed_;
-
   const std::string session_prefix_;
 
   mutable std::mutex mutex_;
@@ -108,6 +111,18 @@ private:
   bool has_output_ = false;
   nighthawk::client::Output final_output_;
   std::function<void()> snapshot_notification_;
+  nighthawk::client::CommandLineOptions knob_options_;
+
+  // Members the feed's read-thread callbacks touch (model_, store_, and, via
+  // onSnapshot, writer_/mutex_ above) MUST be declared before feed_: members
+  // are destroyed in reverse declaration order, so feed_ — whose destructor
+  // cancels the RPC and joins the read thread, letting the last callbacks
+  // fire — is destroyed first and everything its callbacks reference is still
+  // alive. Destroying this object with a run live (Ctrl-C / EOF, where
+  // finishSession never ran) is therefore safe.
+  RunViewModel model_;
+  SnapshotStore store_;
+  RunFeed feed_;
 };
 
 } // namespace Tui

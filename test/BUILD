@@ -81,12 +81,13 @@ cc_test(
     ],
 )
 
-# FORK-ONLY (We-Amp): layout-contract tests (min-size gate, status bar rows).
-# Plain cc_test, same quarantine reasoning as tui_view_model_test.
+# FORK-ONLY (We-Amp): layout-contract tests (min-size gate, status bar rows,
+# knob tab). Plain cc_test, same quarantine reasoning as tui_view_model_test.
 cc_test(
     name = "tui_layout_test",
     srcs = ["tui_layout_test.cc"],
     deps = [
+        "//api/client:base_cc_proto",
         "//source/client/tui:tui_lib",
         "@ftxui//:dom",
         "@ftxui//:screen",

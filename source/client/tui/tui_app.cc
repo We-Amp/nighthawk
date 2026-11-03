@@ -39,11 +39,13 @@ constexpr std::chrono::seconds kFinishTimeout{30};
 
 RunController::RunController(const std::shared_ptr<grpc::ChannelInterface>& channel,
                              std::string session_prefix)
-    : feed_(channel,
+    : session_prefix_(std::move(session_prefix)),
+      // feed_ last, matching declaration order: it is destroyed first, which
+      // is what makes teardown-with-a-live-run safe (see the header comment).
+      feed_(channel,
             RunFeedCallbacks{std::bind(&RunController::onSnapshot, this, std::placeholders::_1),
                              std::bind(&RunController::onCompleted, this, std::placeholders::_1),
-                             std::bind(&RunController::onFinished, this, std::placeholders::_1)}),
-      session_prefix_(std::move(session_prefix)) {}
+                             std::bind(&RunController::onFinished, this, std::placeholders::_1)}) {}
 
 RunController::~RunController() = default;
 
@@ -62,15 +64,19 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
 
   // Mark the run un-finished before the read thread can race us: start()
   // returns only once the run is in flight, and a very short run could
-  // otherwise deliver on_finished before the flag flips.
+  // otherwise deliver on_finished before the flag flips. The reset model is
+  // stored too, so the render side drops the previous run's data immediately
+  // instead of serving it until this run's first snapshot.
   {
     std::lock_guard<std::mutex> lock(mutex_);
     finished_ = false;
     completed_ = false;
     has_output_ = false;
     final_output_ = nighthawk::client::Output{};
+    knob_options_ = request.options();
     model_ = RunViewModel{};
   }
+  store_.store(model_);
 
   // Open the session file pair BEFORE the run starts: once feed_.start()
   // returns, snapshots can arrive on the read thread, and one delivered before
@@ -132,9 +138,14 @@ bool RunController::lastRunEndedCompleted() const {
 
 std::shared_ptr<const RunViewModel> RunController::model() const { return store_.load(); }
 
-const std::string& RunController::sessionPath() const {
+std::string RunController::sessionPath() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return session_path_;
+}
+
+const nighthawk::client::CommandLineOptions& RunController::knobOptions() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return knob_options_;
 }
 
 absl::Status RunController::finishSession(bool completed) {
@@ -186,9 +197,11 @@ absl::Status RunController::finishSession(bool completed) {
 void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) {
   // The snapshot path (spec §4): fold into the model, swap the immutable
   // store copy, persist the record, then ping the shell for exactly one
-  // gated redraw.
+  // gated redraw. The notification fires outside the mutex so a callback that
+  // re-enters the controller cannot deadlock.
   model_ = ApplySnapshot(std::move(model_), snapshot);
   store_.store(model_);
+  std::function<void()> notification;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (writer_ != nullptr) {
@@ -196,9 +209,10 @@ void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) 
       *record.mutable_metric_series() = ToMetricSeries(snapshot);
       writer_->enqueue(std::move(record));
     }
-    if (snapshot_notification_ != nullptr) {
-      snapshot_notification_();
-    }
+    notification = snapshot_notification_;
+  }
+  if (notification != nullptr) {
+    notification();
   }
 }
 
@@ -278,7 +292,7 @@ int runInteractive(const std::string& address, const std::string& session_prefix
       });
     }
     return RenderLayout(screen.dimx(), screen.dimy(), active_tab, mode, view_model, dialog,
-                        controller.sessionPath());
+                        controller.sessionPath(), controller.knobOptions());
   });
 
   Component app = CatchEvent(view, [&](Event event) {
@@ -354,6 +368,10 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   });
 
   screen.Loop(app);
+  // The loop is over (q, Ctrl-C, or EOF): drop the feed-thread notification
+  // before the controller's destructor tears the feed down, so no stale
+  // postEvent can fire into a dying screen during teardown.
+  controller.set_snapshot_notification(nullptr);
   return 0;
 }
 
