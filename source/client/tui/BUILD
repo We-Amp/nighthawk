@@ -14,11 +14,24 @@ envoy_package()
 # cquery guard is documented in README.md next to this file.
 envoy_cc_library(
     name = "tui_lib",
-    srcs = ["tui_app.cc"],
-    hdrs = ["tui_app.h"],
+    srcs = [
+        "session_reader.cc",
+        "session_writer.cc",
+        "tui_app.cc",
+    ],
+    hdrs = [
+        "session_reader.h",
+        "session_writer.h",
+        "tui_app.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
+        "//api/client:base_cc_proto",
         "//api/client:grpc_service_lib",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@ftxui//:dom",
         "@ftxui//:screen",
         "@tclap//:tclap",

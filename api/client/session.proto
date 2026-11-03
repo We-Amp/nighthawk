@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package nighthawk.client;
+
+// FORK-ONLY (We-Amp): this file, and the messages it defines, are fork-specific
+// additions that do not exist upstream. Rebase check: if an upstream change
+// collides with the ones here, the fork's additions must give way before
+// rebasing — colliding field NUMBERS are renumbered, while colliding MESSAGE
+// NAMES are renamed (fork-private names carry no wire-compat obligation).
+// Upstream consumers never see these messages unless they explicitly opt in.
+
+import "api/client/live.proto";
+import "api/client/output.proto";
+import "api/client/service.proto";
+
+// First record of a session file: identifies the format and records the
+// options the run was started with.
+message SessionHeader {
+  // Session file format version, currently "1".
+  string format_version = 1;
+  string session_id = 2;
+  // Client-host session metadata: when the TUI process opened the session
+  // (mac wall clock). The rig stays the timestamp authority for all
+  // metric-series records (spec §8.5).
+  int64 started_unix_ns = 3;
+  // The exact options the run was started with.
+  nighthawk.client.StartRequest start_request = 4;
+}
+
+// One live snapshot, persisted as it arrived from the run feed.
+message MetricSeriesRecord {
+  // Wall-clock time of the snapshot, unix epoch nanoseconds. Engine-stamped:
+  // the rig is the timestamp authority (spec §8.5).
+  int64 wall_time_unix_ns = 1;
+  // Monotonic clock reading at snapshot creation, nanoseconds.
+  int64 monotonic_ns = 2;
+  // Constant "main" pre-A1 (M0a measurement semantics).
+  string phase_id = 3;
+  // Constant execution-id-or-empty pre-A2.
+  string epoch_id = 4;
+  map<string, uint64> counters = 5;
+  repeated nighthawk.client.StatisticSnapshot statistics = 6;
+}
+
+// Last record of a session file.
+message RunEndRecord {
+  // False when the run was stopped or interrupted before completion.
+  bool completed = 1;
+  // The run's final output. Present iff completed.
+  nighthawk.client.Output output = 2;
+  // Session-writer drop count (drop policy). The writer overwrites this with
+  // its queue's authoritative dropped count at close, so a caller-passed 0
+  // cannot mask queue drops.
+  uint64 dropped_records = 3;
+  int64 ended_unix_ns = 4;
+}
+
+// One frame of a session file.
+message SessionRecord {
+  oneof record {
+    SessionHeader header = 1;
+    MetricSeriesRecord metric_series = 2;
+    RunEndRecord run_end = 3;
+  }
+}

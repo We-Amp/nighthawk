@@ -21,6 +21,21 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): session file format, writer/reader, and queue drop
+# contract tests. Plain cc_test for the same reason as tui_app_test: the TUI
+# quarantine keeps this off Envoy's C++ sources and test helpers.
+cc_test(
+    name = "tui_session_test",
+    srcs = ["tui_session_test.cc"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/strings",
+        "@googletest//:gtest_main",
+    ],
+)
+
 
 envoy_cc_test(
     name = "benchmark_http_client_test",
