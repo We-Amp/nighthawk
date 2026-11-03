@@ -6,14 +6,18 @@ Run this after every change that touches `tui_lib`'s dependency graph (it is
 re-run in Task 7 on a clean checkout). **The output must stay empty**:
 
 ```bash
-comm -12 \
-  <(bazel cquery --config=macos 'deps(//source/client/tui:tui_lib)' --output=label 2>/dev/null | sort) \
-  <(bazel cquery --config=macos 'kind("cc.* rule", @envoy//source/...)' --output=label 2>/dev/null | sort)
+a=$(bazel cquery --config=macos 'deps(//source/client/tui:tui_lib)' --output=label 2>/dev/null | sort); b=$(bazel cquery --config=macos 'kind("cc.* rule", @envoy//source/...)' --output=label 2>/dev/null | sort); printf 'tui_deps=%s envoy_cc=%s\n' "$(echo "$a" | wc -l)" "$(echo "$b" | wc -l)" >&2; [ "$(echo "$a" | wc -l)" -gt 0 ] && [ "$(echo "$b" | wc -l)" -gt 0 ] && comm -12 <(echo "$a") <(echo "$b")
 ```
 
-If either cquery stream comes back empty, the check itself failed — do not
-treat that as a pass. A non-empty intersection at any point in M0b is a hard
-stop: report it, do not widen the allowlist to make it pass.
+Both label streams are counted before the intersection is trusted: the counts
+go to stderr, and either a zero count or a non-empty `comm` output fails the
+check (nonzero exit) — stdout must stay empty. A count of zero means the
+cquery itself failed, not that the graph is clean.
+
+**Coverage caveat:** `@envoy//test/...` targets are covered only indirectly —
+Envoy test helpers typically link Envoy source libs transitively, so they show
+up via `@envoy//source/...`; a header-only `@envoy//test` target with no
+transitive source deps would pass the guard as written.
 
 ## The quarantine rule
 
@@ -30,6 +34,14 @@ started compiling Envoy C++ again, and with it the build fragility the TUI is
 supposed to be independent of. The guard is written as an intersection over
 `deps(tui_lib)` rather than a direct-deps check so that a violation added
 anywhere in the transitive closure — not just in this BUILD file — is caught.
+
+## FTXUI fetch caveat
+
+`bazel fetch @ftxui//...` fails on `@ftxui//:tests`: its googletest
+dev-dependency is not wired by Bazel 9 for non-root modules. This is expected,
+not a gate failure — the four library targets the TUI consumes
+(`@ftxui//:dom`, `@ftxui//:screen`, `@ftxui//:component`, `@ftxui//:ftxui`)
+resolve cleanly from bcr.bazel.build.
 
 ## Allowlist
 
