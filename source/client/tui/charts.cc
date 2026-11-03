@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,16 +19,52 @@ namespace {
 
 constexpr const char* kDefaultPlaceholder = "waiting for first flush";
 
-// Keeps only the newest `width` points in the window (older points drop off
-// the left edge once the chart is full).
-template <typename PointT>
-std::vector<PointT> windowOf(const std::vector<PointT>& points, int width) {
-  size_t start = 0;
-  if (width > 0 && points.size() > static_cast<size_t>(width)) {
-    start = points.size() - static_cast<size_t>(width);
+// The flush interval the charts anchor their columns to: the most common
+// positive gap between consecutive stamps of the series (a skipped flush then
+// leaves a blank column instead of shrinking the interval), falling back to
+// the default 1s stats-flush cadence when the series is too short to say.
+uint64_t intervalNsOf(const std::vector<uint64_t>& stamps) {
+  constexpr uint64_t kDefaultIntervalNs = 1000000000ull;
+  if (stamps.size() < 2) {
+    return kDefaultIntervalNs;
   }
-  return std::vector<PointT>(points.begin() + static_cast<long>(start), points.end());
+  std::map<uint64_t, int> gap_counts;
+  for (size_t i = 1; i < stamps.size(); ++i) {
+    if (stamps[i] > stamps[i - 1]) {
+      ++gap_counts[stamps[i] - stamps[i - 1]];
+    }
+  }
+  if (gap_counts.empty()) {
+    return kDefaultIntervalNs;
+  }
+  uint64_t best = kDefaultIntervalNs;
+  int best_count = -1;
+  for (const auto& [gap, count] : gap_counts) {
+    if (count > best_count) {
+      best_count = count;
+      best = gap;
+    }
+  }
+  return best;
 }
+
+// The data column a sample lands on in a fixed-width scrolling viewport:
+// time-anchored, one column per interval, newest at the right edge. Returns
+// -1 for samples older than the window (they have fallen off the left edge).
+int columnFor(uint64_t stamp_ns, uint64_t newest_ns, uint64_t interval_ns, int width) {
+  if (stamp_ns > newest_ns || interval_ns == 0) {
+    return -1;
+  }
+  const uint64_t age = newest_ns - stamp_ns;
+  const uint64_t offset = age / interval_ns;
+  if (offset >= static_cast<uint64_t>(width)) {
+    return -1;
+  }
+  return static_cast<int>(width - 1 - offset);
+}
+
+// Nanoseconds as whole seconds, rounded to nearest.
+uint64_t secondsOf(uint64_t ns) { return (ns + 500000000ull) / 1000000000ull; }
 
 // Maps a value in [0, max] onto a row index in [0, rows - 1]; row 0 is the
 // chart's top line. Overflow-safe: the value is clamped to max first, then
@@ -50,31 +87,6 @@ int rowFor(uint64_t value, uint64_t max, int rows) {
   const uint64_t scaled = static_cast<uint64_t>(
       (static_cast<long double>(clamped) / ceiling) * span);
   return static_cast<int>(span - std::min<uint64_t>(scaled, static_cast<uint64_t>(span)));
-}
-
-// Draws one glyph per data column at the row the value scales to, on a blank
-// character grid of `rows` lines by `width` columns.
-std::vector<std::string> sparkGrid(const std::vector<uint64_t>& column_values, uint64_t max,
-                                   int width, int rows) {
-  if (width <= 0) {
-    return std::vector<std::string>(rows, std::string());
-  }
-  std::vector<std::string> grid(rows, std::string(static_cast<size_t>(width), ' '));
-  for (size_t column = 0; column < column_values.size() && static_cast<int>(column) < width;
-       ++column) {
-    const int row = rowFor(column_values[column], max, rows);
-    grid[row][column] = '*';
-  }
-  return grid;
-}
-
-ftxui::Element rowsAsElement(const std::vector<std::string>& rows) {
-  std::vector<ftxui::Element> elements;
-  elements.reserve(rows.size());
-  for (const std::string& row : rows) {
-    elements.push_back(ftxui::text(row));
-  }
-  return ftxui::vbox(std::move(elements));
 }
 
 // Nanoseconds as a one-decimal millisecond readout ("41.7ms") for the chart
@@ -133,6 +145,36 @@ std::pair<uint64_t, std::string> niceGridline(uint64_t limit_ns) {
   return {best_ns, best_label};
 }
 
+// The first fully-free span of `length` blanks in `line`, or -1 (batch-2
+// polish: the gridline label stamps at the first fully-free span of its row,
+// not only at column 0).
+int firstFreeSpan(const std::string& line, size_t length) {
+  if (length == 0 || line.size() < length) {
+    return -1;
+  }
+  size_t run = 0;
+  for (size_t i = 0; i < line.size(); ++i) {
+    if (line[i] == ' ') {
+      ++run;
+      if (run >= length) {
+        return static_cast<int>(i) - static_cast<int>(length) + 1;
+      }
+    } else {
+      run = 0;
+    }
+  }
+  return -1;
+}
+
+ftxui::Element rowsAsElement(const std::vector<std::string>& rows) {
+  std::vector<ftxui::Element> elements;
+  elements.reserve(rows.size());
+  for (const std::string& row : rows) {
+    elements.push_back(ftxui::text(row));
+  }
+  return ftxui::vbox(std::move(elements));
+}
+
 } // namespace
 
 ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, int width,
@@ -147,28 +189,63 @@ ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, 
     return ftxui::emptyElement();
   }
 
-  const std::vector<PercentilePoint> window = windowOf(points, width);
+  // Time-anchored placement: every sample lands on the column its own
+  // monotonic stamp dictates (one column per flush interval), so a flush the
+  // reducer skipped leaves a blank column and samples never shift left.
+  const uint64_t newest_ns = points.back().monotonic_ns;
+  const uint64_t interval_ns = intervalNsOf(
+      [&points]() {
+        std::vector<uint64_t> stamps;
+        stamps.reserve(points.size());
+        for (const PercentilePoint& point : points) {
+          stamps.push_back(point.monotonic_ns);
+        }
+        return stamps;
+      }());
+
+  struct Placed {
+    int column;
+    const PercentilePoint* point;
+  };
+  std::vector<Placed> placed;
+  placed.reserve(points.size());
   uint64_t max_p99 = 1;
-  size_t max_column = 0;
-  for (size_t column = 0; column < window.size(); ++column) {
-    if (window[column].p99_ns >= max_p99) {
-      max_p99 = window[column].p99_ns;
+  int max_column = 0;
+  uint64_t oldest_visible_ns = newest_ns;
+  for (const PercentilePoint& point : points) {
+    const int column = columnFor(point.monotonic_ns, newest_ns, interval_ns, width);
+    if (column < 0) {
+      continue;
+    }
+    placed.push_back(Placed{column, &point});
+    oldest_visible_ns = std::min(oldest_visible_ns, point.monotonic_ns);
+    if (point.p99_ns >= max_p99) {
+      max_p99 = point.p99_ns;
       max_column = column;
     }
   }
-  const PercentilePoint& newest = window.back();
+  const PercentilePoint& newest = points.back();
 
   // The header row IS the legend: glyph -> series in draw order (p99's "."
   // is painted last and owns shared cells), units in the label, one column
-  // per flush. The spike tail annotates the excursion numerically; the
-  // right-margin readout pair carries the current and window-max p99, and
-  // the one-frame "(rescaled)" marker rides on it.
+  // per flush interval. While a spike window is open the "!" glyph joins the
+  // legend (batch-2 polish), the excursion annotates numerically, and the
+  // right-margin readout pair carries the current and visible-window max
+  // p99 with the one-frame "(rescaled)" marker riding on it.
   std::string left = "# p50   + p90   . p99 ms";
-  const std::string middle = "   1 col = 1 flush";
   if (annotations.spike) {
-    absl::StrAppend(&left, "   p99 ", formatMs(max_p99), " ^",
+    absl::StrAppend(&left, "   ! excursion   p99 ", formatMs(max_p99), " ^",
                     absl::StrFormat("%.1f", annotations.spike_ratio), "x");
   }
+  // The window stamp rides on the legend tail: the viewport's time reference,
+  // once per chart group. Edges are relative to the series' first stored
+  // sample (the run's first flush until the 600-point store rolls over).
+  // Compact by design: the stamp plus edges must fit beside the legend and
+  // the readout pair at the 100-column minimum.
+  const std::string middle = absl::StrCat(
+      "   last ", secondsOf(newest_ns - oldest_visible_ns), "s (",
+      secondsOf(interval_ns), "s/col)  t+", secondsOf(oldest_visible_ns - points.front().monotonic_ns),
+      "s..t+", secondsOf(newest_ns - points.front().monotonic_ns), "s");
   std::string right = absl::StrCat("now ", formatMs(newest.p99_ns), "  max ", formatMs(max_p99));
   if (annotations.rescaled) {
     absl::StrAppend(&right, " (rescaled)");
@@ -176,25 +253,23 @@ ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, 
 
   // One labeled gridline at a nice ms step under half the window max, drawn
   // after the data so every data glyph keeps its cell: dashes land on blank
-  // cells only, and the label is stamped only when its region stayed free.
+  // cells only, and the label is stamped at the first fully-free span of the
+  // row (batch-2 polish) — no label when no free span exists.
   const auto [grid_ns, grid_label] = niceGridline(max_p99);
 
   const int band_rows = std::max(1, height - 1);
   std::vector<std::string> grid(band_rows, std::string(static_cast<size_t>(width), ' '));
-  for (size_t column = 0; column < window.size() && static_cast<int>(column) < width; ++column) {
-    const PercentilePoint& point = window[column];
+  for (const Placed& cell : placed) {
+    const PercentilePoint& point = *cell.point;
     // Three stacked marks per data column: the p50 body, the p90 shoulder,
     // and the p99 envelope dot — drawn in that order so the highest
     // percentile owns shared cells (the p50 floor no longer erases the p99
-    // tail when bands compress). Columns are point-indexed, so a snapshot
-    // the reducer skipped (warm-up count == 0) shifts later points one
-    // column left instead of leaving a blank column — a v0 data-model
-    // limitation, not a rendered gap.
-    grid[rowFor(point.p50_ns, max_p99, band_rows)][column] = '#';
-    grid[rowFor(point.p90_ns, max_p99, band_rows)][column] = '+';
-    grid[rowFor(point.p99_ns, max_p99, band_rows)][column] = '.';
+    // tail when bands compress).
+    grid[rowFor(point.p50_ns, max_p99, band_rows)][cell.column] = '#';
+    grid[rowFor(point.p90_ns, max_p99, band_rows)][cell.column] = '+';
+    grid[rowFor(point.p99_ns, max_p99, band_rows)][cell.column] = '.';
   }
-  if (annotations.spike) {
+  if (annotations.spike && max_column >= 0) {
     // The excursion salience glyph at the excursion's own cell (the window's
     // p99 max), where the lone envelope dot would be missed.
     grid[rowFor(max_p99, max_p99, band_rows)][max_column] = '!';
@@ -202,15 +277,14 @@ ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, 
   if (!grid_label.empty()) {
     const int grid_row = rowFor(grid_ns, max_p99, band_rows);
     std::string& line = grid[static_cast<size_t>(grid_row)];
+    const int stamp_at = firstFreeSpan(line, grid_label.size());
     for (size_t column = 0; column < line.size(); ++column) {
       if (line[column] == ' ') {
         line[column] = '-';
       }
     }
-    const bool label_free =
-        line.compare(0, grid_label.size(), std::string(grid_label.size(), '-')) == 0;
-    if (label_free) {
-      std::copy(grid_label.begin(), grid_label.end(), line.begin());
+    if (stamp_at >= 0) {
+      std::copy(grid_label.begin(), grid_label.end(), line.begin() + stamp_at);
     }
   }
 
@@ -221,7 +295,8 @@ ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, 
 }
 
 ftxui::Element RenderCounterLine(const std::vector<CounterPoint>& points, absl::string_view label,
-                                 int width, int height, absl::string_view empty_message) {
+                                 int width, int height, uint64_t capacity_cap,
+                                 absl::string_view empty_message) {
   if (points.empty()) {
     return ftxui::text(absl::StrCat(
         label, " ",
@@ -232,30 +307,139 @@ ftxui::Element RenderCounterLine(const std::vector<CounterPoint>& points, absl::
     return ftxui::emptyElement();
   }
 
-  const std::vector<CounterPoint> window = windowOf(points, width);
-  uint64_t max_value = 1;
-  for (const CounterPoint& point : window) {
-    max_value = std::max(max_value, point.value);
-  }
+  // Time-anchored placement, exactly as the band's (see above).
+  const uint64_t newest_ns = points.back().monotonic_ns;
+  const uint64_t interval_ns = intervalNsOf(
+      [&points]() {
+        std::vector<uint64_t> stamps;
+        stamps.reserve(points.size());
+        for (const CounterPoint& point : points) {
+          stamps.push_back(point.monotonic_ns);
+        }
+        return stamps;
+      }());
 
-  std::vector<uint64_t> column_values;
-  column_values.reserve(window.size());
-  for (const CounterPoint& point : window) {
-    column_values.push_back(point.value);
+  struct Placed {
+    int column;
+    uint64_t value;
+  };
+  std::vector<Placed> placed;
+  placed.reserve(points.size());
+  uint64_t max_value = 1;
+  for (const CounterPoint& point : points) {
+    const int column = columnFor(point.monotonic_ns, newest_ns, interval_ns, width);
+    if (column < 0) {
+      continue;
+    }
+    placed.push_back(Placed{column, point.value});
+    max_value = std::max(max_value, point.value);
   }
 
   // Header: the raw series label with its unit (the live counters are
   // process-lifetime cumulative counts until the feed deltas them — labeling
-  // them "/flush" would lie), and the now/max readout pair at the right
-  // margin.
+  // them "/flush" would lie). With a capacity cap (the pool-pending series,
+  // backlog item 12) the right margin reads the newest depth as a fraction of
+  // the run's configured gate; without one, the now/max readout pair.
   const std::string left = absl::StrCat(label, " count");
-  const std::string right =
-      absl::StrCat("now ", window.back().value, "  max ", max_value);
+  std::string right;
+  if (capacity_cap > 0) {
+    const uint64_t newest_value = points.back().value;
+    const double fraction = static_cast<double>(std::min(newest_value, capacity_cap)) /
+                            static_cast<double>(capacity_cap);
+    right = absl::StrCat("cur ", newest_value, "/", capacity_cap, " (",
+                         absl::StrFormat("%.0f%%", fraction * 100.0), ")");
+  } else {
+    right = absl::StrCat("now ", points.back().value, "  max ", max_value);
+  }
+
+  const int grid_rows = std::max(1, height - 1);
+  std::vector<std::string> grid(grid_rows, std::string(static_cast<size_t>(width), ' '));
+  for (const Placed& cell : placed) {
+    grid[rowFor(cell.value, max_value, grid_rows)][cell.column] = '*';
+  }
+  if (capacity_cap > 0) {
+    // The ceiling rule: a distinct row of "|" at the cap's height, on blank
+    // cells only so every data glyph keeps its cell — saturation is a
+    // ceiling the band can visibly hit.
+    std::string& line = grid[static_cast<size_t>(rowFor(capacity_cap,
+                                                        std::max(max_value, capacity_cap),
+                                                        grid_rows))];
+    for (size_t column = 0; column < line.size(); ++column) {
+      if (line[column] == ' ') {
+        line[column] = '|';
+      }
+    }
+  }
 
   std::vector<ftxui::Element> elements;
   elements.push_back(ftxui::text(composeHeader(left, right, width)));
-  elements.push_back(rowsAsElement(sparkGrid(column_values, max_value, width,
-                                             std::max(1, height - 1))));
+  elements.push_back(rowsAsElement(grid));
+  return ftxui::vbox(std::move(elements));
+}
+
+ftxui::Element RenderHealthLine(const std::vector<CounterPoint>& http_4xx,
+                                const std::vector<CounterPoint>& stream_resets,
+                                const std::vector<CounterPoint>& pool_connection_failure,
+                                int width, int height) {
+  // Per-flush rates: deltas of the cumulative counter series, keyed by the
+  // snapshot's monotonic stamp (all series ride the same snapshots, so
+  // stamps align). An absent series (the engine suppresses zero counters)
+  // contributes a steady 0/s — zeros are information.
+  const auto deltaAt = [](const std::vector<CounterPoint>& series) {
+    std::map<uint64_t, uint64_t> deltas;
+    for (size_t i = 1; i < series.size(); ++i) {
+      deltas[series[i].monotonic_ns] =
+          series[i].value > series[i - 1].value ? series[i].value - series[i - 1].value : 0;
+    }
+    return deltas;
+  };
+  const std::map<uint64_t, uint64_t> d4xx = deltaAt(http_4xx);
+  const std::map<uint64_t, uint64_t> drst = deltaAt(stream_resets);
+  const std::map<uint64_t, uint64_t> dpf = deltaAt(pool_connection_failure);
+
+  std::map<uint64_t, uint64_t> total;
+  for (const auto* deltas : {&d4xx, &drst, &dpf}) {
+    for (const auto& [stamp, delta] : *deltas) {
+      total[stamp] += delta;
+    }
+  }
+  uint64_t max_total = 0;
+  for (const auto& [stamp, rate] : total) {
+    max_total = std::max(max_total, rate);
+  }
+  const auto latest = [](const std::map<uint64_t, uint64_t>& deltas) {
+    return deltas.empty() ? 0 : deltas.rbegin()->second;
+  };
+
+  const std::string left = absl::StrCat("4xx ", latest(d4xx), "/s | rst ", latest(drst),
+                                        "/s | t/o ", latest(dpf), "/s");
+  const std::string right =
+      absl::StrCat("now ", total.empty() ? 0 : total.rbegin()->second, "/s  max ", max_total,
+                   "/s");
+
+  std::vector<ftxui::Element> elements;
+  elements.push_back(ftxui::text(composeHeader(left, right, width)));
+  if (width > 0 && height > 1 && !total.empty()) {
+    // The summed bad-event rate as one sparkline, newest at the right edge,
+    // anchored to the same flush interval as every other chart.
+    std::vector<uint64_t> stamps;
+    stamps.reserve(total.size());
+    for (const auto& [stamp, rate] : total) {
+      stamps.push_back(stamp);
+    }
+    const uint64_t newest_ns = total.rbegin()->first;
+    const uint64_t interval_ns = intervalNsOf(stamps);
+    const int grid_rows = std::max(1, height - 1);
+    std::vector<std::string> grid(grid_rows, std::string(static_cast<size_t>(width), ' '));
+    for (const auto& [stamp, rate] : total) {
+      const int column = columnFor(stamp, newest_ns, interval_ns, width);
+      if (column < 0) {
+        continue;
+      }
+      grid[rowFor(rate, std::max<uint64_t>(max_total, 1), grid_rows)][column] = '*';
+    }
+    elements.push_back(rowsAsElement(grid));
+  }
   return ftxui::vbox(std::move(elements));
 }
 

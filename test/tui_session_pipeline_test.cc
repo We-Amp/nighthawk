@@ -3,6 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -898,6 +899,177 @@ TEST(SessionConversionTest, ToSessionHeaderCarriesRequestAndMetadata) {
   EXPECT_EQ(header.session_id(), "sid");
   EXPECT_EQ(header.started_unix_ns(), 123'456);
   EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(header.start_request(), request));
+}
+
+// ---------------------------------------------------------------------------
+// UX batch 2: the T7 findings.
+// ---------------------------------------------------------------------------
+
+// F1, the stop->start window: after s (run stopped, session still open until
+// q), a valid dialog enter must keep the dialog open and surface the
+// controller's rejection on the in-dialog line — the same seam the
+// session-already-open steady state uses, not a silent no-op and not a field
+// error. Drives the real key map against a real controller mid-window.
+TEST_F(SessionPipelineTest, StopThenStartSurfacesTheControllerRejection) {
+  const StartRequest request = makeStartRequest(listener().uri(), /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  auto controller = std::make_unique<RunController>(channel(), tempPath("tui-pipeline-stop-start"));
+
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+  bool have_snapshot = false;
+  for (int i = 0; i < 100 && !have_snapshot; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller->model();
+    have_snapshot = model != nullptr && !model->counters.empty();
+    if (!have_snapshot) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(have_snapshot);
+
+  // The stop key: the run winds down (on_finished lands), but the session
+  // stays open until q — this is the stop->start window.
+  controller->stopRun();
+  for (int i = 0; i < 100 && controller->runInProgress(); ++i) {
+    std::this_thread::sleep_for(100ms);
+  }
+  ASSERT_FALSE(controller->runInProgress());
+  const std::string session_path = controller->sessionPath();
+  ASSERT_FALSE(session_path.empty());
+
+  // A valid dialog enter in the window: refused, visibly, on the rejection
+  // line.
+  ShellState state;
+  state.mode = InputMode::kEditingStartRun;
+  state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+  state.uri_field = listener().uri();
+  state.rps_field = "100";
+  state.duration_field = "60";
+  const bool consumed =
+      HandleShellEvent(ftxui::Event::Return, state, *controller, /*force_redraw=*/[] {},
+                       /*exit_loop=*/[] {});
+  EXPECT_TRUE(consumed);
+  EXPECT_EQ(state.mode, InputMode::kEditingStartRun);
+  EXPECT_FALSE(state.show_errors);
+  EXPECT_EQ(state.start_rejected, "cannot start: a session is already open (q quits and saves)");
+  EXPECT_EQ(controller->sessionPath(), session_path);
+
+  // The rejection actually reads on screen via the shared shell mapping.
+  OverlayState overlay;
+  FillOverlayState(state, &overlay);
+  overlay.active_field = StartRunDialogModel::kDuration;
+  const ftxui::Element frame_element =
+      RenderLayout(100, 30, /*active_tab=*/0, state.mode, RunViewModel{}, state.dialog,
+                   controller->sessionPath(), nighthawk::client::CommandLineOptions{}, &overlay);
+  ftxui::Screen screen(100, 30);
+  ftxui::Render(screen, frame_element);
+  EXPECT_NE(screen.ToString().find("cannot start: a session is already open"), std::string::npos);
+
+  // The refusal is the session gate, not the feed state: the stopped run's
+  // session closes cleanly on the way out.
+  EXPECT_TRUE(controller->finishSession(/*completed=*/false).ok());
+  EXPECT_TRUE(controller->sessionPath().empty());
+}
+
+// F3: a start whose RPC write fails must not leave a header-only session
+// orphan behind. The writer opens BEFORE the run launches (the ordering the
+// snapshot path requires), so the failure path closes the just-opened file
+// with a run end record (completed=false) — the file parses as a complete,
+// honest empty session, not an orphan. Drives a real controller against a
+// listener that accepts and immediately closes connections, so the stream
+// write fails fast.
+TEST_F(SessionPipelineTest, FailedStartLeavesNoHeaderOnlySession) {
+  // A TCP listener that accepts and slams the door: connect succeeds, the
+  // HTTP/2 preface write fails, feed start errors.
+  int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_NE(listen_fd, -1);
+  int one = 1;
+  ASSERT_EQ(::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)), 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  ASSERT_EQ(::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  ASSERT_EQ(::listen(listen_fd, 16), 0);
+  socklen_t addr_len = sizeof(addr);
+  ASSERT_EQ(::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+  const uint16_t port = ntohs(addr.sin_port);
+  std::thread closer([listen_fd]() {
+    while (true) {
+      const int fd = ::accept(listen_fd, nullptr, nullptr);
+      if (fd < 0) {
+        return;
+      }
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+    }
+  });
+
+  auto channel = grpc::CreateChannel(fmt::format("127.0.0.1:{}", port),
+                                     grpc::InsecureChannelCredentials());
+  const std::string prefix = tempPath("tui-pipeline-failed-start");
+  auto controller = std::make_unique<RunController>(channel, prefix);
+
+  const StartRequest request = makeStartRequest("http://127.0.0.1:9/", /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  const absl::Status started = controller->startRun(request);
+  EXPECT_FALSE(started.ok());
+
+  // No session left open in the controller.
+  EXPECT_TRUE(controller->sessionPath().empty());
+
+  // The session file the start opened before failing: it must exist AND carry
+  // the run end record — never a header-only orphan. It sits at
+  // "<prefix>-<unix_ns>.nhsession"; find it by prefix.
+  const std::string dir = tempPath("");
+  std::string session_path;
+  for (auto it = std::filesystem::directory_iterator(dir);
+       it != std::filesystem::directory_iterator(); ++it) {
+    const std::string name = it->path().filename().string();
+    if (name.rfind("tui-pipeline-failed-start", 0) == 0 &&
+        name.find(".nhsession") != std::string::npos) {
+      session_path = it->path().string();
+      break;
+    }
+  }
+  ::shutdown(listen_fd, SHUT_RDWR);
+  ::close(listen_fd);
+  closer.join();
+
+  ASSERT_FALSE(session_path.empty()) << "the failed start left no session file at all";
+  auto reader_or = SessionReader::open(session_path);
+  ASSERT_TRUE(reader_or.status().ok());
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+
+  bool have_header = false;
+  bool have_run_end = false;
+  size_t series_count = 0;
+  RunEndRecord run_end;
+  while (true) {
+    auto record_or = reader->next();
+    ASSERT_TRUE(record_or.status().ok());
+    if (!record_or->has_value()) {
+      break;
+    }
+    switch ((*record_or)->record_case()) {
+    case SessionRecord::kHeader:
+      have_header = true;
+      break;
+    case SessionRecord::kMetricSeries:
+      series_count++;
+      break;
+    case SessionRecord::kRunEnd:
+      have_run_end = true;
+      run_end = (*record_or)->run_end();
+      break;
+    default:
+      ADD_FAILURE() << "unexpected unset record frame";
+      break;
+    }
+  }
+  ASSERT_TRUE(have_header);
+  ASSERT_TRUE(have_run_end) << "header-only session orphan (finding F3)";
+  EXPECT_FALSE(run_end.completed());
+  EXPECT_EQ(series_count, 0u);
 }
 
 } // namespace

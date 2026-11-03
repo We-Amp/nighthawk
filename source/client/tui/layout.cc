@@ -187,7 +187,81 @@ ftxui::Element RenderMinSizeMessage(int width, int height) {
                                   height));
 }
 
-ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height) {
+// Thousands-grouped digits ("27,412") for the completion summary's totals.
+std::string groupDigits(uint64_t value) {
+  std::string digits = absl::StrCat(value);
+  std::string grouped;
+  for (size_t i = 0; i < digits.size(); ++i) {
+    if (i > 0 && (digits.size() - i) % 3 == 0) {
+      grouped.push_back(',');
+    }
+    grouped.push_back(digits[i]);
+  }
+  return grouped;
+}
+
+// The newest value of a counter series, or 0 when the engine never emitted it
+// (zero counters are suppressed engine-side; absence IS zero).
+uint64_t lastCounterValue(const RunViewModel& model, const std::string& name) {
+  const auto it = model.counters.find(name);
+  return it == model.counters.end() || it->second.empty() ? 0 : it->second.back().value;
+}
+
+// The completion-summary block's lines (backlog item 7). Totals, error ratio,
+// and final percentiles come from the same live view the charts draw (the
+// last snapshot's cumulative counters and the band's newest point), with the
+// per-class counts rendered alongside per §8.1/§8.2 claim discipline: every
+// sample the run produced is counted on-screen, none hidden. The saved
+// session path closes the loop on where the recording landed.
+std::vector<std::string> CompletionSummaryLines(const RunViewModel& model,
+                                                absl::string_view session_path) {
+  const uint64_t c1xx = lastCounterValue(model, "benchmark.http_1xx");
+  const uint64_t c2xx = lastCounterValue(model, "benchmark.http_2xx");
+  const uint64_t c3xx = lastCounterValue(model, "benchmark.http_3xx");
+  const uint64_t c4xx = lastCounterValue(model, "benchmark.http_4xx");
+  const uint64_t c5xx = lastCounterValue(model, "benchmark.http_5xx");
+  const uint64_t cxxx = lastCounterValue(model, "benchmark.http_xxx");
+  const uint64_t rst = lastCounterValue(model, "benchmark.stream_resets");
+  const uint64_t tmo = lastCounterValue(model, "benchmark.pool_connection_failure");
+
+  const uint64_t requests = c1xx + c2xx + c3xx + c4xx + c5xx + cxxx + rst + tmo;
+  const uint64_t errors = c4xx + c5xx + cxxx + rst + tmo;
+  const double error_pct =
+      requests == 0 ? 0.0 : 100.0 * static_cast<double>(errors) / static_cast<double>(requests);
+
+  std::string first = absl::StrCat("run complete");
+  if (!model.latency_band.empty()) {
+    const uint64_t elapsed_ns = model.latency_band.back().monotonic_ns -
+                                model.latency_band.front().monotonic_ns;
+    absl::StrAppend(&first, ": ", elapsed_ns / 1000000000ull, "s");
+  }
+  absl::StrAppend(&first, " | ", groupDigits(requests), " requests | errors ", errors, " (",
+                  absl::StrFormat("%.1f%%", error_pct), ")");
+  if (!model.latency_band.empty()) {
+    const PercentilePoint& final_point = model.latency_band.back();
+    absl::StrAppend(&first, " | p50/p90/p99 ", absl::StrFormat("%.1f", static_cast<double>(final_point.p50_ns) / 1e6),
+                    "/", absl::StrFormat("%.1f", static_cast<double>(final_point.p90_ns) / 1e6),
+                    "/", absl::StrFormat("%.1f", static_cast<double>(final_point.p99_ns) / 1e6),
+                    " ms");
+  }
+
+  std::string counts = absl::StrCat("counts: 2xx ", groupDigits(c2xx), ", 4xx ", groupDigits(c4xx),
+                                    ", 5xx ", groupDigits(c5xx), ", rst ", groupDigits(rst),
+                                    ", t/o ", groupDigits(tmo));
+  const uint64_t other = c1xx + c3xx + cxxx;
+  if (other > 0) {
+    absl::StrAppend(&counts, ", other ", groupDigits(other));
+  }
+  absl::StrAppend(&counts, " - every sample counted, none hidden");
+
+  std::string saved = absl::StrCat("recording saved: ",
+                                   session_path.empty() ? "(none)" : std::string(session_path));
+
+  return {first, counts, saved};
+}
+
+ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height,
+                                absl::string_view session_path, uint64_t pool_pending_cap) {
   // State-aware empty state: an idle shell has never had a run, so the
   // honest message names the user-initiated next action; only a live run
   // before its first flush may claim "waiting for first flush".
@@ -196,13 +270,45 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
                                       : "no run yet - press n to start one";
 
   std::vector<ftxui::Element> rows;
-  const int band_height = std::max(1, height / 2);
+  int used_rows = 0;
+
+  // The completion-summary block (backlog item 7): on transition to
+  // completed, totals, error ratio, final percentiles, the saved session
+  // path, and the §8.2 disclosure ride on top; the charts stay intact below.
+  if (model.run_state == "completed") {
+    for (const std::string& line : CompletionSummaryLines(model, session_path)) {
+      rows.push_back(ftxui::text(line.substr(0, static_cast<size_t>(std::max(0, width)))));
+      ++used_rows;
+    }
+  }
+
+  const int band_height = std::max(1, (height - used_rows) / 2);
   BandAnnotations annotations;
   annotations.spike = model.spike_frames_remaining > 0;
   annotations.spike_ratio = model.spike_ratio;
   annotations.rescaled = model.latency_rescaled;
   rows.push_back(RenderPercentileBand(model.latency_band, width, band_height, annotations,
                                       empty_message));
+
+  // The compact health line (backlog item 10): the client-side failure
+  // counters as per-flush rates, zeros included — a reset or timeout is THE
+  // target-drowning signal, and a steady 0/s says "not drowning" outright.
+  int remaining = std::max(0, height - used_rows - band_height);
+  const int health_rows = std::min(2, remaining);
+  if (health_rows > 0) {
+    static const std::vector<CounterPoint> kNoSeries;
+    rows.push_back(RenderHealthLine(
+        model.counters.count("benchmark.http_4xx") ? model.counters.at("benchmark.http_4xx")
+                                                   : kNoSeries,
+        model.counters.count("benchmark.stream_resets")
+            ? model.counters.at("benchmark.stream_resets")
+            : kNoSeries,
+        model.counters.count("benchmark.pool_connection_failure")
+            ? model.counters.at("benchmark.pool_connection_failure")
+            : kNoSeries,
+        width, health_rows));
+    remaining -= health_rows;
+  }
 
   // Sorted counter names keep frames deterministic (the model's hash map
   // iterates in unspecified order).
@@ -213,11 +319,15 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
   }
   std::sort(names.begin(), names.end());
 
-  const int remaining = std::max(0, height - band_height);
   const int per_counter =
       names.empty() ? 0 : std::max(1, remaining / static_cast<int>(names.size()));
   for (const std::string& name : names) {
-    rows.push_back(RenderCounterLine(model.counters.at(name), name, width, per_counter,
+    // The pool-pending series renders its capacity context (backlog item 12)
+    // when the run's config sets the gate: cur/cap readout plus the ceiling
+    // rule at cap height.
+    const uint64_t cap =
+        (pool_pending_cap > 0 && name == "pool_rq_pending_release") ? pool_pending_cap : 0;
+    rows.push_back(RenderCounterLine(model.counters.at(name), name, width, per_counter, cap,
                                      empty_message));
   }
   return ftxui::vbox(std::move(rows));
@@ -241,8 +351,32 @@ ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open) {
   return ftxui::text(bar);
 }
 
+ftxui::Element RenderTabStrip(int active_tab) {
+  // One-row tab strip (backlog item 11), rendered under the status bar: the
+  // active tab inverted, panes that do not exist yet dimmed with their
+  // reason in the text (`flame (m1)` — M1's next pane), so a monochrome
+  // paste still tells implemented from pending. Tab order matches the key
+  // map: c -> charts (0), k -> knobs (2); flame (1) has no key until M1.
+  const bool charts_active = active_tab == 0;
+  const bool knobs_active = active_tab == 2;
+  return ftxui::hbox({
+      ftxui::text("| "),
+      charts_active ? ftxui::text("charts") | ftxui::inverted : ftxui::text("charts"),
+      ftxui::text(" | "),
+      ftxui::text("flame (m1)") | ftxui::dim,
+      ftxui::text(" | "),
+      knobs_active ? ftxui::text("knobs") | ftxui::inverted : ftxui::text("knobs"),
+      ftxui::text(" |"),
+  });
+}
+
 ftxui::Element RenderHelpOverlay() {
-  const int outer_width = 80;
+  // Narrowed to 64 columns (batch-2 polish): the overlay sits at column 10,
+  // so its right edge clears the charts' right-margin readout pairs (which
+  // start near column 76 at the 100-column minimum) — the readouts behind it
+  // are no longer fragmented. Height stays within rows 3..28 so the status
+  // bar (rows 0-2) and the key bar (row 29) both stay visible.
+  const int outer_width = 64;
   const int inner_width = outer_width - 4;
   std::vector<ftxui::Element> lines;
   lines.push_back(ftxui::text(borderRule(outer_width)));
@@ -266,6 +400,7 @@ ftxui::Element RenderHelpOverlay() {
   lines.push_back(ftxui::text(borderedRow("  phase      placeholder until M2 real phase ids", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  epoch      placeholder until M3 steering epochs", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  flush 1s   chart cadence: one column per flush", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  4xx/rst/t/o  per-flush client-side failure rates", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  session    session recording path", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  mode       navigate, or editing while a dialog owns", inner_width)));
   lines.push_back(ftxui::text(borderedRow("             the keyboard", inner_width)));
@@ -328,25 +463,38 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
   ftxui::Element pane;
   switch (active_tab) {
   case 0:
-    // Rows 0..2 are the status bar and the last row is the key bar.
-    pane = RenderChartsPane(model, width, height - 4);
+    // Rows 0..2 are the status bar, row 3 the tab strip, and the last row
+    // the key bar.
+    pane = RenderChartsPane(model, width, height - 5, session_path,
+                            knob_options.has_max_pending_requests()
+                                ? static_cast<uint64_t>(knob_options.max_pending_requests().value())
+                                : 0);
     break;
   case 1:
-    // Tab 1 is the knob pane, rendered from the most recent run's options
+    // Tab 1 is the flamegraph pane: not built until M1. The dimmed tab-strip
+    // cell names the milestone, and the pane body says the same thing, so
+    // landing here (no key routes to it in M0b) is visibly refused rather
+    // than silently blank.
+    pane = ftxui::text("flame (m1): pane lands in M1") | ftxui::dim;
+    break;
+  case 2:
+    // Tab 2 is the knob pane, rendered from the most recent run's options
     // (unset defaults before any run). Empty options never render an empty
     // pane: KnobsFromOptions yields the five knobs with "unset"/"not
     // configured" values.
-    pane = RenderKnobPane(KnobsFromOptions(knob_options), width, height - 4);
+    pane = RenderKnobPane(KnobsFromOptions(knob_options), width, height - 5);
     break;
   default:
     pane = ftxui::text(absl::StrCat("unknown tab ", active_tab));
     break;
   }
 
-  // The key bar is pinned to the bottom row via the filler, so it reads from
-  // the same row in every frame and every mode.
+  // The tab strip (backlog item 11) sits between the status bar and the
+  // pane; the key bar is pinned to the bottom row via the filler, so it
+  // reads from the same row in every frame and every mode.
   ftxui::Element frame = ftxui::vbox({
       RenderStatusBar(model, mode, session_path, dialog.uri(), knob_options.duration().seconds()),
+      RenderTabStrip(active_tab),
       pane,
       ftxui::filler(),
       RenderKeyBar(mode, model.run_state == "running", /*session_open=*/!session_path.empty()),

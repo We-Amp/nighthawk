@@ -129,13 +129,14 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     return false; // let the text inputs handle the character
   }
 
-  // Navigate mode key map.
+  // Navigate mode key map. Tab indices match the tab strip's order: c ->
+  // charts (0), k -> knobs (2); flame (1) is M1's pane and takes no key yet.
   if (event == Event::Character('c')) {
     state.active_tab = 0;
     return true;
   }
   if (event == Event::Character('k')) {
-    state.active_tab = 1;
+    state.active_tab = 2;
     return true;
   }
   if (event == Event::Character('?')) {

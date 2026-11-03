@@ -26,12 +26,36 @@ namespace {
 // a clear message instead of wrapping garbage). Assertions work on the
 // rendered screen text so they pin what the user actually sees.
 
+// Removes ANSI SGR escape sequences (this ftxui's Screen::ToString emits
+// them for inverted/dim cells). The text assertions below pin what the user
+// READS; the attribute-level assertions (the inverted caret, the strip's
+// active cell) go through Screen::CellAt directly.
+std::string stripAnsi(const std::string& text) {
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size();) {
+    if (text[i] == '\x1b' && i + 1 < text.size() && text[i + 1] == '[') {
+      size_t j = i + 2;
+      while (j < text.size() && text[j] != 'm' && text[j] != '\n') {
+        ++j;
+      }
+      if (j < text.size() && text[j] == 'm') {
+        i = j + 1;
+        continue;
+      }
+    }
+    out.push_back(text[i]);
+    ++i;
+  }
+  return out;
+}
+
 // Splits an ftxui::Screen into per-row strings. ToString() terminates rows
 // with "\r\n"; the carriage returns are stripped so row indexing stays exact.
 std::vector<std::string> screenLines(const ftxui::Element& element, int width, int height) {
   ftxui::Screen screen(width, height);
   ftxui::Render(screen, element);
-  std::string text = screen.ToString();
+  std::string text = stripAnsi(screen.ToString());
   std::vector<std::string> lines;
   size_t start = 0;
   while (start <= text.size()) {
@@ -82,7 +106,7 @@ Frame renderFrame(const ftxui::Element& element, int width, int height) {
   Frame frame;
   frame.screen = std::make_unique<ftxui::Screen>(width, height);
   ftxui::Render(*frame.screen, element);
-  std::string text = frame.screen->ToString();
+  std::string text = stripAnsi(frame.screen->ToString());
   size_t start = 0;
   while (start <= text.size()) {
     size_t newline = text.find('\n', start);
@@ -139,21 +163,79 @@ TEST(LayoutTest, BelowMinSizeRendersMessageOnly) {
 }
 
 // The layout contract at the exact minimum: rows 0-2 always carry the status
-// bar (state + uri | phase placeholder | session path), the charts pane owns
-// everything below row 2.
+// bar (state + uri | phase placeholder | session path), row 3 the tab strip,
+// and the charts pane everything below it.
 TEST(LayoutTest, StatusBarOccupiesThreeRowsAtMinSize) {
   ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/0, InputMode::kNavigate,
                                         runningModel(), filledDialog(), kSessionPath);
   std::vector<std::string> lines = screenLines(element, 100, 30);
 
-  ASSERT_GE(lines.size(), 4u);
+  ASSERT_GE(lines.size(), 5u);
   EXPECT_NE(lines[0].find("running"), std::string::npos);
   EXPECT_NE(lines[0].find(kUri), std::string::npos);
   EXPECT_NE(lines[1].find("phase: main"), std::string::npos);
   EXPECT_NE(lines[1].find("pre-phase-engine placeholder"), std::string::npos);
   EXPECT_NE(lines[2].find(kSessionPath), std::string::npos);
-  // The charts pane starts at row 3: the percentile band's legend row.
-  EXPECT_NE(lines[3].find("p50"), std::string::npos);
+  // Row 3 is the tab strip; the charts pane starts at row 4 with the
+  // percentile band's legend row.
+  EXPECT_NE(lines[3].find("| charts | flame (m1) | knobs |"), std::string::npos);
+  EXPECT_NE(lines[4].find("p50"), std::string::npos);
+}
+
+// The tab strip (backlog item 11): every frame names the panes, the active
+// tab renders inverted, and the not-yet-built pane is dimmed with its reason.
+TEST(TabStripTest, StripNamesPanesAndMarksTheActiveTab) {
+  // Charts active (the default tab): "charts" inverted, flame dimmed.
+  Frame charts = frameAt(InputMode::kNavigate, runningModel(), filledDialog());
+  EXPECT_NE(charts.lines[3].find("| charts | flame (m1) | knobs |"), std::string::npos)
+      << "row3=[" << charts.lines[3] << "]";
+  bool inverted_charts = false;
+  bool inverted_knobs = false;
+  for (int x = 0; x < 40; ++x) {
+    const ftxui::Cell& cell = charts.screen->CellAt(x, 3);
+    if (cell.character == "c") {
+      inverted_charts = inverted_charts || cell.inverted;
+    }
+    if (cell.character == "k") {
+      inverted_knobs = inverted_knobs || cell.inverted;
+    }
+  }
+  EXPECT_TRUE(inverted_charts);
+  EXPECT_FALSE(inverted_knobs);
+
+  // Knobs active (the k key lands on tab 2): the inversion moves.
+  ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/2, InputMode::kNavigate,
+                                        runningModel(), filledDialog(), kSessionPath);
+  Frame knobs = renderFrame(element, 100, 30);
+  inverted_charts = false;
+  inverted_knobs = false;
+  for (int x = 0; x < 40; ++x) {
+    const ftxui::Cell& cell = knobs.screen->CellAt(x, 3);
+    if (cell.character == "c") {
+      inverted_charts = inverted_charts || cell.inverted;
+    }
+    if (cell.character == "k") {
+      inverted_knobs = inverted_knobs || cell.inverted;
+    }
+  }
+  EXPECT_FALSE(inverted_charts);
+  EXPECT_TRUE(inverted_knobs);
+
+  // The reason rides in the text (survives a monochrome paste), and the
+  // unimplemented pane never renders inverted.
+  EXPECT_NE(knobs.lines[3].find("flame (m1)"), std::string::npos);
+}
+
+// Tab 1 is the flamegraph pane: M1's pane, visibly refused for now (dimmed
+// strip cell and a body naming the milestone), and never a blank screen.
+TEST(LayoutTest, FlameTabRendersAVisiblyRefusedPlaceholder) {
+  ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate,
+                                        runningModel(), filledDialog(), kSessionPath);
+  std::string text;
+  for (const std::string& line : screenLines(element, 100, 30)) {
+    text += line + "\n";
+  }
+  EXPECT_NE(text.find("flame (m1): pane lands in M1"), std::string::npos);
 }
 
 // Pre-A1 placeholder semantics: phase and epoch ids carry placeholder markers
@@ -180,12 +262,12 @@ TEST(StatusBarTest, ShowsPhaseEpochPlaceholders) {
   EXPECT_NE(empty_epoch.find("epoch: (none)"), std::string::npos);
 }
 
-// Tab 1 renders the real knob pane from the run options (fix round: the k key
+// Tab 2 renders the real knob pane from the run options (fix round: the k key
 // used to expose Task 5's static placeholder while the pane was test-only).
 TEST(LayoutTest, KnobsTabRendersTheKnobPane) {
   nighthawk::client::CommandLineOptions options;
   options.mutable_requests_per_second()->set_value(100);
-  ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate,
+  ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/2, InputMode::kNavigate,
                                         runningModel(), filledDialog(), kSessionPath, options);
   std::string text;
   for (const std::string& line : screenLines(element, 100, 30)) {
@@ -199,7 +281,7 @@ TEST(LayoutTest, KnobsTabRendersTheKnobPane) {
 
   // Before any run (defaulted empty options): the unset vocabulary, still no
   // placeholder.
-  ftxui::Element defaults = RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate,
+  ftxui::Element defaults = RenderLayout(100, 30, /*active_tab=*/2, InputMode::kNavigate,
                                          runningModel(), filledDialog(), kSessionPath);
   std::string defaults_text;
   for (const std::string& line : screenLines(defaults, 100, 30)) {
@@ -273,11 +355,38 @@ TEST(HelpOverlayTest, HelpListsKeysAndStatusBarFields) {
   EXPECT_TRUE(frame.contains("esc        cancel"));
   EXPECT_TRUE(frame.contains("state      idle | running | completed | stopped"));
   EXPECT_TRUE(frame.contains("flush 1s   chart cadence: one column per flush"));
+  EXPECT_TRUE(frame.contains("4xx/rst/t/o  per-flush client-side failure rates"));
   EXPECT_TRUE(frame.contains("session    session recording path"));
   // The help overlay never breaks the layout contract: status bar and key
   // bar stay on their rows.
   EXPECT_NE(frame.lines[0].find("running"), std::string::npos);
   EXPECT_NE(frame.lines[29].find("? help"), std::string::npos);
+}
+
+// Batch-2 polish: with live charts behind it, the narrowed help overlay must
+// not fragment the charts' right-margin readouts — the overlay's right edge
+// clears the readout pairs entirely (they render near columns 76-99 at the
+// 100-column minimum).
+TEST(HelpOverlayTest, HelpOverlayLeavesTheChartReadoutsIntact) {
+  OverlayState overlay;
+  overlay.help_open = true;
+  Frame frame = frameAt(InputMode::kNavigate, runningModel(), filledDialog(), &overlay);
+
+  // The overlay's box: left border at column 10, top border on row 3 (the
+  // strip row), right border at column 10 + 64 - 1 = 73.
+  ASSERT_EQ(frame.lines[3][10], '+');
+  ASSERT_EQ(frame.lines[3][73], '+');
+  ASSERT_EQ(frame.lines[3][74], ' ');
+
+  // The band legend row (row 4) carries the readout pair, intact right of the
+  // overlay: "now" and "max" both land past column 73.
+  const std::string& legend = frame.lines[4];
+  const size_t now_at = legend.find("now ");
+  const size_t max_at = legend.find("max ");
+  ASSERT_NE(now_at, std::string::npos);
+  ASSERT_NE(max_at, std::string::npos);
+  EXPECT_GT(now_at, 73u);
+  EXPECT_GT(max_at, 73u);
 }
 
 // The start-run dialog overlay (backlog item 1): bordered box over the pane,
@@ -438,6 +547,142 @@ TEST(EmptyStateTest, IdleAndRunningRenderDifferentEmptyStates) {
   Frame done = frameAt(InputMode::kNavigate, runningModel(), StartRunDialogModel{});
   EXPECT_TRUE(done.lacks("no run yet"));
   EXPECT_TRUE(done.lacks("waiting for first flush"));
+}
+
+// A completed model carrying the response-class counters and a 60s band.
+RunViewModel completedModel() {
+  RunViewModel model = runningModel(); // 10 one-second stamps, ~30ms p99
+  model.run_state = "completed";
+  model.target_uri = kUri;
+  auto& two_xx = model.counters["benchmark.http_2xx"];
+  two_xx.push_back(CounterPoint{9000000000ull, 27444});
+  auto& four_xx = model.counters["benchmark.http_4xx"];
+  four_xx.push_back(CounterPoint{9000000000ull, 23});
+  auto& five_xx = model.counters["benchmark.http_5xx"];
+  five_xx.push_back(CounterPoint{9000000000ull, 198});
+  auto& resets = model.counters["benchmark.stream_resets"];
+  resets.push_back(CounterPoint{9000000000ull, 42});
+  return model;
+}
+
+// The completion-summary block (backlog item 7): totals, error ratio, final
+// percentiles, the saved session path, the §8.2 counts-shown disclosure —
+// with the charts intact below.
+TEST(CompletionSummaryTest, CompletedRunRendersTheSummaryAboveIntactCharts) {
+  Frame frame = frameAt(InputMode::kNavigate, completedModel(), filledDialog());
+
+  // The summary rides at the top of the pane (rows 4..6), built from the same
+  // live view the charts draw.
+  const std::string summary = frame.lines[4] + "\n" + frame.lines[5] + "\n" + frame.lines[6];
+  EXPECT_NE(summary.find("p50/p90/p99 10.0/20.0/30.0 ms"), std::string::npos)
+      << "rows4-6=[" << frame.lines[4] << "][" << frame.lines[5] << "][" << frame.lines[6]
+      << "]";
+  EXPECT_NE(summary.find("run complete: 9s"), std::string::npos);
+  EXPECT_NE(summary.find("27,707 requests"), std::string::npos); // 27444+23+198+42
+  EXPECT_NE(summary.find("errors 263 (0.9%)"), std::string::npos); // 23+198+42
+  EXPECT_NE(summary.find("p50/p90/p99 10.0/20.0/30.0 ms"), std::string::npos);
+  EXPECT_NE(summary.find("counts: 2xx 27,444, 4xx 23, 5xx 198, rst 42, t/o 0"), std::string::npos);
+  EXPECT_NE(summary.find("every sample counted, none hidden"), std::string::npos);
+  EXPECT_NE(summary.find("recording saved: /tmp/nh-m0b-demo-1.nhsession"), std::string::npos);
+
+  // Charts intact below: the band legend and its data, then the counters.
+  bool legend_below_summary = false;
+  for (size_t row = 7; row < 12; ++row) {
+    if (frame.lines[row].find("# p50") != std::string::npos) {
+      legend_below_summary = true;
+    }
+  }
+  EXPECT_TRUE(legend_below_summary);
+  EXPECT_TRUE(frame.contains("benchmark.http_2xx"));
+
+  // A running run renders no summary block.
+  Frame running = frameAt(InputMode::kNavigate, runningModel(), filledDialog());
+  EXPECT_TRUE(running.lacks("run complete"));
+  EXPECT_TRUE(running.lacks("every sample counted, none hidden"));
+}
+
+// The compact health line (backlog item 10) renders in the pane from real
+// counter series — and with zeros when the engine never emitted them.
+TEST(HealthLineTest, PaneRendersTheFailureRateLineIncludingZeros) {
+  // No failure counters at all: the line still renders, all zeros.
+  Frame zeros = frameAt(InputMode::kNavigate, runningModel(), filledDialog());
+  EXPECT_TRUE(zeros.contains("4xx 0/s | rst 0/s | t/o 0/s"));
+
+  // A reset burst on the running model.
+  RunViewModel model = runningModel();
+  auto& resets = model.counters["benchmark.stream_resets"];
+  resets.push_back(CounterPoint{8000000000ull, 30});
+  resets.push_back(CounterPoint{9000000000ull, 72});
+  Frame burst = frameAt(InputMode::kNavigate, model, filledDialog());
+  EXPECT_TRUE(burst.contains("rst 42/s"));
+}
+
+// Pool-pending capacity context (backlog item 12): the pending series
+// renders as a fraction of the run's configured gate, with the ceiling rule.
+TEST(PoolCapacityTest, PendingSeriesRendersFractionOfTheConfiguredCap) {
+  RunViewModel model = runningModel();
+  auto& pending = model.counters["pool_rq_pending_release"];
+  pending.push_back(CounterPoint{9000000000ull, 312});
+
+  nighthawk::client::CommandLineOptions with_cap;
+  with_cap.mutable_max_pending_requests()->set_value(2048);
+  Frame capped = renderFrame(
+      RenderLayout(100, 30, /*active_tab=*/0, InputMode::kNavigate, model, filledDialog(),
+                   kSessionPath, with_cap),
+      100, 30);
+  EXPECT_TRUE(capped.contains("pool_rq_pending_release count"));
+  EXPECT_TRUE(capped.contains("cur 312/2048 (15%)"));
+  bool ceiling_rule = false;
+  for (const std::string& line : capped.lines) {
+    if (line.find("||") != std::string::npos) {
+      ceiling_rule = true;
+    }
+  }
+  EXPECT_TRUE(ceiling_rule);
+
+  // Without the configured gate the series falls back to the plain readout.
+  Frame uncapped = frameAt(InputMode::kNavigate, model, filledDialog());
+  EXPECT_TRUE(uncapped.contains("pool_rq_pending_release count"));
+  EXPECT_FALSE(uncapped.contains("cur 312/2048"));
+}
+
+// The fixed-width scrolling viewport (backlog item 9) sizes to the terminal:
+// at the 100-column minimum the window is the newest 100 seconds; at 110
+// columns it widens to match. The stamps move with the window, not with a
+// hardcoded width.
+TEST(ViewportTest, WindowScalesWithTheTerminalWidth) {
+  // 150 one-second flushes: more history than either window shows.
+  RunViewModel model;
+  model.run_state = "running";
+  model.target_uri = kUri;
+  for (uint64_t i = 0; i < 150; ++i) {
+    model.latency_band.push_back(
+        PercentilePoint{i * 1000000000ull, /*p50_ns=*/10000000, /*p90_ns=*/20000000,
+                        /*p99_ns=*/30000000});
+    model.counters["benchmark.http_2xx"].push_back(CounterPoint{i * 1000000000ull, 1000 + i});
+  }
+
+  Frame at_100 = renderFrame(
+      RenderLayout(100, 30, /*active_tab=*/0, InputMode::kNavigate, model, filledDialog(),
+                   kSessionPath),
+      100, 30);
+  EXPECT_NE(at_100.text.find("last 99s (1s/col)"), std::string::npos);
+  EXPECT_NE(at_100.text.find("t+50s..t+149s"), std::string::npos);
+
+  Frame at_110 = renderFrame(
+      RenderLayout(110, 30, /*active_tab=*/0, InputMode::kNavigate, model, filledDialog(),
+                   kSessionPath),
+      110, 30);
+  EXPECT_NE(at_110.text.find("last 109s (1s/col)"), std::string::npos);
+  EXPECT_NE(at_110.text.find("t+40s..t+149s"), std::string::npos);
+
+  // Nothing clips at the 100x30 boundary (the max-width gate frame): every
+  // row fits exactly 100 columns.
+  for (size_t i = 0; i < at_100.lines.size(); ++i) {
+    ASSERT_LE(at_100.lines[i].size(), 100u) << "row " << i << " size "
+                                            << at_100.lines[i].size() << ": ["
+                                            << at_100.lines[i] << "]";
+  }
 }
 
 } // namespace

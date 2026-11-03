@@ -208,6 +208,154 @@ TEST(RunViewModelTest, LoadReturnsStablePointerBetweenStores) {
   EXPECT_EQ(first->run_state, "completed");
 }
 
+// ---------------------------------------------------------------------------
+// Reducer annotation logic (batch-2 polish: the spike threshold, the floor
+// window, the decay, and the rescaled trigger were previously untested).
+// ---------------------------------------------------------------------------
+
+// A band-only snapshot: one sampled statistic, no counters.
+LiveSnapshot bandSnapshotAt(uint64_t monotonic_ns, uint64_t p99_ns) {
+  LiveSnapshot snapshot;
+  snapshot.set_monotonic_ns(static_cast<int64_t>(monotonic_ns));
+  StatisticSnapshot* stat = snapshot.add_statistics();
+  stat->set_id("benchmark.http_latency");
+  stat->set_count(100);
+  stat->set_p50_ns(p99_ns / 3);
+  stat->set_p90_ns(p99_ns / 2);
+  stat->set_p99_ns(p99_ns);
+  return snapshot;
+}
+
+// Folds `count` steady flushes at `p99_ns` (one per second, starting t=1s).
+RunViewModel steadyBand(size_t count, uint64_t p99_ns) {
+  RunViewModel model;
+  model.run_state = "running";
+  for (size_t i = 1; i <= count; ++i) {
+    model = ApplySnapshot(std::move(model), bandSnapshotAt(i * 1000000000ull, p99_ns));
+  }
+  return model;
+}
+
+// The "(rescaled)" trigger is the VISIBLE-WINDOW max (the newest
+// kChartViewportColumns stored points), not the whole stored band: a tall
+// peak that has already left the window must not silence the marker, and a
+// rise that stays under the window max must not fire it (batch-2 polish; the
+// pre-batch-2 trigger compared against the spike-floor window instead).
+TEST(ReducerAnnotationTest, RescaledTriggerUsesTheVisibleWindowMax) {
+  // 10 tall points (100ms) rolled well out of the window, then 90+ steady
+  // points at 30ms. The store's max is 100ms; the window's max is 30ms.
+  RunViewModel model = steadyBand(10, 100000000);
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(11000000000ull, 30000000));
+  for (size_t i = 12; i <= 10 + kChartViewportColumns; ++i) {
+    model = ApplySnapshot(std::move(model), bandSnapshotAt(i * 1000000000ull, 30000000));
+  }
+  ASSERT_EQ(model.latency_band.size(), 10 + kChartViewportColumns);
+
+  // A new p99 above the window max (but far below the stored max) must fire
+  // the one-frame marker: the viewer's chart really does rescale.
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(107000000000ull, 40000000));
+  EXPECT_TRUE(model.latency_rescaled);
+
+  // And the marker is one-frame: the next steady snapshot clears it.
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(108000000000ull, 40000000));
+  EXPECT_FALSE(model.latency_rescaled);
+}
+
+TEST(ReducerAnnotationTest, RescaledDoesNotFireBelowTheWindowMax) {
+  // The newest 20 points climb to 50ms (inside the window), older window
+  // points sit at 30ms. A new 40ms point is above the spike-floor window's
+  // max (30ms, the pre-batch-2 trigger) but BELOW the visible-window max
+  // (50ms): the chart did not rescale, so the marker must stay off.
+  RunViewModel model;
+  model.run_state = "running";
+  uint64_t t = 0;
+  for (size_t i = 0; i < 30; ++i) {
+    t += 1000000000ull;
+    model = ApplySnapshot(std::move(model), bandSnapshotAt(t, 30000000));
+  }
+  for (size_t i = 0; i < 20; ++i) {
+    t += 1000000000ull;
+    model = ApplySnapshot(std::move(model), bandSnapshotAt(t, 50000000));
+  }
+  ASSERT_EQ(model.latency_band.size(), 50u);
+
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(t + 1000000000ull, 40000000));
+  EXPECT_FALSE(model.latency_rescaled);
+
+  // Above the window max it fires again.
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(t + 2000000000ull, 60000000));
+  EXPECT_TRUE(model.latency_rescaled);
+}
+
+// The spike threshold: the newest p99 at exactly kSpikeRatio (2.0x) over its
+// recent floor opens the annotation window; just under it does not.
+TEST(ReducerAnnotationTest, SpikeOpensAtThresholdAndCarriesTheRatio) {
+  RunViewModel model = steadyBand(10, 30000000); // floor 30ms
+  EXPECT_EQ(model.spike_frames_remaining, 0u);
+
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(11000000000ull, 59000000));
+  EXPECT_EQ(model.spike_frames_remaining, 0u); // 1.97x — under the threshold
+  EXPECT_DOUBLE_EQ(model.spike_ratio, 0.0);
+
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(12000000000ull, 60000000));
+  EXPECT_EQ(model.spike_frames_remaining, kSpikeFrames); // exactly 2.0x
+  EXPECT_DOUBLE_EQ(model.spike_ratio, 2.0);
+}
+
+// The spike floor is the minimum of the last kSpikeFloorWindow points: a low
+// outlier that has rolled out of the floor window must not inflate the ratio.
+TEST(ReducerAnnotationTest, SpikeFloorIsTheFloorWindowMinimum) {
+  RunViewModel model;
+  model.run_state = "running";
+  // One 5ms outlier, then 20+ points at 40ms: the floor-window minimum is
+  // 40ms; the whole-band minimum (5ms) is out of the window.
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(1000000000ull, 5000000));
+  for (size_t i = 2; i <= kSpikeFloorWindow + 5; ++i) {
+    model = ApplySnapshot(std::move(model), bandSnapshotAt(i * 1000000000ull, 40000000));
+  }
+  // 79ms is 1.975x the floor-window minimum: no spike. Against the stale
+  // 5ms whole-band floor it would read 15.8x and (wrongly) fire.
+  model = ApplySnapshot(std::move(model),
+                        bandSnapshotAt((kSpikeFloorWindow + 6) * 1000000000ull, 79000000));
+  EXPECT_EQ(model.spike_frames_remaining, 0u);
+
+  // 80ms is exactly 2.0x the floor-window minimum: spike.
+  model = ApplySnapshot(std::move(model),
+                        bandSnapshotAt((kSpikeFloorWindow + 7) * 1000000000ull, 80000000));
+  EXPECT_EQ(model.spike_frames_remaining, kSpikeFrames);
+  EXPECT_DOUBLE_EQ(model.spike_ratio, 2.0);
+}
+
+// The spike annotation window decays one frame per below-threshold flush and
+// stays closed afterwards.
+TEST(ReducerAnnotationTest, SpikeWindowDecaysAndStaysClosed) {
+  RunViewModel model = steadyBand(10, 30000000);
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(11000000000ull, 90000000)); // 3x: open
+  ASSERT_EQ(model.spike_frames_remaining, kSpikeFrames);
+
+  for (int expected = kSpikeFrames - 1; expected >= 0; --expected) {
+    model = ApplySnapshot(std::move(model),
+                          bandSnapshotAt(static_cast<uint64_t>(12 + (kSpikeFrames - 1 - expected)) *
+                                             1000000000ull,
+                                         30000000));
+    EXPECT_EQ(model.spike_frames_remaining, static_cast<size_t>(expected));
+  }
+  // Well past the decay: still closed, no ratio residue.
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(20000000000ull, 30000000));
+  EXPECT_EQ(model.spike_frames_remaining, 0u);
+  EXPECT_DOUBLE_EQ(model.spike_ratio, 0.0);
+}
+
+// Too few points to judge a floor: no spike decision at all.
+TEST(ReducerAnnotationTest, SpikeNeedsAFloorWindow) {
+  RunViewModel model;
+  model.run_state = "running";
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(1000000000ull, 1000000));
+  model = ApplySnapshot(std::move(model), bandSnapshotAt(2000000000ull, 100000000));
+  // 100x over the previous point, but the band is under the 3-point minimum.
+  EXPECT_EQ(model.spike_frames_remaining, 0u);
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client

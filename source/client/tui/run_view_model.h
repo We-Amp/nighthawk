@@ -27,6 +27,15 @@ namespace Tui {
 // the front.
 inline constexpr size_t kRunViewModelMaxPoints = 600;
 
+// The visible chart window in columns, as the reducer approximates it (the
+// charts render at the terminal's width, which ApplySnapshot cannot know; the
+// standard 100x30 terminal gives the pane ~100 data columns). The
+// "(rescaled)" marker's trigger is computed over the newest
+// kChartViewportColumns stored points — the window max a viewer actually sees
+// — not over the whole 600-point store, where an old tall peak would silence
+// the marker for genuinely new rescalings (batch-2 polish).
+inline constexpr size_t kChartViewportColumns = 96;
+
 struct PercentilePoint {
   uint64_t monotonic_ns;
   uint64_t p50_ns;
@@ -59,7 +68,11 @@ struct RunViewModel {
   nighthawk::client::LiveSnapshot last_snapshot;
   // One-frame markers recomputed by every ApplySnapshot (true only on the
   // frame whose snapshot changed the scale), so the chart renderer can print
-  // a one-frame "(rescaled)" marker when the latency window max grows.
+  // a one-frame "(rescaled)" marker when the latency VISIBLE-WINDOW max
+  // grows: the trigger compares the newest p99 against the max of the newest
+  // kChartViewportColumns stored points (pre-append), not the whole
+  // 600-point store band (batch-2 polish; the store's old peaks used to
+  // silence the marker).
   bool latency_rescaled = false;
   // Spike salience: while > 0, the chart renders the "!" excursion glyph and
   // the "^Nx" numeric tail. Set to kSpikeFrames when the newest p99 exceeds

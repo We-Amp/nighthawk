@@ -18,7 +18,10 @@ namespace Tui {
 
 // FORK-ONLY (We-Amp): the TUI shell's layout contract (spec §4):
 //   - a persistent 3-row status bar always on screen (rows 0..2),
-//   - the active tab's pane owns the screen below it,
+//   - a one-row tab strip under the status bar (row 3): `| charts | flame
+//     (m1) | knobs |`, the active tab inverted, not-yet-implemented panes
+//     dimmed with their reason (backlog item 11),
+//   - the active tab's pane owns the screen below the strip,
 //   - a persistent mode-aware key bar pinned to the bottom row (row 29 at the
 //     declared minimum),
 //   - a declared minimum terminal size below which the TUI renders one clear
@@ -76,11 +79,12 @@ struct OverlayState {
 };
 
 // The full frame for one redraw: min-size gate, then status bar over the
-// active tab's pane and the key bar, plus the dialog/help overlay while one
-// is open. `width`/`height` are the terminal dimensions — Task 6 feeds them
-// from the terminal size each frame. Tabs: 0 = charts, 1 = knobs (rendered
-// from `knob_options`, the most recent run's options; unset defaults before
-// any run). `overlay` may be null (the plain pane then renders).
+// tab strip, the active tab's pane, and the key bar, plus the dialog/help
+// overlay while one is open. `width`/`height` are the terminal dimensions —
+// Task 6 feeds them from the terminal size each frame. Tabs (the tab strip's
+// order): 0 = charts, 1 = flame (M1's pane, dimmed placeholder), 2 = knobs
+// (rendered from `knob_options`, the most recent run's options; unset
+// defaults before any run). `overlay` may be null (the plain pane renders).
 ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mode,
                             const RunViewModel& model, const StartRunDialogModel& dialog,
                             absl::string_view session_path,
@@ -88,13 +92,27 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                                 nighthawk::client::CommandLineOptions{},
                             const OverlayState* overlay = nullptr);
 
-// The charts tab (tab 0): percentile band on top, one sparkline per counter
-// series below (sorted by name for deterministic frames). `width`/`height`
-// are the pane-local dimensions (terminal size minus the status bar and key
-// bar). The empty state is state-aware: idle (no run yet) renders "no run
-// yet - press n to start one"; a running run before its first flush renders
-// "waiting for first flush".
-ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height);
+// The charts tab (tab 0): on a completed run a completion-summary block
+// first (backlog item 7: totals, error ratio, final percentiles, the saved
+// session path, and the §8.2 counts-shown disclosure — charts intact below),
+// then the percentile band, the compact health line (4xx / rst / t/o, item
+// 10), and one sparkline per counter series below (sorted by name for
+// deterministic frames; the pool-pending series renders its fraction of
+// `pool_pending_cap` when the run's config sets it, item 12). `width`/
+// `height` are the pane-local dimensions (terminal size minus the status
+// bar, the tab strip, and the key bar). The empty state is state-aware:
+// idle (no run yet) renders "no run yet - press n to start one"; a running
+// run before its first flush renders "waiting for first flush".
+ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height,
+                                absl::string_view session_path = "",
+                                uint64_t pool_pending_cap = 0);
+
+// The one-row tab strip (backlog item 11): `| charts | flame (m1) | knobs |`
+// under the status bar. The active tab renders inverted; a pane that does
+// not exist yet renders dimmed with its reason in the text (`flame (m1)`)
+// so pressing a key that leads there is visibly refused even through a
+// monochrome paste.
+ftxui::Element RenderTabStrip(int active_tab);
 
 // The persistent bottom-row key bar, rendered from the shell's real key map:
 // navigate names n/c/k/q/? (plus s while a run is live, and q's stop-then-
