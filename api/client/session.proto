@@ -8,6 +8,13 @@ package nighthawk.client;
 // rebasing — colliding field NUMBERS are renumbered, while colliding MESSAGE
 // NAMES are renamed (fork-private names carry no wire-compat obligation).
 // Upstream consumers never see these messages unless they explicitly opt in.
+//
+// Session-format evolution rule: record types evolve by adding oneof cases
+// (and new fields within a case). A reader that encounters an unknown case in
+// a format_version-"1" file MUST report it as an unknown-record version skew
+// — never silently skip it, never treat it as corruption. M1's profile_window
+// record is the first such case; the M1 plan owns the reader-side
+// implementation.
 
 import "api/client/live.proto";
 import "api/client/output.proto";

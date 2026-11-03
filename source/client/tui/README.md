@@ -50,6 +50,14 @@ supposed to be independent of. The guard is written as an intersection over
 `deps(tui_lib)` rather than a direct-deps check so that a violation added
 anywhere in the transitive closure — not just in this BUILD file — is caught.
 
+## Session format evolution
+
+Record types in `api/client/session.proto` evolve by adding `oneof` cases: a
+reader that hits an unknown case in a `format_version`-"1" file must report it
+as an unknown-record version skew — never silent skip, never corruption
+(M1's `profile_window` is the first such case; the M1 plan owns the
+reader-side implementation). See the header comment there for the rule.
+
 ## FTXUI fetch caveat
 
 `bazel fetch @ftxui//...` fails on `@ftxui//:tests`: its googletest
