@@ -1,6 +1,7 @@
 #pragma once
 
 #include <semaphore.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <functional>
