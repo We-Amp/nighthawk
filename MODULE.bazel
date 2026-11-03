@@ -33,6 +33,13 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "abseil-cpp", version = "20260817.0", repo_name = "com_google_absl")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
 
+# FORK-ONLY (We-Amp): TUI dependencies. FTXUI from the official BCR for the
+# nighthawk_tui terminal UI; TCLAP pinned explicitly at the version already in
+# the resolved graph (transitively via envoy) so the direct pin cannot shift
+# any already-pinned module.
+bazel_dep(name = "ftxui", version = "7.0.3")
+bazel_dep(name = "tclap", version = "1.2.5.bcr.1")
+
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 http_archive(

@@ -3,10 +3,24 @@ load(
     "envoy_cc_test",
     "envoy_package",
 )
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 licenses(["notice"])  # Apache 2
 
 envoy_package()
+
+# FORK-ONLY (We-Amp): plain cc_test for the TUI skeleton. Deliberately NOT an
+# envoy_cc_test: the TUI quarantine rule keeps this target off Envoy's C++
+# sources, so it must not pull in the Envoy test helper stack.
+cc_test(
+    name = "tui_app_test",
+    srcs = ["tui_app_test.cc"],
+    deps = [
+        "//source/client/tui:tui_lib",
+        "@googletest//:gtest_main",
+    ],
+)
+
 
 envoy_cc_test(
     name = "benchmark_http_client_test",

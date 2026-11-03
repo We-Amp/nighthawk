@@ -220,6 +220,8 @@
     "https://bcr.bazel.build/modules/fmt/12.2.0.bcr.1/source.json": "5a817473cfdd07162adbf555a3cd5c8a798f1f751b87a13a3464dc6d9370b0f3",
     "https://bcr.bazel.build/modules/fmt/8.1.1/MODULE.bazel": "0f55e72316f1593d78998e2dc2ddf2d80697c226c43dc66e4bf2e2e9fd99f52d",
     "https://bcr.bazel.build/modules/fp16/0.0.0-260704-3d2de18.envoy/MODULE.bazel": "not found",
+    "https://bcr.bazel.build/modules/ftxui/7.0.3/MODULE.bazel": "c9dee14b3b918edde60f6bce08bfaa9f4340798e0f67a22a7c88f1a376bce892",
+    "https://bcr.bazel.build/modules/ftxui/7.0.3/source.json": "c835125a719d51f9c1d74b360a806cfe091386f97a53506bef81f8ad320fa7bd",
     "https://bcr.bazel.build/modules/fuzztest/20241028.0/MODULE.bazel": "55ccf828e88fb6ef6aa7fc477f7d0d442c5e740f8c7581294862645069b4a88d",
     "https://bcr.bazel.build/modules/fuzztest/20241028.0/source.json": "dc9bc5801d78274b062ee1dc1a27a0e1e63f8bd505cd46cc1e914a62c0f5c274",
     "https://bcr.bazel.build/modules/gawk/5.3.2.bcr.1/MODULE.bazel": "cdf8cbe5ee750db04b78878c9633cc76e80dcf4416cbe982ac3a9222f80713c8",

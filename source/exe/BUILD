@@ -70,3 +70,16 @@ envoy_cc_library(
     ],
     alwayslink = True,
 )
+
+# FORK-ONLY (We-Amp): entry point for the nighthawk_tui binary. Kept free of
+# the engine's version_linkstamp / symbolize deps so the TUI builds without
+# Envoy C++ sources (quarantine rule, see source/client/tui/README.md).
+envoy_cc_library(
+    name = "tui_main_entry_lib",
+    srcs = ["tui_main_entry.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//source/client/tui:tui_lib",
+    ],
+    alwayslink = True,
+)

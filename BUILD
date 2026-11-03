@@ -98,3 +98,14 @@ envoy_cc_binary(
         "//source/exe:output_transform_main_entry_lib",
     ],
 )
+
+# FORK-ONLY (We-Amp): TUI binary skeleton. Deliberately not in the "nighthawk"
+# filegroup above (that is the engine binary set) and deliberately free of the
+# engine binaries' -lrt linkopt: the TUI must build on a clean mac checkout
+# without any librt crutch. Quarantine rule: source/client/tui/README.md.
+envoy_cc_binary(
+    name = "nighthawk_tui",
+    deps = [
+        "//source/exe:tui_main_entry_lib",
+    ],
+)
