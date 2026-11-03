@@ -384,15 +384,17 @@ TEST(ChartsTest, CounterLineEmptyInputRendersPlaceholder) {
 // counters, zeros included — an absent series (the engine suppresses zero
 // counters) reads as a steady 0/s.
 TEST(ChartsTest, HealthLineRendersRatesIncludingZeros) {
-  // Cumulative 4xx: 100 -> 102 -> 102: latest rate 0/s, peak 2/s. Resets and
-  // pool connect failures absent entirely.
+  // Cumulative 4xx: first appearance at 100 (the engine suppresses zero
+  // counters, so the first sighting carries its full count), then 100 ->
+  // 102 -> 102: latest rate 0/s, peak the first appearance's 100/s. Resets
+  // and pool connect failures absent entirely.
   std::vector<CounterPoint> http_4xx = {CounterPoint{0, 100}, CounterPoint{1000000000ull, 102},
                                         CounterPoint{2000000000ull, 102}};
   std::vector<std::string> lines =
       screenLines(RenderHealthLine(http_4xx, {}, {}, 60, 10), 60, 10);
   ASSERT_GE(lines.size(), 1u);
   EXPECT_NE(lines[0].find("4xx 0/s | rst 0/s | t/o 0/s"), std::string::npos);
-  EXPECT_NE(lines[0].find("now 0/s  max 2/s"), std::string::npos);
+  EXPECT_NE(lines[0].find("now 0/s  max 100/s"), std::string::npos);
 
   // All series empty (no failures ever): the line still renders — zeros are
   // information.
@@ -405,6 +407,28 @@ TEST(ChartsTest, HealthLineRendersRatesIncludingZeros) {
   std::vector<std::string> burst =
       screenLines(RenderHealthLine({}, resets, {}, 60, 10), 60, 10);
   EXPECT_NE(burst[0].find("rst 42/s"), std::string::npos);
+}
+
+// A counter's first appearance counts as its delta: the engine suppresses
+// zero counters, so a flush that first carries N failures must read N/s,
+// not 0/s — while a first appearance at 0 stays a 0/s.
+TEST(ChartsTest, HealthLineCountsFirstAppearanceInRate) {
+  // Single sighting at 7: the flush carried 7 failures, so both the latest
+  // and the peak rate are 7/s.
+  std::vector<CounterPoint> first_at_seven = {CounterPoint{500000000ull, 7}};
+  std::vector<std::string> lines =
+      screenLines(RenderHealthLine(first_at_seven, {}, {}, 60, 10), 60, 10);
+  ASSERT_GE(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("4xx 7/s | rst 0/s | t/o 0/s"), std::string::npos);
+  EXPECT_NE(lines[0].find("now 7/s  max 7/s"), std::string::npos);
+
+  // First appearance at 0 (and nothing after): a steady 0/s.
+  std::vector<CounterPoint> first_at_zero = {CounterPoint{500000000ull, 0}};
+  std::vector<std::string> zeros =
+      screenLines(RenderHealthLine(first_at_zero, {}, {}, 60, 10), 60, 10);
+  ASSERT_GE(zeros.size(), 1u);
+  EXPECT_NE(zeros[0].find("4xx 0/s | rst 0/s | t/o 0/s"), std::string::npos);
+  EXPECT_NE(zeros[0].find("now 0/s  max 0/s"), std::string::npos);
 }
 
 TEST(ChartsTest, ChartsRenderWindowedColumnsWithinWidth) {

@@ -387,9 +387,13 @@ ftxui::Element RenderHealthLine(const std::vector<CounterPoint>& http_4xx,
   // contributes a steady 0/s — zeros are information.
   const auto deltaAt = [](const std::vector<CounterPoint>& series) {
     std::map<uint64_t, uint64_t> deltas;
-    for (size_t i = 1; i < series.size(); ++i) {
+    for (size_t i = 0; i < series.size(); ++i) {
+      // A counter's first appearance is its delta: the engine suppresses
+      // zero counters, so the first sighting already carries the full
+      // pre-appearance count (first-appearance-at-0 stays a 0 delta).
+      const uint64_t previous = i > 0 ? series[i - 1].value : 0;
       deltas[series[i].monotonic_ns] =
-          series[i].value > series[i - 1].value ? series[i].value - series[i - 1].value : 0;
+          series[i].value > previous ? series[i].value - previous : 0;
     }
     return deltas;
   };
