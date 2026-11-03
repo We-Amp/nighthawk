@@ -81,6 +81,39 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): layout-contract tests (min-size gate, status bar rows).
+# Plain cc_test, same quarantine reasoning as tui_view_model_test.
+cc_test(
+    name = "tui_layout_test",
+    srcs = ["tui_layout_test.cc"],
+    deps = [
+        "//source/client/tui:tui_lib",
+        "@ftxui//:dom",
+        "@ftxui//:screen",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
+# FORK-ONLY (We-Amp): start-run dialog model + input-mode tests. Plain cc_test,
+# same quarantine reasoning as tui_view_model_test.
+cc_test(
+    name = "tui_start_run_dialog_test",
+    srcs = ["tui_start_run_dialog_test.cc"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 envoy_cc_test(
     name = "benchmark_http_client_test",
     srcs = ["benchmark_http_client_test.cc"],
