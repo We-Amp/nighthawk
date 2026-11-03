@@ -78,6 +78,17 @@ envoy_cc_binary(
     ],
 )
 
+# FORK-ONLY (We-Amp): live snapshot streaming probe client.
+envoy_cc_binary(
+    name = "nighthawk_live_probe",
+    linkopts = [
+        "-lrt",
+    ],
+    deps = [
+        "//source/exe:live_probe_entry_lib",
+    ],
+)
+
 envoy_cc_binary(
     name = "nighthawk_output_transform",
     linkopts = [

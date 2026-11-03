@@ -243,6 +243,17 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "live_probe_test",
+    srcs = ["live_probe_test.cc"],
+    deps = [
+        "//source/client:live_probe_lib",
+        "//source/client:nighthawk_service_lib",
+        "//test/test_common:environment_lib",
+        "@envoy//test/test_common:network_utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "statistic_test",
     srcs = ["statistic_test.cc"],
     data = [

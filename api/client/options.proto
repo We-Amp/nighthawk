@@ -11,6 +11,7 @@ import "envoy/config/core/v3/protocol.proto";
 import "envoy/config/metrics/v3/stats.proto";
 import "envoy/extensions/transport_sockets/tls/v3/cert.proto";
 import "envoy/config/core/v3/extension.proto";
+import "api/client/live.proto";
 import "validate/validate.proto";
 
 // Allows for static configuration of requests that should be send by the load generator.
@@ -140,7 +141,8 @@ message Protocol {
 
 // TODO(oschaaf): Ultimately this will be a load test specification. The fact that it
 // can arrive via CLI is just a concrete detail. Change this to reflect that.
-// Next unused number is 121.
+// Next unused number is 121. (Field 911 is reserved FORK-ONLY (We-Amp): see
+// the live_streaming field below.)
 message CommandLineOptions {
   // The target requests-per-second rate. Default: 5.
   google.protobuf.UInt32Value requests_per_second = 1
@@ -347,4 +349,9 @@ message CommandLineOptions {
   // A plugin config that is to be parsed by a RateLimiterPluginConfigFactory
   // and used to create a custom rate limiter.
   envoy.config.core.v3.TypedExtensionConfig rate_limiter_plugin_config = 120;
+
+  // FORK-ONLY (We-Amp): rebase check - field number 911 is fork-specific and
+  // free upstream. Presence of this message opts a run in to live snapshot
+  // streaming over ExecutionStream.
+  nighthawk.client.LiveStreamingOptions live_streaming = 911;
 }

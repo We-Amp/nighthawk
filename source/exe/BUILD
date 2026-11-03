@@ -47,6 +47,19 @@ envoy_cc_library(
     alwayslink = True,
 )
 
+# FORK-ONLY (We-Amp): entry point for the live probe binary.
+envoy_cc_library(
+    name = "live_probe_entry_lib",
+    srcs = ["live_probe_main_entry.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//source/client:live_probe_lib",
+        "//source/common:version_linkstamp",
+        "@com_google_absl//absl/debugging:symbolize",
+    ],
+    alwayslink = True,
+)
+
 envoy_cc_library(
     name = "output_transform_main_entry_lib",
     srcs = ["output_transform_main_entry.cc"],

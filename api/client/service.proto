@@ -6,6 +6,7 @@ import "google/protobuf/duration.proto";
 import "google/rpc/status.proto";
 import "validate/validate.proto";
 
+import "api/client/live.proto";
 import "api/client/options.proto";
 import "api/client/output.proto";
 
@@ -37,6 +38,10 @@ message ExecutionResponse {
   // if it is not set there it will be auto-generated. The format used for auto-generated
   // identifiers may change at any time.
   string execution_id = 8;
+  // FORK-ONLY (We-Amp): rebase check - field number 911 is fork-specific and
+  // free upstream. A live progress snapshot, streamed while the run is in
+  // flight when the request opted in to live streaming.
+  nighthawk.client.LiveSnapshot live_snapshot = 911;
 }
 
 service NighthawkService {

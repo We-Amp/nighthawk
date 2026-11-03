@@ -10,8 +10,12 @@
 #pragma clang diagnostic pop
 #endif
 
+#include <atomic>
 #include <future>
 #include <memory>
+#include <thread>
+
+#include "absl/synchronization/mutex.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/common/thread.h"
@@ -71,6 +75,12 @@ private:
   // busy_lock_ is used to test from the service thread to query if there's
   // an active test being run.
   Envoy::Thread::MutexBasicLockable busy_lock_;
+  // FORK-ONLY (We-Amp): serializes every write to the execution stream. Two
+  // writers exist when live snapshot streaming is opted in: the run thread
+  // (final response) and the live snapshot collector thread (snapshot
+  // responses). gRPC ServerReaderWriter::Write is not safe for concurrent
+  // use, so every write must take this mutex.
+  absl::Mutex stream_write_mutex_;
 };
 
 /**

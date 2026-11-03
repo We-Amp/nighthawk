@@ -980,6 +980,8 @@ OptionsImpl::OptionsImpl(const nighthawk::client::CommandLineOptions& options) {
   }
   stats_flush_interval_ =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(options, stats_flush_interval, stats_flush_interval_);
+  // FORK-ONLY (We-Amp): live snapshot streaming opt-in.
+  live_streaming_ = options.has_live_streaming();
   if (options.has_stats_flush_interval_duration()) {
     stats_flush_interval_duration_ = options.stats_flush_interval_duration();
   }
@@ -1235,6 +1237,10 @@ CommandLineOptionsPtr OptionsImpl::toCommandLineOptionsInternal() const {
     *command_line_options->mutable_stats_flush_interval_duration() = stats_flush_interval_duration_;
   } else {
     command_line_options->mutable_stats_flush_interval()->set_value(stats_flush_interval_);
+  }
+  // FORK-ONLY (We-Amp): live snapshot streaming opt-in.
+  if (live_streaming_) {
+    command_line_options->mutable_live_streaming();
   }
   command_line_options->mutable_latency_response_header_name()->set_value(
       latency_response_header_name_);

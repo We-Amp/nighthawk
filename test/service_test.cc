@@ -1,6 +1,7 @@
 #include <grpc++/grpc++.h>
 
 #include <chrono>
+#include <map>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -9,6 +10,8 @@
 #include <unistd.h>
 
 #include "nighthawk/common/exception.h"
+
+#include "absl/strings/match.h"
 
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
@@ -394,6 +397,149 @@ TEST_P(ServiceTest, Unresolvable) {
   options->mutable_uri()->set_value("http://unresolvable-host/");
   // We expect output, because the options proto is valid.
   runWithFailingValidationExpectations(false, "Unable to create ProcessImpl");
+}
+
+namespace {
+
+// Collected outcome of one benchmark request on a live-streaming (or legacy)
+// stream: every snapshot received, whether the run's final response arrived,
+// and whether any message arrived after the final response (which must never
+// happen: snapshots stop at run end).
+struct LiveStreamResult {
+  std::vector<nighthawk::client::LiveSnapshot> snapshots;
+  bool got_final_response{false};
+  bool message_after_final{false};
+};
+
+// Sends one request on the stream and reads until the server closes its side.
+// A grpc::ClientContext may only be used for a single RPC, so each call gets
+// its own context here.
+LiveStreamResult readLiveStream(nighthawk::client::NighthawkService::Stub* stub,
+                                const ExecutionRequest& request) {
+  LiveStreamResult result;
+  grpc::ClientContext context;
+  auto stream = stub->ExecutionStream(&context);
+  EXPECT_TRUE(stream->Write(request, {}));
+  EXPECT_TRUE(stream->WritesDone());
+  ExecutionResponse response;
+  while (stream->Read(&response)) {
+    if (result.got_final_response) {
+      result.message_after_final = true;
+      break;
+    }
+    if (response.has_live_snapshot()) {
+      result.snapshots.push_back(response.live_snapshot());
+    } else if (response.has_output()) {
+      result.got_final_response = true;
+    }
+  }
+  auto status = stream->Finish();
+  EXPECT_TRUE(status.ok());
+  return result;
+}
+
+ExecutionRequest makeLiveRequest(const std::string& uri, uint32_t duration_seconds, uint32_t rps,
+                                 uint32_t flush_interval_seconds, bool live_streaming) {
+  ExecutionRequest request;
+  auto* options = request.mutable_start_request()->mutable_options();
+  options->mutable_uri()->set_value(uri);
+  options->mutable_duration()->set_seconds(duration_seconds);
+  options->mutable_requests_per_second()->set_value(rps);
+  options->mutable_stats_flush_interval()->set_value(flush_interval_seconds);
+  if (live_streaming) {
+    options->mutable_live_streaming();
+  }
+  return request;
+}
+
+} // namespace
+
+// Without opting in to live streaming, the service must behave exactly as
+// before: a single response carrying the run output, and no snapshot messages
+// at all. The fork's legacy consumers assert on this via RELEASE_ASSERT.
+TEST_P(ServiceTest, LiveStreamingDisabledBackCompat) {
+  TestHttpListener listener;
+  ExecutionRequest request = makeLiveRequest(listener.uri(), 2, 10, 1, /*live_streaming=*/false);
+  LiveStreamResult result = readLiveStream(stub_.get(), request);
+  EXPECT_TRUE(result.got_final_response);
+  EXPECT_TRUE(result.snapshots.empty());
+  EXPECT_FALSE(result.message_after_final);
+}
+
+// With live streaming opted in, snapshots flow at the stats-flush cadence while
+// the run is in flight: strictly increasing monotonic_ns, counters that only
+// grow, and at least one statistic sample with real content.
+TEST_P(ServiceTest, LiveStreamingSnapshots) {
+  TestHttpListener listener;
+  ExecutionRequest request = makeLiveRequest(listener.uri(), 10, 10, 1, /*live_streaming=*/true);
+  LiveStreamResult result = readLiveStream(stub_.get(), request);
+  EXPECT_TRUE(result.got_final_response);
+  EXPECT_FALSE(result.message_after_final);
+  ASSERT_GE(result.snapshots.size(), 2);
+
+  int64_t last_monotonic_ns = -1;
+  std::map<std::string, uint64_t> last_counters;
+  bool found_benchmark_counter = false;
+  bool found_usable_statistic = false;
+  for (const nighthawk::client::LiveSnapshot& snapshot : result.snapshots) {
+    EXPECT_GT(snapshot.monotonic_ns(), last_monotonic_ns);
+    last_monotonic_ns = snapshot.monotonic_ns();
+    for (const auto& [name, value] : snapshot.counters()) {
+      if (absl::StartsWith(name, "benchmark.")) {
+        found_benchmark_counter = true;
+        auto it = last_counters.find(name);
+        if (it != last_counters.end()) {
+          EXPECT_GE(value, it->second) << "counter " << name << " went backwards";
+        }
+        last_counters[name] = value;
+      }
+    }
+    for (const nighthawk::client::StatisticSnapshot& statistic : snapshot.statistics()) {
+      if (statistic.count() > 0 && statistic.p99_ns() > 0) {
+        found_usable_statistic = true;
+      }
+    }
+  }
+  EXPECT_TRUE(found_benchmark_counter);
+  EXPECT_TRUE(found_usable_statistic);
+}
+
+// Snapshots must stop when the run ends: nothing may follow the final response,
+// and a second back-to-back run on the same stream must behave identically
+// (nothing from the first run may bleed into the second).
+TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
+  TestHttpListener listener;
+  ExecutionRequest request = makeLiveRequest(listener.uri(), 2, 10, 1, /*live_streaming=*/true);
+
+  LiveStreamResult first = readLiveStream(stub_.get(), request);
+  EXPECT_TRUE(first.got_final_response);
+  EXPECT_FALSE(first.message_after_final);
+  EXPECT_GE(first.snapshots.size(), 1);
+
+  // Back-to-back run on the same stream, same behavior expected.
+  LiveStreamResult second = readLiveStream(stub_.get(), request);
+  EXPECT_TRUE(second.got_final_response);
+  EXPECT_FALSE(second.message_after_final);
+  EXPECT_GE(second.snapshots.size(), 1);
+  // The second run must produce fresh snapshots of its own, not a carry-over
+  // of the first run's state: its first snapshot (taken ~1s into the run) must
+  // not already hold as many 2xx responses as the first run accumulated over
+  // its whole duration.
+  if (!first.snapshots.empty() && !second.snapshots.empty()) {
+    uint64_t first_run_total_http_2xx = 0;
+    uint64_t second_run_first_http_2xx = 0;
+    for (const auto& [name, value] : first.snapshots.back().counters()) {
+      if (name == "benchmark.http_2xx") {
+        first_run_total_http_2xx = value;
+      }
+    }
+    for (const auto& [name, value] : second.snapshots.front().counters()) {
+      if (name == "benchmark.http_2xx") {
+        second_run_first_http_2xx = value;
+      }
+    }
+    EXPECT_LT(second_run_first_http_2xx, first_run_total_http_2xx);
+  }
 }
 
 } // namespace

@@ -37,6 +37,12 @@ public:
 
   bool requestExecutionCancellation() override;
 
+  // FORK-ONLY (We-Amp): live snapshot aggregation is a local-process feature;
+  // a remote process produces no local snapshots. Live snapshot streaming of a
+  // remote run is not supported in v0, and the service client used here
+  // RELEASE_ASSERTs on more than one response anyway.
+  nighthawk::client::LiveSnapshot toLiveSnapshot() override { return {}; }
+
 private:
   const Options& options_;
   const std::unique_ptr<NighthawkServiceClient> service_client_;

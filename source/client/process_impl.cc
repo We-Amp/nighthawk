@@ -2,8 +2,10 @@
 
 #include <sys/file.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -741,6 +743,23 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
   const std::chrono::nanoseconds inter_worker_delay =
       computeInterWorkerDelay(concurrency, options_.requestsPerSecond());
   int worker_number = 0;
+  // FORK-ONLY (We-Amp): when live snapshot streaming is opted in, workers
+  // compute immutable partials on their own dispatcher threads and hand them
+  // to this process, which aggregates them into LiveSnapshots.
+  std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)> live_partial_cb;
+  std::chrono::milliseconds live_snapshot_interval{0};
+  if (options_.liveStreamingEnabled()) {
+    live_partial_cb = [this](nighthawk::client::WorkerLiveSnapshotPartial partial) {
+      recordLiveSnapshotPartial(std::move(partial));
+    };
+    const Envoy::Protobuf::Duration flush_duration = options_.statsFlushIntervalDuration();
+    if (flush_duration.seconds() > 0 || flush_duration.nanos() > 0) {
+      live_snapshot_interval = std::chrono::milliseconds(flush_duration.seconds() * 1000 +
+                                                         flush_duration.nanos() / 1000000);
+    } else {
+      live_snapshot_interval = std::chrono::seconds(options_.statsFlushInterval());
+    }
+  }
   while (workers_.size() < concurrency) {
     absl::StatusOr<std::vector<UserDefinedOutputNamePluginPair>> plugins =
         createUserDefinedOutputPlugins(user_defined_output_factories_, worker_number);
@@ -753,10 +772,82 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
         first_worker_start + (inter_worker_delay * worker_number), tracer_,
         options_.simpleWarmup() ? ClientWorkerImpl::HardCodedWarmupStyle::ON
                                 : ClientWorkerImpl::HardCodedWarmupStyle::OFF,
-        std::move(*plugins)));
+        std::move(*plugins), live_partial_cb, live_snapshot_interval));
     worker_number++;
   }
   return absl::OkStatus();
+}
+
+void ProcessImpl::recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapshotPartial partial) {
+  {
+    std::lock_guard<std::mutex> lock(live_partials_mutex_);
+    live_partials_.push_back(std::move(partial));
+  }
+}
+
+nighthawk::client::LiveSnapshot ProcessImpl::toLiveSnapshot() {
+  nighthawk::client::LiveSnapshot snapshot;
+  std::vector<nighthawk::client::WorkerLiveSnapshotPartial> partials;
+  {
+    std::lock_guard<std::mutex> lock(live_partials_mutex_);
+    partials = std::move(live_partials_);
+    live_partials_.clear();
+  }
+  // Fold the new partials into the running per-worker state. Partial values
+  // are cumulative since run start, so the latest one per worker wins.
+  for (nighthawk::client::WorkerLiveSnapshotPartial& partial : partials) {
+    auto& counter_values = live_worker_counter_values_[partial.worker_id()];
+    for (const auto& [name, value] : partial.counters()) {
+      counter_values[name] = value;
+    }
+    auto& worker_statistics = live_worker_statistics_[partial.worker_id()];
+    for (const nighthawk::client::StatisticSnapshot& stat : partial.statistics()) {
+      worker_statistics[stat.id()] = stat;
+    }
+  }
+  // Aggregate the immutable partials. Counts are summed over the workers
+  // (they are cumulative since run start); percentiles take the per-worker
+  // maximum, as raw histograms cannot be merged without their samples. This
+  // makes percentile values an approximation of the global picture, which the
+  // counts alongside them let consumers interpret.
+  for (const auto& [worker_id, counter_values] : live_worker_counter_values_) {
+    for (const auto& [name, value] : counter_values) {
+      (*snapshot.mutable_counters())[name] += value;
+    }
+  }
+  absl::flat_hash_map<std::string, nighthawk::client::StatisticSnapshot*> statistics;
+  for (const auto& [worker_id, worker_statistics] : live_worker_statistics_) {
+    for (const auto& [id, stat] : worker_statistics) {
+      auto inserted = statistics.emplace(id, nullptr);
+      if (inserted.second) {
+        nighthawk::client::StatisticSnapshot* merged = snapshot.add_statistics();
+        *merged = stat;
+        inserted.first->second = merged;
+      } else {
+        nighthawk::client::StatisticSnapshot* merged = inserted.first->second;
+        merged->set_count(merged->count() + stat.count());
+        merged->set_p50_ns(std::max(merged->p50_ns(), stat.p50_ns()));
+        merged->set_p90_ns(std::max(merged->p90_ns(), stat.p90_ns()));
+        merged->set_p99_ns(std::max(merged->p99_ns(), stat.p99_ns()));
+      }
+    }
+  }
+  const auto now_ns = [](auto clock_now) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(clock_now.time_since_epoch())
+        .count();
+  };
+  snapshot.set_wall_time_unix_ns(now_ns(std::chrono::system_clock::now()));
+  // Snapshots are produced by a single collector thread, but enforce strictly
+  // increasing values anyway: the assertion is a contract consumers may rely on.
+  int64_t monotonic_ns = now_ns(std::chrono::steady_clock::now());
+  if (monotonic_ns <= last_live_snapshot_monotonic_ns_) {
+    monotonic_ns = last_live_snapshot_monotonic_ns_ + 1;
+  }
+  last_live_snapshot_monotonic_ns_ = monotonic_ns;
+  snapshot.set_monotonic_ns(monotonic_ns);
+  snapshot.set_phase_id("main");
+  snapshot.set_epoch_id(options_.executionId().value_or(""));
+  return snapshot;
 }
 
 void ProcessImpl::configureComponentLogLevels(spdlog::level::level_enum level) {

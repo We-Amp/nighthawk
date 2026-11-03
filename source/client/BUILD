@@ -203,8 +203,22 @@ envoy_cc_library(
         ":nighthawk_client_lib",
         "//api/client:grpc_service_lib",
         "//api/request_source:grpc_request_source_service_lib",
+        "@com_google_absl//absl/synchronization",
         "@envoy//source/common/common:thread_lib_with_external_headers",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+    ],
+)
+
+# FORK-ONLY (We-Amp): the live probe client, which drives a Nighthawk service
+# run opted in to live snapshot streaming and prints JSON-line snapshots.
+envoy_cc_library(
+    name = "live_probe_lib",
+    srcs = ["live_probe.cc"],
+    hdrs = ["live_probe.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:grpc_service_lib",
+        "//source/common:nighthawk_common_lib",
     ],
 )
 

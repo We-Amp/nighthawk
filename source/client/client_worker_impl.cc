@@ -21,7 +21,10 @@ ClientWorkerImpl::ClientWorkerImpl(
     const RequestSourceFactory& request_generator_factory, Envoy::Stats::Store& store,
     const int worker_number, const Envoy::MonotonicTime starting_time,
     Envoy::Tracing::TracerSharedPtr& tracer, const HardCodedWarmupStyle hardcoded_warmup_style,
-    std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins)
+    std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins,
+    const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)>&
+        live_snapshot_partial_cb,
+    std::chrono::milliseconds live_snapshot_interval)
     : WorkerImpl(api, tls, store),
       time_source_(std::make_unique<CachedTimeSourceImpl>(*dispatcher_)),
       termination_predicate_factory_(termination_predicate_factory),
@@ -46,7 +49,9 @@ ClientWorkerImpl::ClientWorkerImpl(
                                               *time_source_, *worker_number_scope_, starting_time),
                                           *worker_number_scope_, starting_time, api),
                                       true)),
-      hardcoded_warmup_style_(hardcoded_warmup_style) {}
+      hardcoded_warmup_style_(hardcoded_warmup_style),
+      live_snapshot_partial_cb_(live_snapshot_partial_cb),
+      live_snapshot_interval_(live_snapshot_interval) {}
 
 void ClientWorkerImpl::simpleWarmup() {
   ENVOY_LOG(debug, "> worker {}: warmup start.", worker_number_);
@@ -65,7 +70,16 @@ void ClientWorkerImpl::work() {
     simpleWarmup();
   }
   benchmark_client_->setShouldMeasureLatencies(phase_->shouldMeasureLatencies());
+  setupLiveSnapshotTimer();
   phase_->run();
+  // Stop the live snapshot timer before we leave the run: no partials may be
+  // produced after the run's end, and the worker's dispatcher is not driven
+  // again in a way that would fire it, but disabling explicitly keeps that
+  // invariant local and obvious.
+  if (live_snapshot_timer_ != nullptr) {
+    live_snapshot_timer_->disableTimer();
+    live_snapshot_timer_.reset();
+  }
 
   // Save a final snapshot of the worker-specific counter accumulations before
   // we exit the thread.
@@ -84,6 +98,52 @@ void ClientWorkerImpl::work() {
   // to prevent the shutdown artifacts from influencing the test result counters. The main thread
   // still needs to be able to read the counters for reporting the global numbers, and those
   // should be consistent.
+}
+
+void ClientWorkerImpl::setupLiveSnapshotTimer() {
+  if (live_snapshot_partial_cb_ == nullptr ||
+      live_snapshot_interval_ <= std::chrono::milliseconds(0)) {
+    return;
+  }
+  live_snapshot_timer_ = dispatcher_->createTimer([this]() -> void {
+    emitLiveSnapshotPartial();
+    live_snapshot_timer_->enableTimer(live_snapshot_interval_);
+  });
+  live_snapshot_timer_->enableTimer(live_snapshot_interval_);
+}
+
+void ClientWorkerImpl::emitLiveSnapshotPartial() {
+  if (live_snapshot_partial_cb_ == nullptr) {
+    return;
+  }
+  nighthawk::client::WorkerLiveSnapshotPartial partial;
+  partial.set_worker_id(worker_number_);
+  // These statistics are confined to this worker's thread; we are running on
+  // that very dispatcher, so reading them here is race-free without locking.
+  for (const auto& statistic : statistics()) {
+    nighthawk::client::StatisticSnapshot* snapshot = partial.add_statistics();
+    snapshot->set_id(statistic.first);
+    // Pair the percentile queries with count(): a count of 0 means there were
+    // no samples yet (the percentile fields are then meaningless), and a
+    // statistic implementation that cannot answer percentile queries reports
+    // zeros. Consumers decide based on count.
+    snapshot->set_count(statistic.second->count());
+    snapshot->set_p50_ns(statistic.second->rawPercentileValueAt(50));
+    snapshot->set_p90_ns(statistic.second->rawPercentileValueAt(90));
+    snapshot->set_p99_ns(statistic.second->rawPercentileValueAt(99));
+  }
+  // Snapshot this worker's counters with the same name normalization the
+  // worker applies to its final counter snapshot (see work()).
+  for (const auto& stat : store_.counters()) {
+    std::string stat_name = std::string(absl::StripPrefix(stat->name(), "cluster."));
+    stat_name = std::string(absl::StripPrefix(stat_name, "worker."));
+    const std::string worker_prefix = fmt::format("{}.", worker_number_);
+    if (stat->value() && absl::StartsWith(stat_name, worker_prefix)) {
+      (*partial.mutable_counters())[std::string(absl::StripPrefix(stat_name, worker_prefix))] =
+          stat->value();
+    }
+  }
+  live_snapshot_partial_cb_(std::move(partial));
 }
 
 void ClientWorkerImpl::shutdownThread() {

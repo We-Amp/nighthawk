@@ -57,6 +57,60 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
   ProcessPtr process = std::move(*process_or_status);
 
   OutputCollectorImpl output_collector(time_system_, *options);
+
+  // FORK-ONLY (We-Amp): when the request opted in to live snapshot streaming,
+  // a collector thread emits aggregated LiveSnapshot responses at the stats
+  // flush cadence while the run is in flight. Partials arrive from the workers
+  // as immutable messages; the collector never reads worker histograms. It is
+  // stopped and joined before the final response is written below, so no
+  // snapshot can follow the final response on the stream, and nothing from
+  // this run can bleed into a follow-up run.
+  std::atomic<bool> stop_live_collector{false};
+  std::thread live_collector_thread;
+  if (options->liveStreamingEnabled()) {
+    const Envoy::Protobuf::Duration flush_duration = options->statsFlushIntervalDuration();
+    const std::chrono::milliseconds live_interval =
+        (flush_duration.seconds() > 0 || flush_duration.nanos() > 0)
+            ? std::chrono::milliseconds(flush_duration.seconds() * 1000 +
+                                        flush_duration.nanos() / 1000000)
+            : std::chrono::seconds(options->statsFlushInterval());
+    live_collector_thread =
+        std::thread([this, process_ptr = process.get(), live_interval, &stop_live_collector]() {
+          auto next_tick = std::chrono::steady_clock::now() + live_interval;
+          while (!stop_live_collector.load(std::memory_order_relaxed)) {
+            // Sleep in small slices so a stop request joins this thread promptly.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (std::chrono::steady_clock::now() < next_tick) {
+              continue;
+            }
+            next_tick += live_interval;
+            nighthawk::client::ExecutionResponse snapshot_response;
+            *snapshot_response.mutable_live_snapshot() = process_ptr->toLiveSnapshot();
+            {
+              // As everywhere else, the stream write goes through the write
+              // mutex; a failed write means the stream is gone (e.g. the
+              // client cancelled the RPC), so stop producing snapshots.
+              absl::MutexLock lock(&stream_write_mutex_);
+              if (!stream_->Write(snapshot_response)) {
+                return;
+              }
+            }
+          }
+        });
+  }
+  // Stops and joins the collector no matter how run() ends, so no snapshot is
+  // ever produced after the run finished.
+  struct CollectorJoin {
+    ~CollectorJoin() {
+      stop->store(true, std::memory_order_relaxed);
+      if (thread->joinable()) {
+        thread->join();
+      }
+    }
+    std::atomic<bool>* stop;
+    std::thread* thread;
+  };
+  CollectorJoin collector_join{&stop_live_collector, &live_collector_thread};
   // Watch the gRPC context while the run is in flight: when the client cancels
   // the RPC, request the workers to stop asap instead of running for the full
   // configured duration. The watchdog is joined again on every exit path of
@@ -94,6 +148,14 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
     WatchdogJoin watchdog_join{&stop_watchdog, &watchdog_thread};
     return process->run(output_collector);
   }();
+  // Stop and join the collector before we fill and write the final response
+  // below: no snapshot may follow the final response on the stream. The
+  // CollectorJoin guard above remains as an exception-safety backstop, but is
+  // a no-op from here on since the thread is joined.
+  stop_live_collector.store(true, std::memory_order_relaxed);
+  if (live_collector_thread.joinable()) {
+    live_collector_thread.join();
+  }
   if (!ok) {
     response.mutable_error_detail()->set_code(grpc::StatusCode::INTERNAL);
     // TODO(https://github.com/envoyproxy/nighthawk/issues/181): wire through error descriptions, so
@@ -122,6 +184,10 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
 
 void ServiceImpl::writeResponse(const nighthawk::client::ExecutionResponse& response) {
   ENVOY_LOG(debug, "Write response: {}", absl::StrCat(response));
+  // Every stream write takes stream_write_mutex_: with live snapshot streaming
+  // opted in, the collector thread writes snapshot responses concurrently with
+  // this run thread, and gRPC stream writes are not safe for concurrent use.
+  absl::MutexLock lock(&stream_write_mutex_);
   if (!stream_->Write(response)) {
     ENVOY_LOG(warn, "Failed to write response to the stream");
   }

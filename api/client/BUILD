@@ -9,6 +9,7 @@ envoy_package()
 api_cc_py_proto_library(
     name = "base",
     srcs = [
+        "live.proto",
         "options.proto",
         "output.proto",
         "service.proto",

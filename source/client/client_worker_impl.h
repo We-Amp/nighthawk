@@ -1,6 +1,10 @@
 #pragma once
 
+#include <chrono>
+#include <functional>
 #include <vector>
+
+#include "api/client/live.pb.h"
 
 #include "envoy/api/api.h"
 #include "envoy/event/dispatcher.h"
@@ -37,7 +41,10 @@ public:
                    const Envoy::MonotonicTime starting_time,
                    Envoy::Tracing::TracerSharedPtr& tracer,
                    const HardCodedWarmupStyle hardcoded_warmup_style,
-                   std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins);
+                   std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins,
+                   const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)>&
+                       live_snapshot_partial_cb = {},
+                   std::chrono::milliseconds live_snapshot_interval = {});
   StatisticPtrMap statistics() const override;
 
   const std::map<std::string, uint64_t>& threadLocalCounterValues() override {
@@ -60,6 +67,14 @@ protected:
 
 private:
   void simpleWarmup();
+  // FORK-ONLY (We-Amp): live snapshot streaming support. The worker computes
+  // percentile summaries and counter values of its own, thread-confined
+  // statistics on its own dispatcher thread (statistics are not shared or
+  // locked), wrapping them in an immutable partial that is handed to the
+  // collector via live_snapshot_partial_cb_. No locks are taken on request
+  // hot paths; the callback only fires at the live snapshot cadence.
+  void setupLiveSnapshotTimer();
+  void emitLiveSnapshotPartial();
 
   std::unique_ptr<Envoy::TimeSource> time_source_;
   const TerminationPredicateFactory& termination_predicate_factory_;
@@ -74,6 +89,9 @@ private:
   Envoy::LocalInfo::LocalInfoPtr local_info_;
   std::map<std::string, uint64_t> threadLocalCounterValues_;
   const HardCodedWarmupStyle hardcoded_warmup_style_;
+  const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)> live_snapshot_partial_cb_;
+  const std::chrono::milliseconds live_snapshot_interval_;
+  Envoy::Event::TimerPtr live_snapshot_timer_;
 };
 
 using ClientWorkerImplPtr = std::unique_ptr<ClientWorkerImpl>;

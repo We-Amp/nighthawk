@@ -2,6 +2,11 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
+
+#include "absl/container/flat_hash_map.h"
+
+#include "api/client/live.pb.h"
 
 #include "envoy/api/api.h"
 #include "envoy/network/address.h"
@@ -90,6 +95,14 @@ public:
   bool run(OutputCollector& collector) override;
 
   /**
+   * FORK-ONLY (We-Amp): drains the immutable per-worker live snapshot partials
+   * accumulated so far and aggregates them into a LiveSnapshot. Safe to call
+   * concurrently with a running benchmark; the partials are handed over under
+   * a lock, and no worker statistics are read from the calling thread.
+   */
+  nighthawk::client::LiveSnapshot toLiveSnapshot() override;
+
+  /**
    * Should be called before destruction to cleanly shut down.
    */
   void shutdown() override;
@@ -130,6 +143,25 @@ private:
    */
   void setupStatsSinks(const envoy::config::bootstrap::v3::Bootstrap& bootstrap,
                        std::list<std::unique_ptr<Envoy::Stats::Sink>>& stats_sinks);
+  // FORK-ONLY (We-Amp): sink for immutable per-worker live snapshot partials.
+  // Workers push from their own dispatcher threads; the service's collector
+  // thread drains via toLiveSnapshot().
+  void recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapshotPartial partial);
+  std::mutex live_partials_mutex_;
+  std::vector<nighthawk::client::WorkerLiveSnapshotPartial> live_partials_;
+  // Running latest per-worker counter values and statistic summaries. Each
+  // worker's partials are cumulative since run start, so the latest value per
+  // worker wins; the aggregated snapshot sums the per-worker latests over the
+  // workers (and takes the percentile maximum, see toLiveSnapshot()). This
+  // keeps snapshots cumulative from run start even when the collector drains
+  // partials one interval at a time.
+  absl::flat_hash_map<uint32_t, absl::flat_hash_map<std::string, uint64_t>>
+      live_worker_counter_values_;
+  absl::flat_hash_map<uint32_t,
+                      absl::flat_hash_map<std::string, nighthawk::client::StatisticSnapshot>>
+      live_worker_statistics_;
+  // Enforces strictly increasing monotonic_ns across snapshots.
+  int64_t last_live_snapshot_monotonic_ns_{0};
   bool runInternal(OutputCollector& collector, const UriPtr& tracing_uri,
                    const Envoy::Network::DnsResolverSharedPtr& dns_resolver,
                    const std::optional<Envoy::SystemTime>& schedule);

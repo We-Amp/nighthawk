@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package nighthawk.client;
+
+// FORK-ONLY (We-Amp): this file, and the messages it defines, are fork-specific
+// additions that do not exist upstream. Rebase check: if an upstream change
+// adds messages or field numbers that collide with the ones here, the fork's
+// additions must be renumbered before rebasing. Upstream consumers never see
+// these messages unless they explicitly opt in.
+
+// Opt-in marker for live snapshot streaming over ExecutionStream. The message
+// carries no fields: its presence in CommandLineOptions is what enables
+// streaming. When absent, the service behaves exactly as it does upstream
+// (a single response per run, no snapshots).
+message LiveStreamingOptions {
+}
+
+// A point-in-time percentile summary of a single statistic. Percentiles are
+// raw nanosecond values. Consumers must check count: 0 means there were no
+// samples yet (the percentile fields are then meaningless), and an id whose
+// implementation cannot answer percentile queries reports zeros.
+message StatisticSnapshot {
+  // The statistic id, as it appears in the run's final output (e.g.
+  // "benchmark.http_latency").
+  string id = 1;
+  // Number of samples observed so far.
+  uint64 count = 2;
+  uint64 p50_ns = 3;
+  uint64 p90_ns = 4;
+  uint64 p99_ns = 5;
+}
+
+// A snapshot of live benchmark progress, streamed while a run is in flight.
+// Aggregated from immutable per-worker partials that each worker computes on
+// its own dispatcher thread; the service-side collector never touches worker
+// histograms directly. Counters and statistics are cumulative from run start.
+message LiveSnapshot {
+  // Wall-clock time of the snapshot, unix epoch nanoseconds.
+  int64 wall_time_unix_ns = 1;
+  // Monotonic clock reading at snapshot creation, nanoseconds since an
+  // arbitrary epoch. Strictly increasing across the snapshots of a run.
+  int64 monotonic_ns = 2;
+  // The benchmark phase the snapshot belongs to (currently "main").
+  string phase_id = 3;
+  // Identifier of the execution this snapshot belongs to (the execution_id
+  // option when set, empty otherwise).
+  string epoch_id = 4;
+  // Global counter values accumulated so far, keyed by counter name.
+  map<string, uint64> counters = 5;
+  // Global statistics so far. Counts are summed over the workers; percentile
+  // values are the maximum over the workers (per-worker histograms cannot be
+  // merged without their raw samples, so this is an approximation).
+  repeated StatisticSnapshot statistics = 6;
+}
+
+// Internal: the immutable partial snapshot one worker computes on its own
+// dispatcher thread at the stats-flush cadence. Handed to the service-side
+// collector, which aggregates these into a LiveSnapshot. Never serialized on
+// the wire; fork-only, and subject to change without notice.
+message WorkerLiveSnapshotPartial {
+  uint32 worker_id = 1;
+  repeated StatisticSnapshot statistics = 2;
+  map<string, uint64> counters = 3;
+}

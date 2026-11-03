@@ -84,6 +84,7 @@ public:
               (const, override));
   MOCK_METHOD(uint32_t, statsFlushInterval, (), (const, override));
   MOCK_METHOD(Envoy::Protobuf::Duration, statsFlushIntervalDuration, (), (const, override));
+  MOCK_METHOD(bool, liveStreamingEnabled, (), (const, override));
   MOCK_METHOD(std::string, responseHeaderWithLatencyInput, (), (const, override));
   MOCK_METHOD(bool, allowEnvoyDeprecatedV2Api, (), (const));
   MOCK_METHOD(std::optional<Envoy::SystemTime>, scheduled_start, (), (const, override));
