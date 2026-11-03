@@ -4,7 +4,13 @@
 #include <signal.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <fcntl.h>
+#endif
+
+#include <atomic>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "nighthawk/client/options.h"
@@ -78,6 +84,32 @@ public:
   EncapsulationSubProcessRunner(std::function<void()> nighthawk_runner,
                                 std::function<void(sem_t&)> encap_envoy_runner)
       : nighthawk_runner_(nighthawk_runner), encap_envoy_runner_(encap_envoy_runner) {
+#if defined(__APPLE__)
+    // macOS does not implement unnamed process-shared semaphores: sem_init() with
+    // pshared=1 fails with ENOSYS. Use a named semaphore instead. Because it is
+    // opened before fork(), the child inherits the handle and refers to the same
+    // semaphore object, preserving the cross-process signalling semantics.
+    // The name is unique per process and per construction within the process; on
+    // an (unexpected) name collision, retry with a bumped counter, bounded.
+    static std::atomic<int> name_counter{0};
+    sem_t* sem = SEM_FAILED;
+    std::string name;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      name = "/nighthawk." + std::to_string(getpid()) + "." + std::to_string(name_counter++);
+      sem = sem_open(name.c_str(), O_CREAT | O_EXCL, /*mode=*/0600, /*value=*/0);
+      if (sem != SEM_FAILED) {
+        break;
+      }
+      if (errno != EEXIST) {
+        break;
+      }
+    }
+    if (sem == SEM_FAILED) {
+      throw NighthawkException("Could not initialise semaphore");
+    }
+    nighthawk_control_sem_ = sem;
+    semaphore_name_ = std::move(name);
+#else
     nighthawk_control_sem_ = static_cast<sem_t*>(
         mmap(NULL, sizeof(sem_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
 
@@ -86,6 +118,7 @@ public:
     if (ret != 0) {
       throw NighthawkException("Could not initialise semaphore");
     }
+#endif
   };
 
   ~EncapsulationSubProcessRunner() {
@@ -93,11 +126,21 @@ public:
     if (!status.ok()) {
       ENVOY_LOG_MISC(warn, status.ToString());
     }
+#if defined(__APPLE__)
+    // Only the process that created the named semaphore cleans it up: the forked
+    // child merely inherits the open handle and exits via _exit(). The child is
+    // reaped before unlinking, so no other process can still be using the name.
+    if (pid_ != 0) {
+      sem_close(nighthawk_control_sem_);
+      sem_unlink(semaphore_name_.c_str());
+    }
+#else
     if (pid_ == 0) {
       // Have only parent process destroy semaphore
       sem_destroy(nighthawk_control_sem_);
       munmap(nighthawk_control_sem_, sizeof(sem_t));
     }
+#endif
   }
   /**
    * Run functions in parent and child processes. It blocks until nighthawk_runner
@@ -160,6 +203,9 @@ private:
   std::function<void(sem_t&)> encap_envoy_runner_;
   pid_t pid_ = -1;
   sem_t* nighthawk_control_sem_;
+#if defined(__APPLE__)
+  std::string semaphore_name_;
+#endif
   Envoy::Thread::MutexBasicLockable terminate_mutex_;
 };
 
