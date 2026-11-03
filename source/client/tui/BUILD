@@ -15,13 +15,17 @@ envoy_package()
 envoy_cc_library(
     name = "tui_lib",
     srcs = [
+        "charts.cc",
         "run_feed.cc",
+        "run_view_model.cc",
         "session_reader.cc",
         "session_writer.cc",
         "tui_app.cc",
     ],
     hdrs = [
+        "charts.h",
         "run_feed.h",
+        "run_view_model.h",
         "session_framing.h",
         "session_reader.h",
         "session_writer.h",
@@ -31,6 +35,7 @@ envoy_cc_library(
     deps = [
         "//api/client:base_cc_proto",
         "//api/client:grpc_service_lib",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
