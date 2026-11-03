@@ -32,10 +32,15 @@ cc_test(
     srcs = ["tui_session_test.cc"],
     deps = [
         "//api/client:base_cc_proto",
+        "//api/client:grpc_service_lib",
         "//source/client/tui:tui_lib",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/strings",
         "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
     ],
 )
 
