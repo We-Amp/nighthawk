@@ -223,6 +223,21 @@ TEST(KeyBarTest, NavigateIdleBarNamesTheNavigationKeys) {
   // No run is live, so neither stop nor the quit-stops warning appear.
   EXPECT_EQ(frame.lines[29].find("s stop"), std::string::npos);
   EXPECT_EQ(frame.lines[29].find("(stops run)"), std::string::npos);
+  // frameAt renders with a session path present (a session open until q):
+  // the n hint is annotated as unavailable there, since pressing it would
+  // silently refuse (M0b final-review finding).
+  EXPECT_NE(frame.lines[29].find("n new run (unavailable: session open)"), std::string::npos);
+}
+
+// With no session open the n hint is a plain affordance again: no stale
+// "unavailable" annotation.
+TEST(KeyBarTest, NavigateBarWithClosedSessionNamesNAvailable) {
+  ftxui::Element element =
+      RenderLayout(100, 30, /*active_tab=*/0, InputMode::kNavigate, RunViewModel{},
+                   filledDialog(), /*session_path=*/"");
+  Frame frame = renderFrame(element, 100, 30);
+  EXPECT_NE(frame.lines[29].find("n new run |"), std::string::npos);
+  EXPECT_EQ(frame.lines[29].find("unavailable"), std::string::npos);
 }
 
 TEST(KeyBarTest, RunningBarNamesStopAndTheQuitStopsWarning) {
@@ -320,6 +335,33 @@ TEST(DialogOverlayTest, CleanDialogRendersFieldsWithoutErrors) {
   EXPECT_TRUE(frame.contains("https://demo.we-amp.local"));
   EXPECT_TRUE(frame.contains("300"));
   EXPECT_TRUE(frame.contains("60"));
+}
+
+// M0b final-review finding: a rejected enter whose fields validated but whose
+// start the controller refused (a session already open — the steady state
+// after every run until q) must render a distinct line inside the dialog.
+// Reusing the field-error path would put "start run - 0 errors" on the
+// border: a false statement about a failure that is not a field error.
+TEST(DialogOverlayTest, ControllerRejectionRendersInsideTheBoxWithoutAnErrorCount) {
+  OverlayState overlay;
+  overlay.uri_field = kUri;
+  overlay.rps_field = "100";
+  overlay.duration_field = "60";
+  overlay.active_field = StartRunDialogModel::kUri;
+  overlay.start_rejected = "cannot start: a session is already open (press q to close it)";
+  Frame frame = frameAt(InputMode::kEditingStartRun, RunViewModel{}, filledDialog(), &overlay);
+
+  // The rejection reads inside the box, naming the way out. The message
+  // wraps at the fixed border width rather than being clipped (both wrapped
+  // rows appear).
+  EXPECT_TRUE(frame.contains("cannot start: a session is already open"));
+  EXPECT_TRUE(frame.contains("(press q to close it)"));
+  // No error-count border title (and in particular no "0 errors"), no
+  // per-field inline errors: this failure is not a field error.
+  EXPECT_TRUE(frame.lacks("errors"));
+  EXPECT_TRUE(frame.lacks("must be > 0"));
+  EXPECT_TRUE(frame.lacks("must not be empty"));
+  EXPECT_NE(frame.lines[9].find("start run"), std::string::npos);
 }
 
 // The target-slot invariant (backlog item 6): "(no target)" only ever reads

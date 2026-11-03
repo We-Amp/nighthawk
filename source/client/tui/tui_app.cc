@@ -57,6 +57,7 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
       state.rps_field.clear();
       state.duration_field.clear();
       state.show_errors = false;
+      state.start_rejected.clear();
       state.mode = InputMode::kNavigate;
       state.mode_mirror.store(state.mode, std::memory_order_relaxed);
       // Exactly one forced redraw so the panes catch up on the state edited
@@ -73,20 +74,34 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
                           absl::SimpleAtoi(state.duration_field, &duration_seconds);
       state.dialog.set_rps(rps);
       state.dialog.set_duration_seconds(duration_seconds);
-      if (parsed && state.dialog.valid() && controller.startRun(state.dialog.build_request()).ok()) {
+      // Field-validation failure first: inline errors on the offending field
+      // rows plus the error-count border title.
+      if (!parsed || !state.dialog.valid()) {
+        // A failed enter is never silent and never closes the box: the
+        // inline errors render on the offending field rows until the form
+        // validates or esc cancels.
+        state.show_errors = true;
+        return true;
+      }
+      const absl::Status started = controller.startRun(state.dialog.build_request());
+      if (started.ok()) {
         state.uri_field.clear();
         state.rps_field.clear();
         state.duration_field.clear();
         state.show_errors = false;
+        state.start_rejected.clear();
         state.mode = InputMode::kNavigate;
         state.mode_mirror.store(state.mode, std::memory_order_relaxed);
         // Exactly one forced redraw on the dialog close (input_mode.h).
         force_redraw();
       } else {
-        // A failed enter is never silent and never closes the box: the
-        // inline errors render on the offending field rows until the form
-        // validates or esc cancels.
-        state.show_errors = true;
+        // A controller rejection (e.g. a session already open) is not a
+        // field error: say why the start is impossible on a distinct line
+        // inside the box. Reusing the field-error path would render a
+        // "start run - 0 errors" border title — a false statement (M0b
+        // review finding).
+        state.show_errors = false;
+        state.start_rejected = absl::StrCat("cannot start: ", started.message());
       }
       return true;
     }
@@ -117,6 +132,7 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     state.rps_field.clear();
     state.duration_field.clear();
     state.show_errors = false;
+    state.start_rejected.clear();
     state.mode = InputMode::kEditingStartRun;
     state.mode_mirror.store(state.mode, std::memory_order_relaxed);
     return true;
@@ -160,7 +176,9 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (writer_ != nullptr) {
-      return absl::FailedPreconditionError("a session is already open; finish it first");
+      // User-facing through the start-run dialog's rejection line: name the
+      // way out (q closes the open session), not the lifecycle detail.
+      return absl::FailedPreconditionError("a session is already open (press q to close it)");
     }
   }
 

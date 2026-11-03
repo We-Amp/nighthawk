@@ -57,9 +57,15 @@ struct OverlayState {
   // 0=uri, 1=rps, 2=duration (StartRunDialogModel::DialogField numbering);
   // the active field's value renders with a reverse-video caret.
   int active_field = 0;
-  // True after a rejected enter: the inline errors, the border error summary,
-  // and the box staying open are all keyed on this.
+  // True after a rejected enter whose failure was field validation: the
+  // inline errors, the border error summary, and the box staying open are
+  // all keyed on this.
   bool show_errors = false;
+  // A rejected enter whose fields validated but whose start the controller
+  // refused (e.g. a session is already open): a distinct line inside the
+  // dialog, never the error-count border title. Empty when nothing was
+  // rejected.
+  std::string start_rejected;
   // The `?` help overlay (navigate mode).
   bool help_open = false;
   // The live Input components (interactive shell only). When set, their
@@ -92,8 +98,11 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
 
 // The persistent bottom-row key bar, rendered from the shell's real key map:
 // navigate names n/c/k/q/? (plus s while a run is live, and q's stop-then-
-// quit), editing names the dialog's tab/enter/esc.
-ftxui::Element RenderKeyBar(InputMode mode, bool running);
+// quit), editing names the dialog's tab/enter/esc. `session_open` marks the
+// state where `n` can never succeed (a session is open until it is closed
+// with q): the n hint is then annotated as unavailable instead of
+// advertising a key that would silently refuse.
+ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open);
 
 // The `?` help overlay: every key of the real key map and every status-bar
 // field with a one-line definition, so no on-screen token stays undefined.

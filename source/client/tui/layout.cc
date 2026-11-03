@@ -85,6 +85,34 @@ std::string borderRule(int outer_width) {
 constexpr int kDialogInnerWidth = kDialogOverlayWidth - 4;
 constexpr int kDialogLabelWidth = 15; // "duration (s): " fits with one trailing space.
 
+// Greedy word-wrap to the dialog's fixed inner width. The controller's
+// rejection text can exceed one row; clipping it silently would hide the
+// way out (the q hint), so it wraps onto as many rows as it needs.
+std::vector<std::string> wrapRows(const std::string& text, int inner_width) {
+  std::vector<std::string> rows;
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = std::min(start + static_cast<size_t>(inner_width), text.size());
+    if (end < text.size()) {
+      // Wrap at the last space inside the window when one exists, so a
+      // parenthetical like "(press q to close it)" stays together.
+      const size_t space = text.rfind(' ', end - 1);
+      if (space != std::string::npos && space > start) {
+        end = space;
+      }
+    }
+    rows.push_back(text.substr(start, end - start));
+    while (end < text.size() && text[end] == ' ') {
+      ++end;
+    }
+    start = end;
+  }
+  if (rows.empty()) {
+    rows.push_back("");
+  }
+  return rows;
+}
+
 ftxui::Element dialogFieldRow(int field, const StartRunDialogModel& dialog,
                               const OverlayState& overlay) {
   const char* label;
@@ -188,16 +216,20 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
   return ftxui::vbox(std::move(rows));
 }
 
-ftxui::Element RenderKeyBar(InputMode mode, bool running) {
+ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open) {
   // Rendered strictly from the shell's real key map (tui_app's navigate-mode
   // handler and the dialog editor's keys) — nothing here invents a binding.
+  // While a session is open the n key cannot succeed; the hint says so
+  // instead of advertising a key that would silently refuse (M0b review
+  // finding).
+  const char* n_hint = session_open ? "n new run (unavailable: session open)" : "n new run";
   std::string bar;
   if (mode == InputMode::kEditingStartRun) {
     bar = "tab field | enter apply | esc cancel";
   } else if (running) {
-    bar = "n new run | c charts | k knobs | s stop | q quit (stops run) | ? help";
+    bar = absl::StrCat(n_hint, " | c charts | k knobs | s stop | q quit (stops run) | ? help");
   } else {
-    bar = "n new run | c charts | k knobs | q quit | ? help";
+    bar = absl::StrCat(n_hint, " | c charts | k knobs | q quit | ? help");
   }
   return ftxui::text(bar);
 }
@@ -236,8 +268,11 @@ ftxui::Element RenderHelpOverlay() {
 
 ftxui::Element RenderStartRunDialog(const StartRunDialogModel& dialog,
                                     const OverlayState& overlay) {
-  // Border summary: the error count rides on the top border ("start run -
-  // 2 errors") once a submit has been rejected; a clean dialog reads plain.
+  // Border summary: the field-error count rides on the top border ("start
+  // run - 2 errors") after a rejected enter. Only field-validation failures
+  // land here: a controller rejection renders as a line inside the box, so
+  // the border never makes a false "0 errors" claim (M0b final-review
+  // finding).
   std::string title = "start run";
   if (overlay.show_errors) {
     int errors = 0;
@@ -246,7 +281,9 @@ ftxui::Element RenderStartRunDialog(const StartRunDialogModel& dialog,
         ++errors;
       }
     }
-    title = absl::StrCat("start run - ", errors, " errors");
+    if (errors > 0) {
+      title = absl::StrCat("start run - ", errors, " errors");
+    }
   }
 
   std::vector<ftxui::Element> lines;
@@ -256,6 +293,14 @@ ftxui::Element RenderStartRunDialog(const StartRunDialogModel& dialog,
   lines.push_back(dialogFieldRow(StartRunDialogModel::kUri, dialog, overlay));
   lines.push_back(dialogFieldRow(StartRunDialogModel::kRps, dialog, overlay));
   lines.push_back(dialogFieldRow(StartRunDialogModel::kDuration, dialog, overlay));
+  // A controller rejection (e.g. a session already open) reads as a distinct
+  // line inside the box, wrapped to the border width, until esc or a
+  // successful start clears it.
+  for (const std::string& row : wrapRows(overlay.start_rejected, kDialogInnerWidth)) {
+    if (!row.empty()) {
+      lines.push_back(ftxui::text(borderedRow(row, kDialogInnerWidth)));
+    }
+  }
   lines.push_back(ftxui::text(borderedRow("", kDialogInnerWidth)));
   lines.push_back(ftxui::text(borderedRow("tab: next field  enter: start  esc: cancel", kDialogInnerWidth)));
   lines.push_back(ftxui::text(borderRule(kDialogOverlayWidth)));
@@ -297,7 +342,7 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
       RenderStatusBar(model, mode, session_path, dialog.uri(), knob_options.duration().seconds()),
       pane,
       ftxui::filler(),
-      RenderKeyBar(mode, model.run_state == "running"),
+      RenderKeyBar(mode, model.run_state == "running", /*session_open=*/!session_path.empty()),
   });
 
   // While the start-run dialog owns the keyboard, the bordered dialog overlay

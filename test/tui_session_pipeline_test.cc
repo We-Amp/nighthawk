@@ -693,6 +693,76 @@ TEST_F(SessionPipelineTest, CtrlCEventRoutesThroughTheShellKeyMapAndFlushes) {
   EXPECT_FALSE(run_end.completed());
 }
 
+// M0b final-review finding (dialog honesty): an enter whose fields validate
+// but whose start the controller refuses (a session already open — the
+// steady state after every run until q) must surface as a distinct
+// controller-rejection line, NOT the field-error path (which would render a
+// "start run - 0 errors" border title on the real shell). Drives the real
+// key map with a real controller holding an open session.
+TEST_F(SessionPipelineTest, EnterWithOpenSessionSurfacesTheControllerRejection) {
+  const StartRequest request = makeStartRequest(listener().uri(), /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  const std::string prefix = tempPath("tui-pipeline-rejected-enter");
+
+  auto controller = std::make_unique<RunController>(channel(), prefix);
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+  const std::string session_path = controller->sessionPath();
+
+  // The dialog as the user left it: valid fields, ready to submit.
+  ShellState state;
+  state.mode = InputMode::kEditingStartRun;
+  state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+  state.uri_field = listener().uri();
+  state.rps_field = "100";
+  state.duration_field = "60";
+
+  const bool consumed =
+      HandleShellEvent(ftxui::Event::Return, state, *controller, /*force_redraw=*/[] {},
+                       /*exit_loop=*/[] {});
+  EXPECT_TRUE(consumed);
+  // The dialog stays open, and the failure is the controller-rejection path:
+  // no field-error flag, a distinct cannot-start line naming the way out.
+  EXPECT_EQ(state.mode, InputMode::kEditingStartRun);
+  EXPECT_FALSE(state.show_errors);
+  EXPECT_EQ(state.start_rejected,
+            "cannot start: a session is already open (press q to close it)");
+  // The open session is untouched by the refused start.
+  EXPECT_EQ(controller->sessionPath(), session_path);
+
+  // Esc cancels and clears the rejection.
+  const bool esc_consumed =
+      HandleShellEvent(ftxui::Event::Escape, state, *controller, /*force_redraw=*/[] {},
+                       /*exit_loop=*/[] {});
+  EXPECT_TRUE(esc_consumed);
+  EXPECT_EQ(state.mode, InputMode::kNavigate);
+  EXPECT_TRUE(state.start_rejected.empty());
+}
+
+// The other half of the dialog honesty split: fields that fail validation
+// still take the field-error path (inline errors + the error-count border
+// title), with no controller rejection mixed in.
+TEST_F(SessionPipelineTest, EnterWithInvalidFieldsTakesTheFieldErrorPath) {
+  auto controller = std::make_unique<RunController>(channel(), tempPath("tui-pipeline-bad-enter"));
+
+  ShellState state;
+  state.mode = InputMode::kEditingStartRun;
+  state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+  // Empty uri, unparseable rps/duration: field validation must reject.
+  state.uri_field = "";
+  state.rps_field = "abc";
+  state.duration_field = "";
+
+  const bool consumed =
+      HandleShellEvent(ftxui::Event::Return, state, *controller, /*force_redraw=*/[] {},
+                       /*exit_loop=*/[] {});
+  EXPECT_TRUE(consumed);
+  EXPECT_EQ(state.mode, InputMode::kEditingStartRun);
+  EXPECT_TRUE(state.show_errors);
+  EXPECT_TRUE(state.start_rejected.empty());
+  // No start was attempted, so no session opened.
+  EXPECT_TRUE(controller->sessionPath().empty());
+}
+
 // Conversion: a snapshot's fields land on the record verbatim — including the
 // empty epoch id, preserved pre-A2 (constant phase id pre-A1, M0a semantics).
 TEST(SessionConversionTest, ToMetricSeriesCarriesPlaceholders) {

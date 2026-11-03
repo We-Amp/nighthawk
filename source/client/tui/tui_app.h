@@ -164,6 +164,11 @@ struct ShellState {
   // True after a rejected enter whose failure was field validation: the
   // inline errors and the border error summary render keyed on this.
   bool show_errors = false;
+  // Set after a rejected enter whose fields validated but whose start the
+  // controller refused (e.g. a session is already open). A distinct,
+  // honest line inside the dialog — never the field-error path: a
+  // "start run - 0 errors" border title would be a false statement.
+  std::string start_rejected;
 };
 
 // The shell's key map — the exact handler the interactive CatchEvent
