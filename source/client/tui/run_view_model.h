@@ -43,7 +43,9 @@ struct RunViewModel {
   // "idle" | "running" | "completed" | "stopped". Owned by the feed's
   // lifecycle events, not by ApplySnapshot (a snapshot never changes state).
   std::string run_state;
-  // The primary latency series (the snapshot's first statistic), capped at
+  // The primary latency series (the snapshot's first statistic WITH samples;
+  // the aggregator's statistics order is unspecified, so the sampled
+  // statistic is found by scanning, not assumed at index 0), capped at
   // kRunViewModelMaxPoints.
   std::vector<PercentilePoint> latency_band;
   // One capped series per counter name, capped at kRunViewModelMaxPoints.
@@ -54,12 +56,13 @@ struct RunViewModel {
 
 // Pure reducer: folds one LiveSnapshot into the model, returning the updated
 // model (pass-by-value + move keeps the copy-on-write shape obvious at call
-// sites). Appends the snapshot's first statistic to latency_band (the
-// aggregator places the primary latency statistic first) when that statistic
-// has samples — count == 0 means the percentile fields are meaningless
-// (live.proto's consumer contract), so such snapshots leave a gap — and every
-// counter to its series, both capped at kRunViewModelMaxPoints by dropping
-// the oldest points. Sets last_snapshot; never touches run_state.
+// sites). Appends a latency_band point from the snapshot's first statistic
+// with samples — count == 0 means the percentile fields are meaningless
+// (live.proto's consumer contract), so zero-count statistics are skipped
+// entirely and leave a gap; the aggregator's statistics order is unspecified,
+// so the sampled statistic is found by scanning, not assumed at index 0 —
+// and every counter to its series, both capped at kRunViewModelMaxPoints by
+// dropping the oldest points. Sets last_snapshot; never touches run_state.
 RunViewModel ApplySnapshot(RunViewModel model, const nighthawk::client::LiveSnapshot& snapshot);
 
 // Mutex-guarded immutable swap. Feed side stores fully-formed models; render

@@ -113,6 +113,38 @@ TEST(RunViewModelTest, ApplySnapshotSkipsZeroCountStatistic) {
   EXPECT_EQ(model.last_snapshot.monotonic_ns(), 2'000);
 }
 
+TEST(RunViewModelTest, ApplySnapshotSelectsFirstSampledStatistic) {
+  // The live aggregator's statistics order is unspecified (the per-worker
+  // fold iterates a flat_hash_map), so a zero-count response-class statistic
+  // frequently precedes the sampled one. The band must come from the first
+  // statistic WITH samples, not from statistics[0] — under real traffic
+  // statistics[0] is often latency_1xx with count==0 while latency_2xx
+  // carries the samples.
+  RunViewModel model;
+  LiveSnapshot snapshot;
+  snapshot.set_monotonic_ns(1'000);
+  StatisticSnapshot* zero = snapshot.add_statistics();
+  zero->set_id("benchmark_http_client.latency_1xx");
+  zero->set_count(0);
+  zero->set_p50_ns(999);
+  zero->set_p90_ns(999);
+  zero->set_p99_ns(999);
+  StatisticSnapshot* sampled = snapshot.add_statistics();
+  sampled->set_id("benchmark_http_client.latency_2xx");
+  sampled->set_count(15);
+  sampled->set_p50_ns(10);
+  sampled->set_p90_ns(20);
+  sampled->set_p99_ns(30);
+  (*snapshot.mutable_counters())["benchmark.http_2xx"] = 15;
+
+  model = ApplySnapshot(std::move(model), snapshot);
+  ASSERT_EQ(model.latency_band.size(), 1u);
+  EXPECT_EQ(model.latency_band[0].monotonic_ns, 1'000u);
+  EXPECT_EQ(model.latency_band[0].p50_ns, 10u);
+  EXPECT_EQ(model.latency_band[0].p90_ns, 20u);
+  EXPECT_EQ(model.latency_band[0].p99_ns, 30u);
+}
+
 TEST(RunViewModelTest, ConcurrentStoreLoadStaysConsistent) {
   SnapshotStore store;
   std::atomic<bool> done{false};
@@ -124,8 +156,7 @@ TEST(RunViewModelTest, ConcurrentStoreLoadStaysConsistent) {
       // must hold exactly one point whose value equals its own timestamp.
       model.counters["seq"].push_back(
           CounterPoint{static_cast<uint64_t>(i), static_cast<uint64_t>(i)});
-      model.latency_band.push_back(
-          PercentilePoint{static_cast<uint64_t>(i), 1, 2, 3});
+      model.latency_band.push_back(PercentilePoint{static_cast<uint64_t>(i), 1, 2, 3});
       store.store(std::move(model));
     }
     done.store(true);
