@@ -109,3 +109,14 @@ envoy_cc_binary(
         "//source/exe:tui_main_entry_lib",
     ],
 )
+
+# FORK-ONLY (We-Amp): headless reader for .nhsession files; prints one JSON
+# line per record. Same reasoning as nighthawk_tui: not in the engine
+# filegroup and free of the -lrt linkopt (quarantine rule,
+# source/client/tui/README.md).
+envoy_cc_binary(
+    name = "nighthawk_session_dump",
+    deps = [
+        "//source/exe:session_dump_entry_lib",
+    ],
+)

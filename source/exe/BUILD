@@ -83,3 +83,17 @@ envoy_cc_library(
     ],
     alwayslink = True,
 )
+
+# FORK-ONLY (We-Amp): entry point for the nighthawk_session_dump binary. Kept
+# free of the engine's version_linkstamp / symbolize deps so it builds without
+# Envoy C++ sources (quarantine rule, see source/client/tui/README.md).
+envoy_cc_library(
+    name = "session_dump_entry_lib",
+    srcs = ["session_dump_main_entry.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//source/client/tui:tui_lib",
+        "@tclap//:tclap",
+    ],
+    alwayslink = True,
+)
