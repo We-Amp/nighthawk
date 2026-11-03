@@ -144,11 +144,23 @@ struct FeedRecorder {
       cv.notify_all();
     };
     callbacks.on_finished = [this](const absl::Status& status) {
-      std::lock_guard<std::mutex> lock(mutex);
-      events.push_back("finished");
-      finished_count++;
-      finished_status = status;
-      cv.notify_all();
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        events.push_back("finished");
+        finished_count++;
+        finished_status = status;
+        if (stop_from_finished) {
+          finished_entered = true;
+        }
+        cv.notify_all();
+      }
+      // Re-entrancy stress for the deadlock regression: call stop() from
+      // inside on_finished (the one sanctioned re-entrant call), delayed so a
+      // concurrent start() is already holding/waiting on the feed lock first.
+      if (stop_from_finished && feed != nullptr) {
+        std::this_thread::sleep_for(100ms);
+        feed->stop();
+      }
     };
     feed_callbacks_ = std::move(callbacks);
   }
@@ -162,6 +174,14 @@ struct FeedRecorder {
     return cv.wait_for(lock, std::chrono::nanoseconds(absl::ToChronoNanoseconds(budget)),
                        predicate);
   }
+
+  // When set, on_finished signals finished_entered and then calls stop() on
+  // `feed` (the deadlock regression's re-entrant call).
+  bool stop_from_finished = false;
+  RunFeed* feed = nullptr;
+  bool finished_entered = false;
+  bool second_start_returned = false;
+  absl::Status second_start_status = absl::UnknownError("not returned");
 
   std::mutex mutex;
   std::condition_variable cv;
@@ -380,6 +400,62 @@ TEST_F(RunFeedTest, StartRejectedWhileRunning) {
   EXPECT_EQ(recorder.events.back(), "finished");
   EXPECT_EQ(recorder.events[recorder.events.size() - 2], "completed");
   EXPECT_GT(recorder.final_output.results_size(), 0);
+}
+
+// Deadlock regression: stop() is the one sanctioned re-entrant call from
+// on_finished, and a start() may race with that callback (running() is already
+// false when on_finished fires). start() must therefore not hold the feed lock
+// while joining the old read thread, or start -> join -> on_finished -> stop
+// -> lock would deadlock. This test delays a re-entrant stop() inside
+// on_finished and calls start() concurrently; the pre-fix code hangs here.
+TEST_F(RunFeedTest, StopFromFinishedDoesNotDeadlockConcurrentStart) {
+  FeedRecorder recorder;
+  recorder.stop_from_finished = true;
+  recorder.arm();
+  RunFeed feed(channel(), recorder.callbacks());
+  recorder.feed = &feed;
+
+  // A 1s run: it completes naturally, putting the read thread inside
+  // on_finished while running() already reads false.
+  EXPECT_EQ(feed.start(makeStartRequest(listener().uri(), /*rps=*/10, /*duration_seconds=*/1,
+                                        /*stats_flush_interval=*/1)),
+            absl::OkStatus());
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(15), [&recorder]() { return recorder.finished_entered; }));
+
+  // Concurrent with the delayed re-entrant stop() inside on_finished: a
+  // follow-up start(). Pre-fix it blocks forever on the lock the joining
+  // start() holds.
+  std::thread second_start([&]() {
+    absl::Status status = feed.start(makeStartRequest(listener().uri(), 10, 2, 1));
+    {
+      std::lock_guard<std::mutex> lock(recorder.mutex);
+      recorder.second_start_status = status;
+      recorder.second_start_returned = true;
+    }
+    recorder.cv.notify_all();
+  });
+  if (!recorder.waitFor(absl::Seconds(10),
+                        [&recorder]() { return recorder.second_start_returned; })) {
+    ADD_FAILURE() << "start() deadlocked behind a re-entrant stop() from on_finished";
+    second_start.detach();
+    // A deadlocked start() cannot be cleaned up (its thread holds the feed
+    // lock forever); fail the binary now rather than hang teardown.
+    std::abort();
+  }
+  second_start.join();
+  {
+    std::lock_guard<std::mutex> lock(recorder.mutex);
+    EXPECT_EQ(recorder.second_start_status.code(), absl::StatusCode::kOk)
+        << recorder.second_start_status.ToString();
+  }
+
+  // The follow-up run launched by the second start() completes naturally.
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(30), [&recorder]() { return recorder.finished_count >= 2; }));
+  std::lock_guard<std::mutex> lock(recorder.mutex);
+  EXPECT_GE(recorder.finished_count, 2);
+  EXPECT_TRUE(recorder.completed);
 }
 
 } // namespace

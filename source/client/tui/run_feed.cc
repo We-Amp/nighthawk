@@ -38,42 +38,54 @@ RunFeed::~RunFeed() {
 }
 
 absl::Status RunFeed::start(const nighthawk::client::StartRequest& start_request) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (running_.load()) {
-    return absl::FailedPreconditionError("a run is already in flight on this RunFeed");
-  }
-  // Join a finished previous run's thread before reusing the members it reads;
-  // it may still be inside the on_finished callback even though running() is
-  // already false.
-  if (read_thread_.joinable()) {
-    read_thread_.join();
-  }
-  // The previous run's thread is joined (Finish() already called), so its
-  // stream and context can be released before a fresh pair is opened.
-  stream_.reset();
-  context_.reset();
-
-  nighthawk::client::ExecutionRequest execution_request;
-  *execution_request.mutable_start_request() = start_request;
-  auto* options = execution_request.mutable_start_request()->mutable_options();
-  // Opt in to live snapshot streaming: presence of the message is the marker.
-  options->mutable_live_streaming();
-  if (!options->has_stats_flush_interval()) {
-    options->mutable_stats_flush_interval()->set_value(1);
-  }
-
-  context_ = std::make_unique<grpc::ClientContext>();
-  // grpc++ requires Finish() on the stream before it is destroyed; the read
-  // thread always calls it, and a write failure finishes explicitly below.
-  stream_ = stub_->ExecutionStream(context_.get());
-  if (!stream_->Write(execution_request) || !stream_->WritesDone()) {
-    stream_->Finish();
+  std::thread to_join;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_.load() || start_in_progress_) {
+      return absl::FailedPreconditionError("a run is already in flight on this RunFeed");
+    }
+    start_in_progress_ = true;
+    // Take the previous run's (already finished) thread out of the member so it
+    // can be joined with the lock released: joining under the lock would
+    // deadlock when the old read thread is inside its on_finished callback and
+    // that callback calls stop() (the one sanctioned re-entrant call).
+    to_join = std::move(read_thread_);
+    // The previous run's stream and context can be released before a fresh
+    // pair is opened.
     stream_.reset();
-    return absl::InternalError("failed to write the start request to the Nighthawk service");
+    context_.reset();
+  }
+  if (to_join.joinable()) {
+    to_join.join();
   }
 
-  running_.store(true);
-  read_thread_ = std::thread([this]() { readLoop(); });
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    nighthawk::client::ExecutionRequest execution_request;
+    *execution_request.mutable_start_request() = start_request;
+    auto* options = execution_request.mutable_start_request()->mutable_options();
+    // Opt in to live snapshot streaming: presence of the message is the marker.
+    options->mutable_live_streaming();
+    if (!options->has_stats_flush_interval()) {
+      options->mutable_stats_flush_interval()->set_value(1);
+    }
+
+    context_ = std::make_unique<grpc::ClientContext>();
+    // grpc++ requires Finish() on the stream before it is destroyed; the read
+    // thread always calls it, and a write failure finishes explicitly below.
+    stream_ = stub_->ExecutionStream(context_.get());
+    if (!stream_->Write(execution_request) || !stream_->WritesDone()) {
+      stream_->Finish();
+      stream_.reset();
+      context_.reset();
+      start_in_progress_ = false;
+      return absl::InternalError("failed to write the start request to the Nighthawk service");
+    }
+
+    running_.store(true);
+    read_thread_ = std::thread([this]() { readLoop(); });
+    start_in_progress_ = false;
+  }
   return absl::OkStatus();
 }
 

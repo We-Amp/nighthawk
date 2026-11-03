@@ -61,7 +61,10 @@ public:
   // (field 911, presence is the marker) and defaults stats_flush_interval to
   // 1s when the caller left it unset. Note this deliberately bypasses the
   // shared client choke point, which strips live_streaming for legacy
-  // consumers. Returns kFailedPrecondition if a run is already in flight.
+  // consumers. Returns kFailedPrecondition if a run is already in flight; a
+  // stop() immediately followed by start() also returns kFailedPrecondition,
+  // until the stopped run's on_finished has landed (inherent to the single
+  // read-thread design, not a bug).
   // If the request cannot be written, returns an error and no callbacks fire;
   // once start() returns OK, on_finished fires exactly once eventually.
   absl::Status start(const nighthawk::client::StartRequest& start_request);
@@ -85,14 +88,19 @@ private:
 
   // Guards the stream/context/thread lifecycle so stop() and a follow-up
   // start() can be called from any thread. Callbacks fire without the lock
-  // held. The context is held by pointer because grpc::ClientContext is
-  // neither copyable nor assignable and each run needs a fresh one.
+  // held, and start() releases it while joining the previous run's thread (so
+  // a re-entrant stop() from that run's on_finished cannot deadlock). The
+  // context is held by pointer because grpc::ClientContext is neither copyable
+  // nor assignable and each run needs a fresh one.
   std::mutex mutex_;
   std::unique_ptr<grpc::ClientContext> context_;
   std::unique_ptr<grpc::ClientReaderWriter<nighthawk::client::ExecutionRequest,
                                            nighthawk::client::ExecutionResponse>>
       stream_;
   std::thread read_thread_;
+  // Set while start() is between its two critical sections (joining the
+  // previous run's thread), so concurrent start() calls cannot double-start.
+  bool start_in_progress_ = false;
   std::atomic<bool> running_{false};
 };
 
