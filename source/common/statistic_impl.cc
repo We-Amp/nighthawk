@@ -273,6 +273,9 @@ uint64_t HdrStatistic::min() const {
   return count() == 0 ? UINT64_MAX : hdr_value_at_percentile(histogram_, 0);
 }
 uint64_t HdrStatistic::max() const { return hdr_value_at_percentile(histogram_, 100); }
+uint64_t HdrStatistic::rawPercentileValueAt(double percentile) const {
+  return hdr_value_at_percentile(histogram_, percentile);
+}
 
 StatisticPtr HdrStatistic::combine(const Statistic& statistic) const {
   auto combined = std::make_unique<HdrStatistic>();
@@ -357,6 +360,14 @@ double CircllhistStatistic::mean() const { return hist_approx_mean(histogram_); 
 double CircllhistStatistic::pvariance() const { return pstdev() * pstdev(); }
 double CircllhistStatistic::pstdev() const {
   return count() == 0 ? std::nan("") : hist_approx_stddev(histogram_);
+}
+uint64_t CircllhistStatistic::rawPercentileValueAt(double percentile) const {
+  // hist_approx_quantile() takes quantiles in [0, 1], while the Statistic
+  // interface takes percentiles in [0, 100].
+  const double quantile = percentile / 100.0;
+  double value = 0;
+  hist_approx_quantile(histogram_, &quantile, 1, &value);
+  return static_cast<uint64_t>(value);
 }
 
 StatisticPtr CircllhistStatistic::combine(const Statistic& statistic) const {

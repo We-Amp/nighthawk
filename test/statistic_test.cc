@@ -402,6 +402,20 @@ TEST(StatisticTest, HdrStatisticOutOfRange) {
   EXPECT_EQ(0, a.count());
 }
 
+TEST(StatisticTest, RawPercentileValueAt) {
+  HdrStatistic statistic;
+  for (uint64_t i = 0; i < 101; i++) {
+    statistic.addValue(i);
+  }
+  EXPECT_EQ(50, statistic.rawPercentileValueAt(50.0));
+  EXPECT_EQ(99, statistic.rawPercentileValueAt(99.0));
+  EXPECT_EQ(0, statistic.rawPercentileValueAt(0.0));
+
+  // Implementations that cannot answer percentile queries return 0.
+  StreamingStatistic streaming_statistic;
+  EXPECT_EQ(0, streaming_statistic.rawPercentileValueAt(50.0));
+}
+
 TEST(StatisticTest, NullStatistic) {
   NullStatistic stat;
   EXPECT_EQ(0, stat.count());

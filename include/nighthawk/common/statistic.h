@@ -133,6 +133,15 @@ public:
    * instance this was called for will now represent what the stream contained.
    */
   virtual absl::Status deserializeNative(std::istream& input_stream) PURE;
+
+  /**
+   * Get the raw value at a given percentile.
+   *
+   * @param percentile The percentile to look up, in the range [0, 100].
+   * @return The raw (nanosecond) value at the given percentile. Implementations that cannot
+   * answer percentile queries return 0.
+   */
+  virtual uint64_t rawPercentileValueAt(double percentile) const PURE;
 };
 
 } // namespace Nighthawk

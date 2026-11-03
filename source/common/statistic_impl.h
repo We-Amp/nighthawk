@@ -47,6 +47,7 @@ public:
   double mean() const override { return 0.0; }
   double pvariance() const override { return 0.0; }
   double pstdev() const override { return 0.0; }
+  uint64_t rawPercentileValueAt(double) const override { return 0; }
   StatisticPtr combine(const Statistic&) const override { return createNewInstanceOfSameType(); };
   uint64_t significantDigits() const override { return 0; }
   StatisticPtr createNewInstanceOfSameType() const override {
@@ -64,6 +65,7 @@ public:
   double mean() const override;
   double pvariance() const override;
   double pstdev() const override;
+  uint64_t rawPercentileValueAt(double) const override { return 0; }
   StatisticPtr combine(const Statistic& statistic) const override;
   uint64_t significantDigits() const override { return 8; }
   StatisticPtr createNewInstanceOfSameType() const override {
@@ -91,6 +93,7 @@ public:
   double mean() const override;
   double pvariance() const override;
   double pstdev() const override;
+  uint64_t rawPercentileValueAt(double) const override { return 0; }
   StatisticPtr combine(const Statistic& statistic) const override;
   bool resistsCatastrophicCancellation() const override { return true; }
   StatisticPtr createNewInstanceOfSameType() const override {
@@ -116,6 +119,7 @@ public:
   double mean() const override;
   double pvariance() const override;
   double pstdev() const override;
+  uint64_t rawPercentileValueAt(double) const override { return 0; }
   StatisticPtr combine(const Statistic& statistic) const override;
   bool resistsCatastrophicCancellation() const override {
     return streaming_stats_->resistsCatastrophicCancellation();
@@ -144,6 +148,7 @@ public:
   double pstdev() const override;
   uint64_t max() const override;
   uint64_t min() const override;
+  uint64_t rawPercentileValueAt(double percentile) const override;
 
   StatisticPtr combine(const Statistic& statistic) const override;
   nighthawk::client::Statistic toProto(SerializationDomain domain) const override;
@@ -175,6 +180,7 @@ public:
   double mean() const override;
   double pvariance() const override;
   double pstdev() const override;
+  uint64_t rawPercentileValueAt(double percentile) const override;
   StatisticPtr combine(const Statistic& statistic) const override;
   // circllhist has low significant digit precision as a result of base 10
   // algorithm.
