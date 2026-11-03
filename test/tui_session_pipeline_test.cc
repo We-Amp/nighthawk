@@ -604,6 +604,95 @@ TEST_F(SessionPipelineTest, LoopExitWithoutQFlushesSessionWithRunEnd) {
   EXPECT_EQ(run_end.dropped_records(), 0u);
 }
 
+// F2 final-fix regression (the loop-exit belt alone could not save Ctrl-C):
+// on the real binary FTXUI's default signal machinery intercepted Ctrl-C
+// before the shell's CatchEvent ever saw it — it records SIGINT and re-raises
+// it after PostMain, so the process died before the post-loop
+// handleLoopExit() teardown ran (T7 evidence: exit 0, 0-byte session). The
+// fix routes Ctrl-C through the shell key map itself (App::ForceHandleCtrlC(false)
+// plus a Ctrl-C case in HandleShellEvent): the event reaches the handler
+// inside the loop and takes the exact q path — finishSession (flush + close
+// with a run end record), then exit. This test drives the real handler the
+// CatchEvent installs, with a real controller and a live run, asserting the
+// handler consumed the event, requested the loop exit, stopped the run, and
+// left a parseable, run-end-stamped session behind.
+TEST_F(SessionPipelineTest, CtrlCEventRoutesThroughTheShellKeyMapAndFlushes) {
+  const StartRequest request = makeStartRequest(listener().uri(), /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  const std::string prefix = tempPath("tui-pipeline-ctrlc-event");
+
+  auto controller = std::make_unique<RunController>(channel(), prefix);
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+  const std::string session_path = controller->sessionPath();
+
+  // Run demonstrably live, snapshots flowing (the stored counter series, as
+  // in the sibling teardown tests).
+  bool have_snapshot = false;
+  for (int i = 0; i < 100 && !have_snapshot; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller->model();
+    have_snapshot = model != nullptr && !model->counters.empty();
+    if (!have_snapshot) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(have_snapshot);
+  EXPECT_TRUE(controller->runInProgress());
+
+  // What actually reaches the shell now: the CtrlC event, handled inside the
+  // loop by the same key map the CatchEvent installs.
+  ShellState state;
+  bool exit_requested = false;
+  const bool consumed = HandleShellEvent(ftxui::Event::CtrlC, state, *controller,
+                                         /*force_redraw=*/[] {},
+                                         /*exit_loop=*/[&exit_requested]() { exit_requested = true; });
+
+  // The q-equivalent path: consumed, loop exit requested, run stopped, and
+  // the session closed by the in-loop flush.
+  EXPECT_TRUE(consumed);
+  EXPECT_TRUE(exit_requested);
+  EXPECT_FALSE(controller->runInProgress());
+  EXPECT_TRUE(controller->sessionPath().empty());
+
+  // The session left behind parses with a run end record — pre-fix this
+  // reached neither the in-loop flush nor the post-loop belt on the real
+  // binary (0-byte file).
+  auto reader_or = SessionReader::open(session_path);
+  ASSERT_TRUE(reader_or.status().ok());
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+
+  bool have_header = false;
+  bool have_run_end = false;
+  size_t series_count = 0;
+  RunEndRecord run_end;
+  while (true) {
+    auto record_or = reader->next();
+    ASSERT_TRUE(record_or.status().ok());
+    if (!record_or->has_value()) {
+      break;
+    }
+    switch ((*record_or)->record_case()) {
+    case SessionRecord::kHeader:
+      have_header = true;
+      break;
+    case SessionRecord::kMetricSeries:
+      series_count++;
+      break;
+    case SessionRecord::kRunEnd:
+      have_run_end = true;
+      run_end = (*record_or)->run_end();
+      break;
+    default:
+      ADD_FAILURE() << "unexpected unset record frame";
+      break;
+    }
+  }
+  ASSERT_TRUE(have_header);
+  EXPECT_GT(series_count, 0u);
+  ASSERT_TRUE(have_run_end);
+  // A Ctrl-C mid-run stop is a stopped run, exactly like the s key then q.
+  EXPECT_FALSE(run_end.completed());
+}
+
 // Conversion: a snapshot's fields land on the record verbatim — including the
 // empty epoch id, preserved pre-A2 (constant phase id pre-A1, M0a semantics).
 TEST(SessionConversionTest, ToMetricSeriesCarriesPlaceholders) {

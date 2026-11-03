@@ -37,6 +37,108 @@ constexpr std::chrono::seconds kFinishTimeout{30};
 
 } // namespace
 
+// The q path: stop-if-running, close the session (completed reflects how the
+// run actually ended), then exit the loop. The last snapshot shown before
+// exit is the final data (gRPC cancel semantics). A close error mid-exit is
+// not actionable: the writer then drains without a run end record at
+// destruction (documented).
+bool quitShell(RunController& controller, const std::function<void()>& exit_loop) {
+  (void)controller.finishSession(controller.lastRunEndedCompleted());
+  exit_loop();
+  return true;
+}
+
+bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunController& controller,
+                      const std::function<void()>& force_redraw,
+                      const std::function<void()>& exit_loop) {
+  if (state.mode == InputMode::kEditingStartRun) {
+    if (event == Event::Escape) {
+      state.uri_field.clear();
+      state.rps_field.clear();
+      state.duration_field.clear();
+      state.show_errors = false;
+      state.mode = InputMode::kNavigate;
+      state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+      // Exactly one forced redraw so the panes catch up on the state edited
+      // under the suspension (input_mode.h's rule).
+      force_redraw();
+      return true;
+    }
+    if (event == Event::Return) {
+      state.dialog.set_uri(state.uri_field);
+      uint32_t rps = 0;
+      uint32_t duration_seconds = 0;
+      // Unparseable (or empty) fields stay 0, which the dialog rejects.
+      const bool parsed = absl::SimpleAtoi(state.rps_field, &rps) &&
+                          absl::SimpleAtoi(state.duration_field, &duration_seconds);
+      state.dialog.set_rps(rps);
+      state.dialog.set_duration_seconds(duration_seconds);
+      if (parsed && state.dialog.valid() && controller.startRun(state.dialog.build_request()).ok()) {
+        state.uri_field.clear();
+        state.rps_field.clear();
+        state.duration_field.clear();
+        state.show_errors = false;
+        state.mode = InputMode::kNavigate;
+        state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+        // Exactly one forced redraw on the dialog close (input_mode.h).
+        force_redraw();
+      } else {
+        // A failed enter is never silent and never closes the box: the
+        // inline errors render on the offending field rows until the form
+        // validates or esc cancels.
+        state.show_errors = true;
+      }
+      return true;
+    }
+    return false; // let the text inputs handle the character
+  }
+
+  // Navigate mode key map.
+  if (event == Event::Character('c')) {
+    state.active_tab = 0;
+    return true;
+  }
+  if (event == Event::Character('k')) {
+    state.active_tab = 1;
+    return true;
+  }
+  if (event == Event::Character('?')) {
+    state.help_open = !state.help_open;
+    return true;
+  }
+  if (state.help_open && event == Event::Escape) {
+    // Only escape's navigate-mode job is closing the help overlay; it is
+    // listed in the overlay's own footer line.
+    state.help_open = false;
+    return true;
+  }
+  if (event == Event::Character('n')) {
+    state.uri_field.clear();
+    state.rps_field.clear();
+    state.duration_field.clear();
+    state.show_errors = false;
+    state.mode = InputMode::kEditingStartRun;
+    state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+    return true;
+  }
+  if (event == Event::Character('s')) {
+    // Stop key: feed stop() only; the service's watchdog ends the run.
+    controller.stopRun();
+    return true;
+  }
+  if (event == Event::Character('q')) {
+    return quitShell(controller, exit_loop);
+  }
+  // Ctrl-C takes the exact q path (flush inside the loop, then exit). FTXUI
+  // would otherwise intercept it: with ForceHandleCtrlC at its default it
+  // records SIGINT and re-raises it after PostMain, terminating the process
+  // before the post-loop teardown could run (T7: 0-byte session on Ctrl-C).
+  if (event == Event::CtrlC) {
+    return quitShell(controller, exit_loop);
+  }
+  return false;
+}
+
 RunController::RunController(const std::shared_ptr<grpc::ChannelInterface>& channel,
                              std::string session_prefix)
     : session_prefix_(std::move(session_prefix)),
@@ -263,25 +365,10 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
   RunController controller(channel, session_prefix);
 
-  StartRunDialogModel dialog;
-  int active_tab = 0;
-  InputMode mode = InputMode::kNavigate;
-  // The feed thread snapshots the mode to decide whether posting a redraw is
-  // allowed (RefreshSuspended); the UI thread updates the mirror on every
-  // transition.
-  std::atomic<InputMode> mode_mirror{InputMode::kNavigate};
-  std::string uri_field;
-  std::string rps_field;
-  std::string duration_field;
-  // The `?` help overlay (navigate mode) and the rejected-submit flag that
-  // keeps the dialog open with its inline errors visible. Both are shell
-  // state the pure layout receives each frame via OverlayState.
-  bool help_open = false;
-  bool show_errors = false;
-
-  Component uri_input = Input(&uri_field, "target uri");
-  Component rps_input = Input(&rps_field, "requests per second");
-  Component duration_input = Input(&duration_field, "duration in seconds");
+  ShellState state;
+  Component uri_input = Input(&state.uri_field, "target uri");
+  Component rps_input = Input(&state.rps_field, "requests per second");
+  Component duration_input = Input(&state.duration_field, "duration in seconds");
 
   // Fullscreen (the alternate-screen buffer) keeps the live TUI from messing
   // up the terminal's scrollback.
@@ -290,8 +377,8 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   // Exactly one redraw per stored snapshot, gated by the input mode (spec §4):
   // while an input mode owns the keyboard the panes catch up only on the one
   // forced redraw the dialog close posts.
-  controller.set_snapshot_notification([&screen, &mode_mirror]() {
-    if (!RefreshSuspended(mode_mirror.load(std::memory_order_relaxed))) {
+  controller.set_snapshot_notification([&screen, &state]() {
+    if (!RefreshSuspended(state.mode_mirror.load(std::memory_order_relaxed))) {
       screen.PostEvent(Event::Custom);
     }
   });
@@ -305,116 +392,42 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     // active field (the vertical container's focus), the rejected-submit
     // flag, and the help toggle.
     OverlayState overlay;
-    overlay.uri_field = uri_field;
-    overlay.rps_field = rps_field;
-    overlay.duration_field = duration_field;
+    overlay.uri_field = state.uri_field;
+    overlay.rps_field = state.rps_field;
+    overlay.duration_field = state.duration_field;
     overlay.active_field = uri_input->Focused() ? StartRunDialogModel::kUri
                           : rps_input->Focused() ? StartRunDialogModel::kRps
                                                  : StartRunDialogModel::kDuration;
-    overlay.show_errors = show_errors;
-    overlay.help_open = help_open;
+    overlay.show_errors = state.show_errors;
+    overlay.help_open = state.help_open;
     overlay.uri_input = uri_input;
     overlay.rps_input = rps_input;
     overlay.duration_input = duration_input;
-    return RenderLayout(screen.dimx(), screen.dimy(), active_tab, mode, view_model, dialog,
-                        controller.sessionPath(), controller.knobOptions(), &overlay);
+    return RenderLayout(screen.dimx(), screen.dimy(), state.active_tab, state.mode, view_model,
+                        state.dialog, controller.sessionPath(), controller.knobOptions(),
+                        &overlay);
   });
 
   Component app = CatchEvent(view, [&](Event event) {
-    if (mode == InputMode::kEditingStartRun) {
-      if (event == Event::Escape) {
-        uri_field.clear();
-        rps_field.clear();
-        duration_field.clear();
-        show_errors = false;
-        mode = InputMode::kNavigate;
-        mode_mirror.store(mode, std::memory_order_relaxed);
-        // Exactly one forced redraw so the panes catch up on the state edited
-        // under the suspension (input_mode.h's rule).
-        screen.PostEvent(Event::Custom);
-        return true;
-      }
-      if (event == Event::Return) {
-        dialog.set_uri(uri_field);
-        uint32_t rps = 0;
-        uint32_t duration_seconds = 0;
-        // Unparseable (or empty) fields stay 0, which the dialog rejects.
-        const bool parsed = absl::SimpleAtoi(rps_field, &rps) &&
-                            absl::SimpleAtoi(duration_field, &duration_seconds);
-        dialog.set_rps(rps);
-        dialog.set_duration_seconds(duration_seconds);
-        if (parsed && dialog.valid() && controller.startRun(dialog.build_request()).ok()) {
-          uri_field.clear();
-          rps_field.clear();
-          duration_field.clear();
-          show_errors = false;
-          mode = InputMode::kNavigate;
-          mode_mirror.store(mode, std::memory_order_relaxed);
-          // Exactly one forced redraw on the dialog close (input_mode.h).
-          screen.PostEvent(Event::Custom);
-        } else {
-          // A failed enter is never silent and never closes the box: the
-          // inline errors render on the offending field rows until the form
-          // validates or esc cancels.
-          show_errors = true;
-        }
-        return true;
-      }
-      return false; // let the text inputs handle the character
-    }
-
-    // Navigate mode key map.
-    if (event == Event::Character('c')) {
-      active_tab = 0;
-      return true;
-    }
-    if (event == Event::Character('k')) {
-      active_tab = 1;
-      return true;
-    }
-    if (event == Event::Character('?')) {
-      help_open = !help_open;
-      return true;
-    }
-    if (help_open && event == Event::Escape) {
-      // Only escape's navigate-mode job is closing the help overlay; it is
-      // listed in the overlay's own footer line.
-      help_open = false;
-      return true;
-    }
-    if (event == Event::Character('n')) {
-      uri_field.clear();
-      rps_field.clear();
-      duration_field.clear();
-      show_errors = false;
-      mode = InputMode::kEditingStartRun;
-      mode_mirror.store(mode, std::memory_order_relaxed);
-      return true;
-    }
-    if (event == Event::Character('s')) {
-      // Stop key: feed stop() only; the service's watchdog ends the run.
-      controller.stopRun();
-      return true;
-    }
-    if (event == Event::Character('q')) {
-      // Quit: stop-if-running, close the session (completed reflects how the
-      // run actually ended), then exit. The last snapshot shown before exit is
-      // the final data (gRPC cancel semantics). A close error mid-exit is not
-      // actionable: the writer then drains without a run end record at
-      // destruction (documented).
-      (void)controller.finishSession(controller.lastRunEndedCompleted());
-      screen.Exit();
-      return true;
-    }
-    return false;
+    return HandleShellEvent(event, state, controller,
+                            [&screen]() { screen.PostEvent(Event::Custom); },
+                            [&screen]() { screen.Exit(); });
   });
 
+  // FTXUI's default signal machinery handles Ctrl-C itself (it records SIGINT
+  // and re-raises it after PostMain, terminating the process before the loop
+  // even returns — the T7 finding: a 0-byte session on Ctrl-C). Handing
+  // Ctrl-C to this shell instead lets HandleShellEvent route it through the
+  // same flush-then-exit sequence as q, inside the loop where the flush is
+  // reachable.
+  screen.ForceHandleCtrlC(false);
   screen.Loop(app);
-  // The loop is over (q, Ctrl-C, or EOF). The q path already flushed inside
-  // the loop; a Ctrl-C or EOF exit never reaches that handler, so route the
-  // teardown through the same flush/close sequence the q path uses — without
-  // this, an open session drains in the destructor with no run end record,
-  // silently losing it (finding F2: a 0-byte session on Ctrl-C).
+  // The loop is over (q, Ctrl-C, or EOF). The q and Ctrl-C paths already
+  // flushed inside the loop; an EOF/signal exit never reaches that handler,
+  // so route the teardown through the same flush/close sequence the q path
+  // uses — without this, an open session drains in the destructor with no
+  // run end record, silently losing it (finding F2: a 0-byte session on
+  // Ctrl-C).
   (void)controller.handleLoopExit();
   return 0;
 }

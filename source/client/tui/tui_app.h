@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <iosfwd>
@@ -10,10 +11,13 @@
 #include "grpc++/grpc++.h"
 
 #include "absl/status/status.h"
+#include "ftxui/component/event.hpp"
 
+#include "source/client/tui/input_mode.h"
 #include "source/client/tui/run_feed.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/session_writer.h"
+#include "source/client/tui/start_run_dialog.h"
 
 namespace Nighthawk {
 namespace Client {
@@ -136,6 +140,47 @@ private:
   SnapshotStore store_;
   RunFeed feed_;
 };
+
+// FORK-ONLY (We-Amp): the interactive shell's mutable UI state, extracted
+// from runInteractive so the key map (HandleShellEvent) is headless-testable —
+// the FTXUI ScreenInteractive loop itself is not. A test drives real
+// ftxui::Event values (including Event::CtrlC) against a real RunController
+// and asserts on this state plus the controller's session lifecycle. The
+// interactive shell keeps its render-side extras (the live Input components)
+// next to this struct and reads its fields each frame.
+struct ShellState {
+  StartRunDialogModel dialog;
+  int active_tab = 0;
+  InputMode mode = InputMode::kNavigate;
+  // The feed thread snapshots the mode to decide whether posting a redraw is
+  // allowed (RefreshSuspended); HandleShellEvent updates the mirror on every
+  // transition.
+  std::atomic<InputMode> mode_mirror{InputMode::kNavigate};
+  std::string uri_field;
+  std::string rps_field;
+  std::string duration_field;
+  // The `?` help overlay (navigate mode).
+  bool help_open = false;
+  // True after a rejected enter whose failure was field validation: the
+  // inline errors and the border error summary render keyed on this.
+  bool show_errors = false;
+};
+
+// The shell's key map — the exact handler the interactive CatchEvent
+// installs, over the shell state above. Returns true when the event was
+// consumed (the CatchEvent must not let it reach the text inputs). The two
+// callbacks stand in for the terminal the loop owns: `force_redraw` posts the
+// one forced redraw the dialog close and escape need while input is suspended
+// (input_mode.h's rule); `exit_loop` leaves the ScreenInteractive loop.
+// A Ctrl-C that reaches this handler routes through the same flush-then-exit
+// sequence as `q` (finishSession inside the loop, then exit): FTXUI's default
+// signal machinery would otherwise record SIGINT and re-raise it after
+// PostMain, killing the process before the post-loop teardown ever runs. The
+// shell pairs this with App::ForceHandleCtrlC(false) so the event actually
+// arrives here.
+bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunController& controller,
+                      const std::function<void()>& force_redraw,
+                      const std::function<void()>& exit_loop);
 
 } // namespace Tui
 
