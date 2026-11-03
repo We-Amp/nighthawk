@@ -136,6 +136,25 @@ TEST(ChartsTest, ChartsRenderWindowedColumnsWithinWidth) {
   }
 }
 
+TEST(ChartsTest, ChartsTolerateDegenerateWidthsAndExtremeValues) {
+  std::vector<PercentilePoint> extreme = {
+      PercentilePoint{1, 1, 2, UINT64_MAX},
+      PercentilePoint{2, 1, 2, UINT64_MAX - 1},
+  };
+  // A p99 at UINT64_MAX must not overflow the row scaling: it lands on the
+  // top band row, and the renderer stays inside the screen.
+  std::vector<std::string> lines = screenLines(RenderPercentileBand(extreme, 60, 10), 60, 10);
+  ASSERT_GE(lines.size(), 2u);
+  EXPECT_NE(lines[1].find('.'), std::string::npos);
+
+  // Degenerate widths must early-out without a huge (negative → size_t)
+  // allocation or a crash.
+  RenderPercentileBand(percentilePoints(10), 0, 10);
+  RenderPercentileBand(percentilePoints(10), -5, 10);
+  RenderCounterLine({CounterPoint{1, 5}}, "benchmark.http_2xx", 0, 10);
+  RenderCounterLine({CounterPoint{1, 5}}, "benchmark.http_2xx", -5, 10);
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client

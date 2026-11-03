@@ -55,9 +55,11 @@ struct RunViewModel {
 // Pure reducer: folds one LiveSnapshot into the model, returning the updated
 // model (pass-by-value + move keeps the copy-on-write shape obvious at call
 // sites). Appends the snapshot's first statistic to latency_band (the
-// aggregator places the primary latency statistic first) and every counter to
-// its series, both capped at kRunViewModelMaxPoints by dropping the oldest
-// points. Sets last_snapshot; never touches run_state.
+// aggregator places the primary latency statistic first) when that statistic
+// has samples — count == 0 means the percentile fields are meaningless
+// (live.proto's consumer contract), so such snapshots leave a gap — and every
+// counter to its series, both capped at kRunViewModelMaxPoints by dropping
+// the oldest points. Sets last_snapshot; never touches run_state.
 RunViewModel ApplySnapshot(RunViewModel model, const nighthawk::client::LiveSnapshot& snapshot);
 
 // Mutex-guarded immutable swap. Feed side stores fully-formed models; render

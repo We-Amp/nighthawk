@@ -20,7 +20,10 @@ void appendCapped(std::vector<PointT>& series, PointT point) {
 
 RunViewModel ApplySnapshot(RunViewModel model, const nighthawk::client::LiveSnapshot& snapshot) {
   const uint64_t monotonic_ns = static_cast<uint64_t>(snapshot.monotonic_ns());
-  if (!snapshot.statistics().empty()) {
+  // live.proto's consumer contract: count == 0 means no samples yet, so the
+  // percentile fields are meaningless — skip the band append and leave a gap
+  // for the warm-up snapshot rather than painting zeros at the chart's bottom.
+  if (!snapshot.statistics().empty() && snapshot.statistics()[0].count() > 0) {
     const nighthawk::client::StatisticSnapshot& stat = snapshot.statistics()[0];
     appendCapped(model.latency_band, PercentilePoint{monotonic_ns, stat.p50_ns(), stat.p90_ns(),
                                                      stat.p99_ns()});

@@ -91,6 +91,28 @@ TEST(RunViewModelTest, ApplySnapshotSkipsBandWhenNoStatistics) {
   EXPECT_EQ(model.last_snapshot.monotonic_ns(), 5'000);
 }
 
+TEST(RunViewModelTest, ApplySnapshotSkipsZeroCountStatistic) {
+  // live.proto: count == 0 means no samples yet, so the percentile fields are
+  // meaningless — the warm-up snapshot must leave a band gap, not paint zeros.
+  RunViewModel model;
+  LiveSnapshot warmup;
+  warmup.set_monotonic_ns(1'000);
+  StatisticSnapshot* stat = warmup.add_statistics();
+  stat->set_id("benchmark.http_latency");
+  stat->set_count(0);
+  stat->set_p50_ns(999);
+  stat->set_p90_ns(999);
+  stat->set_p99_ns(999);
+  model = ApplySnapshot(std::move(model), warmup);
+  EXPECT_TRUE(model.latency_band.empty());
+
+  model = ApplySnapshot(std::move(model), snapshotAt(2'000, 10, 20, 30, 1));
+  ASSERT_EQ(model.latency_band.size(), 1u);
+  EXPECT_EQ(model.latency_band[0].monotonic_ns, 2'000u);
+  EXPECT_EQ(model.latency_band[0].p50_ns, 10u);
+  EXPECT_EQ(model.last_snapshot.monotonic_ns(), 2'000);
+}
+
 TEST(RunViewModelTest, ConcurrentStoreLoadStaysConsistent) {
   SnapshotStore store;
   std::atomic<bool> done{false};
