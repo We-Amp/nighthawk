@@ -11,10 +11,11 @@ namespace Client {
  * streaming, and prints every received LiveSnapshot as a JSON line on the
  * output stream. When the run completes normally, a final JSON line with the
  * run's Output follows. When the probe is interrupted with SIGINT, it cancels
- * the RPC (which prompts the service to stop the run) and prints the last
- * received snapshot as the final line: gRPC never delivers the server's
- * response to a client that cancelled the RPC, so the last snapshot is the
- * best available result.
+ * the RPC (which prompts the service to stop the run) and prints a compact
+ * interruption summary line, of type "interrupted", as the final line: gRPC
+ * never delivers the server's response to a client that cancelled the RPC, so
+ * the last snapshot already streamed above is the best available result, and
+ * the summary line references it (by its timestamps) instead of repeating it.
  *
  * Flags: --address (Nighthawk service gRPC address, e.g. 127.0.0.1:8843),
  * --uri (benchmark target), --rps, --duration (seconds), and optionally

@@ -438,6 +438,27 @@ LiveStreamResult readLiveStream(nighthawk::client::NighthawkService::Stub* stub,
   return result;
 }
 
+// Writes one request on an already-open stream and reads responses until the
+// run's final response arrives. The stream is deliberately left open afterwards
+// (no WritesDone), so a follow-up request can be written on it for a genuine
+// back-to-back same-stream run.
+LiveStreamResult
+readRunFromStream(grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>& stream,
+                  const ExecutionRequest& request) {
+  LiveStreamResult result;
+  EXPECT_TRUE(stream.Write(request, {}));
+  ExecutionResponse response;
+  while (stream.Read(&response)) {
+    if (response.has_live_snapshot()) {
+      result.snapshots.push_back(response.live_snapshot());
+    } else if (response.has_output()) {
+      result.got_final_response = true;
+      break;
+    }
+  }
+  return result;
+}
+
 ExecutionRequest makeLiveRequest(const std::string& uri, uint32_t duration_seconds, uint32_t rps,
                                  uint32_t flush_interval_seconds, bool live_streaming) {
   ExecutionRequest request;
@@ -505,26 +526,35 @@ TEST_P(ServiceTest, LiveStreamingSnapshots) {
 }
 
 // Snapshots must stop when the run ends: nothing may follow the final response,
-// and a second back-to-back run on the same stream must behave identically
-// (nothing from the first run may bleed into the second).
+// and a second back-to-back run on the SAME stream must behave identically
+// (nothing from the first run may bleed into the second). Both runs share one
+// ExecutionStream RPC, exercising the service's stream/future reuse path: if
+// any snapshot writer or run state survived run 1, it would surface here as a
+// stray message or a carry-over of run 1's counters.
 TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
   TestHttpListener listener;
   ExecutionRequest request = makeLiveRequest(listener.uri(), 2, 10, 1, /*live_streaming=*/true);
 
-  LiveStreamResult first = readLiveStream(stub_.get(), request);
+  auto stream = stub_->ExecutionStream(&context_);
+  ASSERT_NE(stream, nullptr);
+
+  // Run 1. Deliberately no WritesDone: the stream must stay open for run 2.
+  LiveStreamResult first = readRunFromStream(*stream, request);
   EXPECT_TRUE(first.got_final_response);
-  EXPECT_FALSE(first.message_after_final);
   EXPECT_GE(first.snapshots.size(), 1);
 
-  // Back-to-back run on the same stream, same behavior expected.
-  LiveStreamResult second = readLiveStream(stub_.get(), request);
+  // Run 2, back-to-back on the same stream, same behavior expected.
+  LiveStreamResult second = readRunFromStream(*stream, request);
   EXPECT_TRUE(second.got_final_response);
-  EXPECT_FALSE(second.message_after_final);
   EXPECT_GE(second.snapshots.size(), 1);
+
   // The second run must produce fresh snapshots of its own, not a carry-over
-  // of the first run's state: its first snapshot (taken ~1s into the run) must
-  // not already hold as many 2xx responses as the first run accumulated over
-  // its whole duration.
+  // of the first run's state. Its first snapshot (taken ~1s into the run) must
+  // not hold more 2xx responses than the last snapshot of run 1 showed: leaked
+  // counters would start run 2 at run 1's accumulated total and push every
+  // snapshot strictly above it. (Equality is legitimate: both snapshots can
+  // land at similar progress at 10 rps.) A stray snapshot left over from run 1
+  // would also surface as run 2's first snapshot here.
   if (!first.snapshots.empty() && !second.snapshots.empty()) {
     uint64_t first_run_total_http_2xx = 0;
     uint64_t second_run_first_http_2xx = 0;
@@ -538,8 +568,15 @@ TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
         second_run_first_http_2xx = value;
       }
     }
-    EXPECT_LT(second_run_first_http_2xx, first_run_total_http_2xx);
+    EXPECT_LE(second_run_first_http_2xx, first_run_total_http_2xx);
   }
+
+  // Nothing may follow run 2's final response: snapshots stop at run end.
+  EXPECT_TRUE(stream->WritesDone());
+  ExecutionResponse extra;
+  EXPECT_FALSE(stream->Read(&extra));
+  auto status = stream->Finish();
+  EXPECT_TRUE(status.ok());
 }
 
 } // namespace

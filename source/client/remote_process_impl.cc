@@ -27,6 +27,11 @@ bool RemoteProcessImpl::run(OutputCollector& collector) {
   // nighthawk_service will ignore the option, but if someone ever changes that this
   // is probably desireable.
   options->mutable_nighthawk_service()->Clear();
+  // We don't forward the fork-only live snapshot streaming opt-in either: a
+  // remote run with it set would stream snapshot responses into
+  // PerformNighthawkBenchmark, which RELEASE_ASSERTs on more than one
+  // response. Remote live streaming is not supported in v0.
+  options->clear_live_streaming();
 
   const absl::StatusOr<const nighthawk::client::ExecutionResponse> result =
       service_client_->PerformNighthawkBenchmark(&stub_, *options);

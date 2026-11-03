@@ -118,17 +118,19 @@ int runLiveProbe(int argc, const char* const* argv, std::ostream& out) {
   if (!got_final && g_live_probe_interrupted) {
     // gRPC never delivers the server's response after the client cancels the
     // RPC (verified against grpc++ behavior: any server write that races with,
-    // or follows, the cancellation is dropped). So after a SIGINT we report
-    // the last live snapshot received as the probe's final result instead of
-    // waiting for a final response that will never arrive.
+    // or follows, the cancellation is dropped). So after a SIGINT we report a
+    // compact summary of the interruption as the probe's final result instead
+    // of waiting for a final response that will never arrive. The last live
+    // snapshot itself, if one arrived, was already streamed as a JSON line
+    // above; the summary references it rather than duplicating it.
     context.TryCancel();
     if (have_snapshot) {
-      absl::StatusOr<std::string> json = toJsonLine(last_snapshot);
-      if (json.ok()) {
-        out << json.value() << "\n";
-      }
+      out << absl::StrCat("{\"type\":\"interrupted\",\"snapshot_received\":true,"
+                          "\"last_snapshot_wall_time_unix_ns\":",
+                          last_snapshot.wall_time_unix_ns(),
+                          ",\"last_snapshot_monotonic_ns\":", last_snapshot.monotonic_ns(), "}\n");
     } else {
-      out << "{\"interrupted\": true, \"snapshot_received\": false}\n";
+      out << "{\"type\":\"interrupted\",\"snapshot_received\":false}\n";
     }
   }
 
