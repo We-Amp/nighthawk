@@ -16,8 +16,11 @@ cc_test(
     name = "tui_app_test",
     srcs = ["tui_app_test.cc"],
     deps = [
+        "//api/client:grpc_service_lib",
         "//source/client/tui:tui_lib",
         "@googletest//:gtest_main",
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
     ],
 )
 
@@ -266,6 +269,17 @@ envoy_cc_test(
     srcs = ["service_test.cc"],
     deps = [
         "//source/client:nighthawk_service_lib",
+        "//test/test_common:environment_lib",
+        "@envoy//test/test_common:network_utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "tui_run_feed_test",
+    srcs = ["tui_run_feed_test.cc"],
+    deps = [
+        "//source/client:nighthawk_service_lib",
+        "//source/client/tui:tui_lib",
         "//test/test_common:environment_lib",
         "@envoy//test/test_common:network_utility_lib",
     ],

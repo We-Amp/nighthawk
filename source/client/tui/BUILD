@@ -15,11 +15,13 @@ envoy_package()
 envoy_cc_library(
     name = "tui_lib",
     srcs = [
+        "run_feed.cc",
         "session_reader.cc",
         "session_writer.cc",
         "tui_app.cc",
     ],
     hdrs = [
+        "run_feed.h",
         "session_framing.h",
         "session_reader.h",
         "session_writer.h",
