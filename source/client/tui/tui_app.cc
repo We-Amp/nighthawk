@@ -198,6 +198,18 @@ absl::Status RunController::finishSession(bool completed) {
   return writer->close(run_end);
 }
 
+absl::Status RunController::handleLoopExit() {
+  // Drop the feed-thread notification before anything can wait: no stale
+  // postEvent may fire into a screen whose loop is already over while the
+  // shutdown below blocks on the feed's terminal event.
+  set_snapshot_notification(nullptr);
+  // The same flush/close sequence the q path runs: stop-if-running, wait for
+  // on_finished, close the writer with a run end record. After a q exit this
+  // is a no-op (the session is already closed; finishSession returns OkStatus
+  // on a null writer).
+  return finishSession(lastRunEndedCompleted());
+}
+
 void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) {
   // The snapshot path (spec §4): fold into the model, swap the immutable
   // store copy, persist the record, then ping the shell for exactly one
@@ -398,10 +410,12 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   });
 
   screen.Loop(app);
-  // The loop is over (q, Ctrl-C, or EOF): drop the feed-thread notification
-  // before the controller's destructor tears the feed down, so no stale
-  // postEvent can fire into a dying screen during teardown.
-  controller.set_snapshot_notification(nullptr);
+  // The loop is over (q, Ctrl-C, or EOF). The q path already flushed inside
+  // the loop; a Ctrl-C or EOF exit never reaches that handler, so route the
+  // teardown through the same flush/close sequence the q path uses — without
+  // this, an open session drains in the destructor with no run end record,
+  // silently losing it (finding F2: a 0-byte session on Ctrl-C).
+  (void)controller.handleLoopExit();
   return 0;
 }
 

@@ -526,6 +526,84 @@ TEST_F(SessionPipelineTest, ControllerTeardownWhileRunIsLiveIsSafe) {
   EXPECT_FALSE(have_run_end);
 }
 
+// F2 fix regression: the Ctrl-C loop-exit path must flush like q. FTXUI's
+// Ctrl-C / EOF exit returns from ScreenInteractive::Loop WITHOUT the q
+// handler's finishSession (the q key is the only in-loop flush), so pre-fix
+// the shell only dropped the snapshot notification post-loop and the open
+// session drained in the destructor with no run end record — on the real
+// binary a 0-byte session file silently lost (finding F2, M0b acceptance).
+// The shell now routes the post-loop teardown through
+// RunController::handleLoopExit(); this drives the controller the way Ctrl-C
+// does — run live, no finishSession ever called — and asserts the session
+// left behind parses with the same run end record the q path writes.
+TEST_F(SessionPipelineTest, LoopExitWithoutQFlushesSessionWithRunEnd) {
+  const StartRequest request = makeStartRequest(listener().uri(), /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  const std::string prefix = tempPath("tui-pipeline-ctrlc");
+
+  auto controller = std::make_unique<RunController>(channel(), prefix);
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+  const std::string session_path = controller->sessionPath();
+
+  // Run demonstrably live, snapshots flowing (same signal as the teardown
+  // test: the stored counter series, not the latency band).
+  bool have_snapshot = false;
+  for (int i = 0; i < 100 && !have_snapshot; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller->model();
+    have_snapshot = model != nullptr && !model->counters.empty();
+    if (!have_snapshot) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(have_snapshot);
+  EXPECT_TRUE(controller->runInProgress());
+
+  // Ctrl-C: the FTXUI loop returned without the q handler having run. The
+  // shell's post-loop teardown must run the same flush/close sequence the q
+  // path uses (stop-if-running -> wait on_finished -> writer close with a
+  // run end record).
+  ASSERT_TRUE(controller->handleLoopExit().ok());
+
+  // The session left behind parses: header, every delivered series, and the
+  // run end record that pre-fix was lost to the destructor drain.
+  auto reader_or = SessionReader::open(session_path);
+  ASSERT_TRUE(reader_or.status().ok());
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+
+  bool have_header = false;
+  bool have_run_end = false;
+  size_t series_count = 0;
+  RunEndRecord run_end;
+  while (true) {
+    auto record_or = reader->next();
+    ASSERT_TRUE(record_or.status().ok());
+    if (!record_or->has_value()) {
+      break;
+    }
+    switch ((*record_or)->record_case()) {
+    case SessionRecord::kHeader:
+      have_header = true;
+      break;
+    case SessionRecord::kMetricSeries:
+      series_count++;
+      break;
+    case SessionRecord::kRunEnd:
+      have_run_end = true;
+      run_end = (*record_or)->run_end();
+      break;
+    default:
+      ADD_FAILURE() << "unexpected unset record frame";
+      break;
+    }
+  }
+  ASSERT_TRUE(have_header);
+  EXPECT_GT(series_count, 0u);
+  ASSERT_TRUE(have_run_end);
+  // A Ctrl-C mid-run stop is a stopped run, exactly like the s key then q.
+  EXPECT_FALSE(run_end.completed());
+  EXPECT_EQ(run_end.dropped_records(), 0u);
+}
+
 // Conversion: a snapshot's fields land on the record verbatim — including the
 // empty epoch id, preserved pre-A2 (constant phase id pre-A1, M0a semantics).
 TEST(SessionConversionTest, ToMetricSeriesCarriesPlaceholders) {

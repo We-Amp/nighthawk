@@ -94,6 +94,18 @@ public:
   // destructor.
   absl::Status finishSession(bool completed);
 
+  // The loop-exit teardown, shared by every way the interactive shell's
+  // ScreenInteractive::Loop can return: the q handler runs finishSession
+  // inside the loop (stop + flush + exit, per the runbook), but FTXUI's
+  // Ctrl-C and EOF exits never reach that handler — the shell therefore calls
+  // this unconditionally once the loop is over. It drops the snapshot
+  // notification first (no stale postEvent into a finished screen), then runs
+  // the same flush/close sequence the q path uses. After a q exit this is a
+  // no-op: the session is already closed and finishSession returns OkStatus
+  // on a null writer. So a Ctrl-C mid-run leaves the same parseable,
+  // run-end-stamped session file a q would have.
+  absl::Status handleLoopExit();
+
 private:
   // The feed callbacks; all fire on the feed's read thread.
   void onSnapshot(const nighthawk::client::LiveSnapshot& snapshot);
