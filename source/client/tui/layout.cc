@@ -95,8 +95,15 @@ std::vector<std::string> wrapRows(const std::string& text, int inner_width) {
     size_t end = std::min(start + static_cast<size_t>(inner_width), text.size());
     if (end < text.size()) {
       // Wrap at the last space inside the window when one exists, so a
-      // parenthetical like "(press q to close it)" stays together.
-      const size_t space = text.rfind(' ', end - 1);
+      // parenthetical like "(q quits and saves)" stays together. When an
+      // opening paren sits inside the window, break right before it instead —
+      // the default last-space break can land inside "(q" and split the
+      // parenthetical anyway.
+      size_t space = text.rfind(' ', end - 1);
+      const size_t paren = text.find('(', start);
+      if (paren != std::string::npos && paren < end && paren > start && text[paren - 1] == ' ') {
+        space = paren - 1;
+      }
       if (space != std::string::npos && space > start) {
         end = space;
       }

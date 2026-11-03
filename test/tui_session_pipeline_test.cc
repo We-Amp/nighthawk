@@ -25,7 +25,10 @@
 #include "api/client/service.grpc.pb.h"
 #include "api/client/service.pb.h"
 
+#include "ftxui/screen/screen.hpp"
+
 #include "source/client/service_impl.h"
+#include "source/client/tui/layout.h"
 #include "source/client/tui/run_feed.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/session_conversion.h"
@@ -693,6 +696,72 @@ TEST_F(SessionPipelineTest, CtrlCEventRoutesThroughTheShellKeyMapAndFlushes) {
   EXPECT_FALSE(run_end.completed());
 }
 
+// Finding-1 residual (re-review): Ctrl-C must quit from EVERY mode. The
+// dialog-owning editing mode swallowed it (the key map only checked Ctrl-C
+// in navigate mode), so with the dialog open FTXUI's default machinery
+// recorded SIGINT and the re-raise killed the process with the session open
+// — a 0-byte file again. The handler must take the same quitShell path
+// (flush + exit) with the dialog open; the dialog state is irrelevant to
+// shutdown.
+TEST_F(SessionPipelineTest, CtrlCWhileEditingDialogFlushesAndExits) {
+  const StartRequest request = makeStartRequest(listener().uri(), /*rps=*/10,
+                                                /*duration_seconds=*/60);
+  const std::string prefix = tempPath("tui-pipeline-ctrlc-dialog");
+
+  auto controller = std::make_unique<RunController>(channel(), prefix);
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+  const std::string session_path = controller->sessionPath();
+
+  bool have_snapshot = false;
+  for (int i = 0; i < 100 && !have_snapshot; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller->model();
+    have_snapshot = model != nullptr && !model->counters.empty();
+    if (!have_snapshot) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(have_snapshot);
+  EXPECT_TRUE(controller->runInProgress());
+
+  // The dialog is open mid-typing when the user hits C-c.
+  ShellState state;
+  state.mode = InputMode::kEditingStartRun;
+  state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+  state.uri_field = listener().uri();
+  state.rps_field = "100";
+  bool exit_requested = false;
+  const bool consumed =
+      HandleShellEvent(ftxui::Event::CtrlC, state, *controller, /*force_redraw=*/[] {},
+                       /*exit_loop=*/[&exit_requested]() { exit_requested = true; });
+
+  EXPECT_TRUE(consumed);
+  EXPECT_TRUE(exit_requested);
+  EXPECT_FALSE(controller->runInProgress());
+  EXPECT_TRUE(controller->sessionPath().empty());
+
+  // The session still parses with a run end record.
+  auto reader_or = SessionReader::open(session_path);
+  ASSERT_TRUE(reader_or.status().ok());
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+  bool have_run_end = false;
+  size_t series_count = 0;
+  while (true) {
+    auto record_or = reader->next();
+    ASSERT_TRUE(record_or.status().ok());
+    if (!record_or->has_value()) {
+      break;
+    }
+    if ((*record_or)->record_case() == SessionRecord::kMetricSeries) {
+      series_count++;
+    } else if ((*record_or)->record_case() == SessionRecord::kRunEnd) {
+      have_run_end = true;
+    }
+  }
+  EXPECT_GT(series_count, 0u);
+  EXPECT_TRUE(have_run_end);
+}
+
+
 // M0b final-review finding (dialog honesty): an enter whose fields validate
 // but whose start the controller refuses (a session already open — the
 // steady state after every run until q) must surface as a distinct
@@ -724,10 +793,40 @@ TEST_F(SessionPipelineTest, EnterWithOpenSessionSurfacesTheControllerRejection) 
   // no field-error flag, a distinct cannot-start line naming the way out.
   EXPECT_EQ(state.mode, InputMode::kEditingStartRun);
   EXPECT_FALSE(state.show_errors);
-  EXPECT_EQ(state.start_rejected,
-            "cannot start: a session is already open (press q to close it)");
+  EXPECT_EQ(state.start_rejected, "cannot start: a session is already open (q quits and saves)");
   // The open session is untouched by the refused start.
   EXPECT_EQ(controller->sessionPath(), session_path);
+
+  // Seam-crossing check (re-review): the state above is only user-visible if
+  // the shell's per-frame ShellState → OverlayState mapping carries it.
+  // Render the frame the same way runInteractive does — via the shared
+  // FillOverlayState mapping, not a hand-built overlay — and assert the
+  // rejection actually reads on screen.
+  OverlayState overlay;
+  FillOverlayState(state, &overlay);
+  overlay.active_field = StartRunDialogModel::kDuration;
+  const ftxui::Element frame_element =
+      RenderLayout(100, 30, /*active_tab=*/0, state.mode, RunViewModel{}, state.dialog,
+                   controller->sessionPath(), nighthawk::client::CommandLineOptions{}, &overlay);
+  ftxui::Screen screen(100, 30);
+  ftxui::Render(screen, frame_element);
+  const std::string frame_text = screen.ToString();
+  EXPECT_NE(frame_text.find("cannot start: a session is already open"), std::string::npos)
+      << frame_text;
+  EXPECT_NE(frame_text.find("(q quits and saves)"), std::string::npos);
+  // And the inverse: a clean state renders no rejection line (the mapping
+  // must not leave stale text behind).
+  state.start_rejected.clear();
+  OverlayState clean_overlay;
+  FillOverlayState(state, &clean_overlay);
+  clean_overlay.active_field = StartRunDialogModel::kDuration;
+  const ftxui::Element clean_element =
+      RenderLayout(100, 30, /*active_tab=*/0, state.mode, RunViewModel{}, state.dialog,
+                   controller->sessionPath(), nighthawk::client::CommandLineOptions{},
+                   &clean_overlay);
+  ftxui::Screen clean_screen(100, 30);
+  ftxui::Render(clean_screen, clean_element);
+  EXPECT_EQ(clean_screen.ToString().find("cannot start:"), std::string::npos);
 
   // Esc cancels and clears the rejection.
   const bool esc_consumed =

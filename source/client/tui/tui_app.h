@@ -14,6 +14,7 @@
 #include "ftxui/component/event.hpp"
 
 #include "source/client/tui/input_mode.h"
+#include "source/client/tui/layout.h"
 #include "source/client/tui/run_feed.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/session_writer.h"
@@ -182,14 +183,22 @@ struct ShellState {
 // one forced redraw the dialog close and escape need while input is suspended
 // (input_mode.h's rule); `exit_loop` leaves the ScreenInteractive loop.
 // A Ctrl-C that reaches this handler routes through the same flush-then-exit
-// sequence as `q` (finishSession inside the loop, then exit): FTXUI's default
-// signal machinery would otherwise record SIGINT and re-raise it after
-// PostMain, killing the process before the post-loop teardown ever runs. The
-// shell pairs this with App::ForceHandleCtrlC(false) so the event actually
-// arrives here.
+// sequence as `q` (finishSession inside the loop, then exit), from ANY mode —
+// checked before the mode maps so an open dialog cannot swallow it: FTXUI's
+// default signal machinery would otherwise record SIGINT and re-raise it
+// after PostMain, killing the process before the post-loop teardown ever
+// runs. The shell pairs this with App::ForceHandleCtrlC(false) so the event
+// actually arrives here.
 bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunController& controller,
                       const std::function<void()>& force_redraw,
                       const std::function<void()>& exit_loop);
+
+// The ShellState → OverlayState mapping the interactive shell applies every
+// frame — shared with the tests so a field dropped from the mapping is a
+// visible test failure, not an invisible screen (a state-only assertion
+// cannot catch a missing copy). The shell-only extras the caller still fills:
+// the focus-derived active field and the live Input components.
+void FillOverlayState(const ShellState& state, OverlayState* overlay);
 
 } // namespace Tui
 

@@ -348,14 +348,14 @@ TEST(DialogOverlayTest, ControllerRejectionRendersInsideTheBoxWithoutAnErrorCoun
   overlay.rps_field = "100";
   overlay.duration_field = "60";
   overlay.active_field = StartRunDialogModel::kUri;
-  overlay.start_rejected = "cannot start: a session is already open (press q to close it)";
+  overlay.start_rejected = "cannot start: a session is already open (q quits and saves)";
   Frame frame = frameAt(InputMode::kEditingStartRun, RunViewModel{}, filledDialog(), &overlay);
 
   // The rejection reads inside the box, naming the way out. The message
   // wraps at the fixed border width rather than being clipped (both wrapped
   // rows appear).
   EXPECT_TRUE(frame.contains("cannot start: a session is already open"));
-  EXPECT_TRUE(frame.contains("(press q to close it)"));
+  EXPECT_TRUE(frame.contains("(q quits and saves)"));
   // No error-count border title (and in particular no "0 errors"), no
   // per-field inline errors: this failure is not a field error.
   EXPECT_TRUE(frame.lacks("errors"));

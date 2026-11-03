@@ -48,9 +48,30 @@ bool quitShell(RunController& controller, const std::function<void()>& exit_loop
   return true;
 }
 
+void FillOverlayState(const ShellState& state, OverlayState* overlay) {
+  overlay->uri_field = state.uri_field;
+  overlay->rps_field = state.rps_field;
+  overlay->duration_field = state.duration_field;
+  overlay->show_errors = state.show_errors;
+  overlay->help_open = state.help_open;
+  // The controller-rejection line rides along: dropping this copy would make
+  // a refused submit silent again while every state-level assertion stays
+  // green (the re-review finding).
+  overlay->start_rejected = state.start_rejected;
+}
+
 bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunController& controller,
                       const std::function<void()>& force_redraw,
                       const std::function<void()>& exit_loop) {
+  // Ctrl-C quits from EVERY mode, before any mode-specific map can swallow
+  // it: with the dialog open the editing branch would otherwise return false,
+  // FTXUI's default machinery would record SIGINT, and the re-raise would
+  // kill the process with the session open (the finding-1 residual). The
+  // dialog state is irrelevant to shutdown — the same quitShell path (flush
+  // inside the loop, then exit) runs in both modes.
+  if (event == Event::CtrlC) {
+    return quitShell(controller, exit_loop);
+  }
   if (state.mode == InputMode::kEditingStartRun) {
     if (event == Event::Escape) {
       state.uri_field.clear();
@@ -145,13 +166,6 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
   if (event == Event::Character('q')) {
     return quitShell(controller, exit_loop);
   }
-  // Ctrl-C takes the exact q path (flush inside the loop, then exit). FTXUI
-  // would otherwise intercept it: with ForceHandleCtrlC at its default it
-  // records SIGINT and re-raises it after PostMain, terminating the process
-  // before the post-loop teardown could run (T7: 0-byte session on Ctrl-C).
-  if (event == Event::CtrlC) {
-    return quitShell(controller, exit_loop);
-  }
   return false;
 }
 
@@ -177,8 +191,9 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     std::lock_guard<std::mutex> lock(mutex_);
     if (writer_ != nullptr) {
       // User-facing through the start-run dialog's rejection line: name the
-      // way out (q closes the open session), not the lifecycle detail.
-      return absl::FailedPreconditionError("a session is already open (press q to close it)");
+      // way out honestly — in M0b there is no close-without-exit, q quits
+      // the TUI and saves the session.
+      return absl::FailedPreconditionError("a session is already open (q quits and saves)");
     }
   }
 
@@ -408,16 +423,14 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     const RunViewModel& view_model = model == nullptr ? kIdleModel : *model;
     // The overlay state the pure layout renders from: draft fields, the
     // active field (the vertical container's focus), the rejected-submit
-    // flag, and the help toggle.
+    // flag, and the help toggle. The shared mapping carries the shell state;
+    // the focus-derived active field and the live Input components are the
+    // shell-only extras.
     OverlayState overlay;
-    overlay.uri_field = state.uri_field;
-    overlay.rps_field = state.rps_field;
-    overlay.duration_field = state.duration_field;
+    FillOverlayState(state, &overlay);
     overlay.active_field = uri_input->Focused() ? StartRunDialogModel::kUri
                           : rps_input->Focused() ? StartRunDialogModel::kRps
                                                  : StartRunDialogModel::kDuration;
-    overlay.show_errors = state.show_errors;
-    overlay.help_open = state.help_open;
     overlay.uri_input = uri_input;
     overlay.rps_input = rps_input;
     overlay.duration_input = duration_input;
