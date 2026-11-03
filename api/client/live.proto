@@ -4,9 +4,10 @@ package nighthawk.client;
 
 // FORK-ONLY (We-Amp): this file, and the messages it defines, are fork-specific
 // additions that do not exist upstream. Rebase check: if an upstream change
-// adds messages or field numbers that collide with the ones here, the fork's
-// additions must be renumbered before rebasing. Upstream consumers never see
-// these messages unless they explicitly opt in.
+// collides with the ones here, the fork's additions must give way before
+// rebasing — colliding field NUMBERS are renumbered, while colliding MESSAGE
+// NAMES are renamed (fork-private names carry no wire-compat obligation).
+// Upstream consumers never see these messages unless they explicitly opt in.
 
 // Opt-in marker for live snapshot streaming over ExecutionStream. The message
 // carries no fields: its presence in CommandLineOptions is what enables
@@ -42,8 +43,11 @@ message LiveSnapshot {
   int64 monotonic_ns = 2;
   // The benchmark phase the snapshot belongs to (currently "main").
   string phase_id = 3;
-  // Identifier of the execution this snapshot belongs to (the execution_id
-  // option when set, empty otherwise).
+  // Identifier of the execution this snapshot belongs to. FORK-ONLY rebase
+  // check on semantics: pre-A2 this field carries execution identity (the
+  // execution_id option when set, empty otherwise); A2 repurposes it as the
+  // knob-epoch id. A rebase that lands on top of A2 must account for this
+  // semantics change, not just the field number.
   string epoch_id = 4;
   // Global counter values accumulated so far, keyed by counter name.
   map<string, uint64> counters = 5;

@@ -2,6 +2,10 @@
 
 #include <csignal>
 #include <iostream>
+#include <memory>
+
+#include <pthread.h>
+#include <signal.h>
 
 #include "grpc++/grpc++.h"
 
@@ -27,12 +31,16 @@ grpc::ClientContext* g_live_probe_context = nullptr;
 
 void liveProbeSignalHandler(int) {
   g_live_probe_interrupted = 1;
-  if (g_live_probe_context != nullptr) {
+  // Snapshot the pointer into a local before checking it: the main thread may
+  // null the global concurrently (teardown), and dereferencing through the
+  // global twice could race between the null check and the call.
+  grpc::ClientContext* context = g_live_probe_context;
+  if (context != nullptr) {
     // Cancel the RPC so the service's cancellation watchdog stops the in-flight
     // run promptly. Not strictly async-signal-safe, but TryCancel() only flips
     // gRPC's cancellation state and wakes the channel; this is the practical
     // way to unblock a synchronous Read() from a signal path.
-    g_live_probe_context->TryCancel();
+    context->TryCancel();
   }
 }
 
@@ -41,6 +49,27 @@ absl::StatusOr<std::string> toJsonLine(const Envoy::Protobuf::Message& message) 
   return Envoy::MessageUtil::getJsonStringFromMessage(message, /*pretty_print=*/false,
                                                       /*preserve_proto_field_names=*/true);
 }
+
+// Blocks SIGINT for the duration of the guard. Used around the sequences that
+// set and clear g_live_probe_context, so the signal handler can never observe
+// a torn or stale pointer mid-update (any SIGINT arriving while blocked stays
+// pending and is delivered as soon as the guard unblocks).
+class ScopedSigintBlock {
+public:
+  ScopedSigintBlock() {
+    sigemptyset(&set_);
+    sigaddset(&set_, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &set_, &oldset_);
+  }
+  ~ScopedSigintBlock() { pthread_sigmask(SIG_SETMASK, &oldset_, nullptr); }
+
+  ScopedSigintBlock(const ScopedSigintBlock&) = delete;
+  ScopedSigintBlock& operator=(const ScopedSigintBlock&) = delete;
+
+private:
+  sigset_t set_;
+  sigset_t oldset_;
+};
 
 } // namespace
 
@@ -72,7 +101,10 @@ int runLiveProbe(int argc, const char* const* argv, std::ostream& out) {
   auto channel = grpc::CreateChannel(address.getValue(), grpc::InsecureChannelCredentials());
   auto stub = nighthawk::client::NighthawkService::NewStub(channel);
   grpc::ClientContext context;
-  g_live_probe_context = &context;
+  {
+    ScopedSigintBlock block;
+    g_live_probe_context = &context;
+  }
 
   nighthawk::client::ExecutionRequest request;
   auto* options = request.mutable_start_request()->mutable_options();
@@ -83,13 +115,21 @@ int runLiveProbe(int argc, const char* const* argv, std::ostream& out) {
   // Opt in to live snapshot streaming: presence of the message is the marker.
   options->mutable_live_streaming();
 
-  auto stream = stub->ExecutionStream(&context);
+  // grpc++ requires Finish() on the stream before it is destroyed; owning it
+  // in a unique_ptr guarantees no invocation leaks the ClientReaderWriter.
+  std::unique_ptr<grpc::ClientReaderWriter<nighthawk::client::ExecutionRequest,
+                                           nighthawk::client::ExecutionResponse>>
+      stream(stub->ExecutionStream(&context));
   // SIGINT: cancel the RPC (which the service's cancellation watchdog turns
   // into a prompt run stop) and report the last snapshot received.
   std::signal(SIGINT, liveProbeSignalHandler);
   if (!stream->Write(request) || !stream->WritesDone()) {
     out << "Failed to write the request to the Nighthawk service.\n";
-    g_live_probe_context = nullptr;
+    stream->Finish();
+    {
+      ScopedSigintBlock block;
+      g_live_probe_context = nullptr;
+    }
     return 1;
   }
 
@@ -134,7 +174,10 @@ int runLiveProbe(int argc, const char* const* argv, std::ostream& out) {
     }
   }
 
-  g_live_probe_context = nullptr;
+  {
+    ScopedSigintBlock block;
+    g_live_probe_context = nullptr;
+  }
   grpc::Status status = stream->Finish();
   if (got_final) {
     absl::StatusOr<std::string> json = toJsonLine(response.output());
