@@ -11,10 +11,15 @@
 
 #include "absl/strings/str_cat.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 namespace Nighthawk {
 namespace Client {
 
-void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionRequest& request) {
+void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionRequest& request,
+                                         grpc::ServerContext* context) {
   std::unique_ptr<Envoy::Thread::LockGuard> busy_lock;
   {
     // Lock accepted_lock, in case we get here before accepted_event_.wait() is entered.
@@ -52,7 +57,43 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
   ProcessPtr process = std::move(*process_or_status);
 
   OutputCollectorImpl output_collector(time_system_, *options);
-  const bool ok = process->run(output_collector);
+  // Watch the gRPC context while the run is in flight: when the client cancels
+  // the RPC, request the workers to stop asap instead of running for the full
+  // configured duration. The watchdog is joined again on every exit path of
+  // run() before the process shuts down.
+  std::atomic<bool> stop_watchdog{false};
+  std::thread watchdog_thread;
+  if (context != nullptr) {
+    watchdog_thread = std::thread([context, process_ptr = process.get(), &stop_watchdog]() {
+      while (!stop_watchdog.load(std::memory_order_relaxed)) {
+        if (context->IsCancelled()) {
+          // The run may have completed on its own in the meantime; calling
+          // this is harmless, and it cannot race with process shutdown,
+          // which only starts after this thread has been joined.
+          process_ptr->requestExecutionCancellation();
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    });
+  }
+  // Stops and joins the watchdog no matter how run() ends (success, failure or
+  // exception), so no thread is ever left running while the process shuts down
+  // below.
+  struct WatchdogJoin {
+    ~WatchdogJoin() {
+      stop->store(true, std::memory_order_relaxed);
+      if (thread->joinable()) {
+        thread->join();
+      }
+    }
+    std::atomic<bool>* stop;
+    std::thread* thread;
+  };
+  const bool ok = [&]() {
+    WatchdogJoin watchdog_join{&stop_watchdog, &watchdog_thread};
+    return process->run(output_collector);
+  }();
   if (!ok) {
     response.mutable_error_detail()->set_code(grpc::StatusCode::INTERNAL);
     // TODO(https://github.com/envoyproxy/nighthawk/issues/181): wire through error descriptions, so
@@ -102,7 +143,7 @@ grpc::Status ServiceImpl::finishGrpcStream(const bool success, absl::string_view
 // TODO(oschaaf): should we merge incoming request options with defaults?
 // TODO(oschaaf): aggregate the client's logs and forward them in the grpc response.
 grpc::Status ServiceImpl::ExecutionStream(
-    grpc::ServerContext* /*context*/,
+    grpc::ServerContext* context,
     grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
                              nighthawk::client::ExecutionRequest>* stream) {
   nighthawk::client::ExecutionRequest request;
@@ -117,8 +158,8 @@ grpc::Status ServiceImpl::ExecutionStream(
         Envoy::Thread::LockGuard accepted_lock(accepted_lock_);
         // We pass in std::launch::async to avoid lazy evaluation, as we want this to run
         // asap. See: https://en.cppreference.com/w/cpp/thread/async
-        future_ = std::future<void>(
-            std::async(std::launch::async, &ServiceImpl::handleExecutionRequest, this, request));
+        future_ = std::future<void>(std::async(
+            std::launch::async, &ServiceImpl::handleExecutionRequest, this, request, context));
         // Block until the thread associated to the future has acquired busy_lock_
         accepted_event_.wait(accepted_lock_);
       } else {

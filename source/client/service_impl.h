@@ -51,7 +51,8 @@ public:
                                            nighthawk::client::ExecutionRequest>* stream) override;
 
 private:
-  void handleExecutionRequest(const nighthawk::client::ExecutionRequest& request);
+  void handleExecutionRequest(const nighthawk::client::ExecutionRequest& request,
+                              grpc::ServerContext* context);
   void writeResponse(const nighthawk::client::ExecutionResponse& response);
   grpc::Status finishGrpcStream(const bool success, absl::string_view description = "");
 

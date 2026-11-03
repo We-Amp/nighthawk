@@ -1,6 +1,12 @@
 #include <grpc++/grpc++.h>
 
 #include <chrono>
+#include <thread>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "nighthawk/common/exception.h"
 
@@ -23,6 +29,101 @@ namespace {
 
 using nighthawk::client::ExecutionRequest;
 using nighthawk::client::ExecutionResponse;
+
+// A minimal HTTP/1.1 server that answers every request with an empty 200
+// response. It gives the benchmark client live upstream traffic so that tests
+// can observe 2xx counters in the output the service produces.
+class TestHttpListener {
+public:
+  TestHttpListener() {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_NE(listen_fd_, -1);
+    int one = 1;
+    EXPECT_EQ(::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)), 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    EXPECT_EQ(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    EXPECT_EQ(::listen(listen_fd_, 16), 0);
+    socklen_t addr_len = sizeof(addr);
+    EXPECT_EQ(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+    port_ = ntohs(addr.sin_port);
+    thread_ = std::thread([this]() { acceptLoop(); });
+  }
+
+  ~TestHttpListener() {
+    // shutdown() reliably wakes a blocked accept(), close() alone may not.
+    ::shutdown(listen_fd_, SHUT_RDWR);
+    ::close(listen_fd_);
+    thread_.join();
+  }
+
+  TestHttpListener(const TestHttpListener&) = delete;
+  TestHttpListener& operator=(const TestHttpListener&) = delete;
+
+  std::string uri() const { return fmt::format("http://127.0.0.1:{}/", port_); }
+
+private:
+  static constexpr int kNoSignalFlags =
+#ifdef MSG_NOSIGNAL
+      MSG_NOSIGNAL;
+#else
+      0;
+#endif
+
+  void acceptLoop() {
+    while (true) {
+      int fd = ::accept(listen_fd_, nullptr, nullptr);
+      if (fd < 0) {
+        return;
+      }
+#ifdef SO_NOSIGPIPE
+      int one = 1;
+      ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+      serve(fd);
+    }
+  }
+
+  static void serve(int fd) {
+    static constexpr absl::string_view kResponse = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    std::string buffer;
+    char chunk[4096];
+    while (true) {
+      size_t request_end;
+      while ((request_end = buffer.find("\r\n\r\n")) != std::string::npos) {
+        buffer.erase(0, request_end + 4);
+        if (!sendAll(fd, kResponse)) {
+          ::close(fd);
+          return;
+        }
+      }
+      ssize_t n = ::recv(fd, chunk, sizeof(chunk), 0);
+      if (n <= 0) {
+        break;
+      }
+      buffer.append(chunk, static_cast<size_t>(n));
+    }
+    ::close(fd);
+  }
+
+  static bool sendAll(int fd, absl::string_view data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+      ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, kNoSignalFlags);
+      if (n <= 0) {
+        return false;
+      }
+      sent += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  int listen_fd_{-1};
+  uint16_t port_{0};
+  std::thread thread_;
+};
 
 class ServiceTest : public TestWithParam<Envoy::Network::Address::IpVersion> {
 public:
@@ -234,6 +335,58 @@ TEST_P(ServiceTest, CancelNotSupported) {
   auto status = r->Finish();
   EXPECT_THAT(status.error_message(), HasSubstr("Request is not supported yet"));
   EXPECT_FALSE(status.ok());
+}
+
+// Cancelling the client's gRPC context must promptly stop an in-flight
+// benchmark: the service must release its single-run lock so that a follow-up
+// run is served normally, instead of being declined while the abandoned run
+// lingers for its full configured duration.
+TEST_P(ServiceTest, CancelViaContext) {
+  TestHttpListener listener;
+  auto options = request_.mutable_start_request()->mutable_options();
+  options->mutable_uri()->set_value(listener.uri());
+  options->mutable_duration()->set_seconds(60);
+  options->mutable_requests_per_second()->set_value(10);
+
+  const auto start_time = std::chrono::steady_clock::now();
+  auto r = stub_->ExecutionStream(&context_);
+  EXPECT_TRUE(r->Write(request_, {}));
+  std::this_thread::sleep_for(2s);
+  context_.TryCancel();
+  // The client cancelled the RPC, so this stream cannot carry the run's final
+  // response anymore; the prompt end of the RPC is all we can observe on it.
+  EXPECT_FALSE(r->Read(&response_));
+  r->Finish();
+
+  // Give the service a bounded grace period to wind the cancelled run down
+  // (run cancellation polling plus run teardown).
+  std::this_thread::sleep_for(2s);
+
+  // A follow-up run must be served normally: status OK, output present, and
+  // 2xx counters accumulated against the live listener.
+  setupGrpcClient();
+  grpc::ClientContext followup_context;
+  request_ = nighthawk::client::ExecutionRequest();
+  auto followup_options = request_.mutable_start_request()->mutable_options();
+  followup_options->mutable_uri()->set_value(listener.uri());
+  followup_options->mutable_duration()->set_seconds(2);
+  followup_options->mutable_requests_per_second()->set_value(10);
+  auto followup = stub_->ExecutionStream(&followup_context);
+  EXPECT_TRUE(followup->Write(request_, {}));
+  EXPECT_TRUE(followup->WritesDone());
+  EXPECT_TRUE(followup->Read(&response_));
+  EXPECT_FALSE(response_.has_error_detail());
+  EXPECT_TRUE(response_.has_output());
+  uint64_t http_2xx = 0;
+  for (const auto& counter : response_.output().results(0).counters()) {
+    if (counter.name() == "benchmark.http_2xx") {
+      http_2xx = counter.value();
+    }
+  }
+  EXPECT_GT(http_2xx, 0);
+  auto followup_status = followup->Finish();
+  EXPECT_TRUE(followup_status.ok());
+  EXPECT_LT(std::chrono::steady_clock::now() - start_time, 30s);
 }
 
 TEST_P(ServiceTest, Unresolvable) {
