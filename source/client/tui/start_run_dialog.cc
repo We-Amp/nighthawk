@@ -1,10 +1,17 @@
 #include "source/client/tui/start_run_dialog.h"
 
+#include "absl/strings/ascii.h"
+
 namespace Nighthawk {
 namespace Client {
 namespace Tui {
 
-void StartRunDialogModel::set_uri(std::string uri) { uri_ = std::move(uri); }
+// Trims surrounding whitespace so a fat-fingered submit still works, and a
+// whitespace-only field lands on the invalid empty-uri path (routed from the
+// Task 5 review).
+void StartRunDialogModel::set_uri(std::string uri) {
+  uri_ = std::string(absl::StripAsciiWhitespace(uri));
+}
 
 void StartRunDialogModel::set_rps(uint32_t rps) { rps_ = rps; }
 

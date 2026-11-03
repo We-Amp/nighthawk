@@ -114,6 +114,38 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): display-only knob pane tests. Plain cc_test, same
+# quarantine reasoning as tui_view_model_test.
+cc_test(
+    name = "tui_knob_pane_test",
+    srcs = ["tui_knob_pane_test.cc"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@ftxui//:dom",
+        "@ftxui//:screen",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
+# FORK-ONLY (We-Amp): headless session-pipeline integration tests — the same
+# feed -> store -> writer pipeline the interactive shell drives, minus the
+# terminal, over an in-proc Nighthawk service and a real HTTP listener. An
+# envoy_cc_test (like tui_run_feed_test) because it needs ServiceImpl and the
+# grpc server stack; the headless code under test stays inside the quarantine.
+envoy_cc_test(
+    name = "tui_session_pipeline_test",
+    srcs = ["tui_session_pipeline_test.cc"],
+    deps = [
+        "//source/client:nighthawk_service_lib",
+        "//source/client/tui:tui_lib",
+    ],
+)
+
 envoy_cc_test(
     name = "benchmark_http_client_test",
     srcs = ["benchmark_http_client_test.cc"],

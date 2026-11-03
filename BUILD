@@ -107,6 +107,11 @@ envoy_cc_binary(
     name = "nighthawk_tui",
     deps = [
         "//source/exe:tui_main_entry_lib",
+        # tui_lib carries grpc++ code (run_feed, the interactive shell's
+        # channel); the binary must link grpc explicitly (same pattern as the
+        # plain cc_test targets).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
     ],
 )
 
@@ -118,5 +123,10 @@ envoy_cc_binary(
     name = "nighthawk_session_dump",
     deps = [
         "//source/exe:session_dump_entry_lib",
+        # tui_lib now carries grpc++ code beyond the reader (the interactive
+        # shell); the whole archive links, so grpc must be explicit here too
+        # (same pattern as nighthawk_tui).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
     ],
 )

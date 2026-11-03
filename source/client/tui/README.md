@@ -19,6 +19,21 @@ Envoy test helpers typically link Envoy source libs transitively, so they show
 up via `@envoy//source/...`; a header-only `@envoy//test` target with no
 transitive source deps would pass the guard as written.
 
+## Threading model (M0b)
+
+Implemented as specified (design spec §4): the FTXUI loop (`nighthawk_tui`) owns
+the terminal; `RunFeed` owns its dedicated gRPC read thread (all feed callbacks
+fire there); `SessionWriter` owns its own writer thread behind the bounded
+`SessionRecordQueue` (drop-newest policy); state crosses threads only as
+immutable snapshots (`SnapshotStore`/`RunViewModel`). The lifecycle logic lives
+in the headless `RunController` (`tui_app.h`); the interactive shell only
+composes `RenderLayout` and the key map on top.
+
+**pprof worker pool: deferred to M1.** This is an inference from the milestone
+ladder, not a spec sanction: M0b has no pprof work to fold (the pool's first
+consumer is M1's flamegraph pipeline), so introducing it here would be dead
+code. The other named-thread contracts above are implemented as specified.
+
 ## The quarantine rule
 
 The TUI (`nighthawk_tui`, `//source/client/tui:tui_lib`) may depend only on
