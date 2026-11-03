@@ -20,6 +20,11 @@ namespace Tui {
  * nighthawk.client.SessionRecord. Records are returned in file order. The
  * JSONL sidecar index is not needed for sequential reads.
  *
+ * Format gate: open() reads (and stashes) the first frame and requires it to
+ * be a header with format_version "1"; an unsupported version is rejected at
+ * open with an error naming the found version. The stashed header is returned
+ * by the first next() call, so records still come back in file order.
+ *
  * Dependency quarantine: this library and everything it pulls in must stay
  * clear of @envoy//source/... C++ targets (see source/client/tui/README.md
  * for the standing guard that enforces this).
@@ -27,10 +32,12 @@ namespace Tui {
 class SessionReader {
 public:
   /**
-   * Opens a session data file.
+   * Opens a session data file and validates its header frame.
    *
    * @param session_path path of the .nhsession data file.
-   * @return the reader, or an error when the file cannot be opened.
+   * @return the reader, or an error when the file cannot be opened, is
+   * empty, has a non-header first frame, or declares an unsupported
+   * format_version.
    */
   static absl::StatusOr<std::unique_ptr<SessionReader>> open(absl::string_view session_path);
 
@@ -45,8 +52,15 @@ public:
 private:
   explicit SessionReader(std::ifstream data_file);
 
+  // Reads one length-prefixed frame from the current position; shared by
+  // open()'s format gate and next().
+  absl::StatusOr<std::optional<nighthawk::client::SessionRecord>> readFrame();
+
   std::ifstream data_file_;
   uint64_t offset_ = 0;
+  // The header frame read by open()'s format gate, handed back by the first
+  // next() call so records still come back in file order.
+  std::optional<nighthawk::client::SessionRecord> pending_header_;
 };
 
 } // namespace Tui

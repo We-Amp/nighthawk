@@ -35,44 +35,8 @@ struct SessionWriterOptions {
   size_t queue_capacity = 1024;
 };
 
-/**
- * Appends a varint32 encoding of `value` to `out`. The caller checks the
- * stream state afterwards.
- *
- * @param out the output stream to append to.
- * @param value the value to encode.
- * @return ok, or an internal error if the stream is already in a bad state.
- */
-absl::Status writeVarint32(std::ostream& out, uint32_t value);
-
-/**
- * Number of bytes writeVarint32() emits for `value`.
- *
- * @param value the value to measure.
- * @return the encoded length in bytes (1..5).
- */
-uint32_t varint32Length(uint32_t value);
-
-/**
- * Outcome of a varint32 read attempt.
- */
-enum class VarintReadResult {
-  // A value was read into the out-param.
-  kOk,
-  // Clean EOF: the stream was already at its end before the read started.
-  kEof,
-  // EOF in the middle of the varint, or the varint exceeds 5 bytes.
-  kError,
-};
-
-/**
- * Reads one varint32 from `in`.
- *
- * @param in the input stream to read from.
- * @param value receives the decoded value when kOk is returned.
- * @return kOk, kEof, or kError as described above.
- */
-VarintReadResult readVarint32(std::istream& in, uint32_t& value);
+// The varint32 frame-length primitives (writeVarint32, varint32Length,
+// readVarint32) live in session_framing.h, shared with the reader.
 
 /**
  * Bounded, thread-safe record queue with a drop-newest policy, used by

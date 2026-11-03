@@ -2,6 +2,7 @@
 #include <fstream>
 #include <ios>
 #include <optional>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -376,6 +377,89 @@ TEST(TuiSessionTest, ReaderRejectsTruncatedFrame) {
   ASSERT_FALSE(r5.ok());
   EXPECT_EQ(r5.status().code(), absl::StatusCode::kDataLoss);
   EXPECT_NE(r5.status().message().find("offset"), std::string::npos) << r5.status();
+}
+
+// Appends one length-prefixed frame for `record` to `out` (the same varint32
+// framing the writer uses), for tests that hand-build damaged files.
+void appendFrame(std::ostream& out, const SessionRecord& record) {
+  std::string payload;
+  ASSERT_TRUE(record.SerializeToString(&payload));
+  uint32_t length = payload.size();
+  while ((length & ~0x7fu) != 0) {
+    out.put(static_cast<char>((length & 0x7fu) | 0x80u));
+    length >>= 7;
+  }
+  out.put(static_cast<char>(length));
+  out.write(payload.data(), payload.size());
+}
+
+// A valid header frame (format_version "1") serialized alone, for tests that
+// build files frame by frame.
+SessionRecord makeHeaderRecord(const std::string& version) {
+  SessionHeader header;
+  header.set_format_version(version);
+  header.set_session_id("hand-built");
+  header.set_started_unix_ns(1);
+  SessionRecord record;
+  *record.mutable_header() = std::move(header);
+  return record;
+}
+
+TEST(TuiSessionTest, ReaderRejectsRecordNotSetFrame) {
+  // A length-consistent frame whose payload parses but sets no record must
+  // surface as kDataLoss naming the offset, not as a silent {} line.
+  const std::string path = tempPath("unset-record.nhsession");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.is_open());
+    appendFrame(out, makeHeaderRecord("1"));
+    // Corrupted-but-length-consistent: zero-length payload parses fine but
+    // carries no record.
+    out.put('\0');
+    ASSERT_TRUE(out.good());
+  }
+
+  auto reader_or = SessionReader::open(path);
+  ASSERT_TRUE(reader_or.ok()) << reader_or.status();
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+  auto header = reader->next();
+  ASSERT_TRUE(header.ok()) << header.status();
+  ASSERT_TRUE(header->has_value());
+  auto corrupted = reader->next();
+  ASSERT_FALSE(corrupted.ok());
+  EXPECT_EQ(corrupted.status().code(), absl::StatusCode::kDataLoss);
+  EXPECT_NE(corrupted.status().message().find("offset"), std::string::npos) << corrupted.status();
+}
+
+TEST(TuiSessionTest, ReaderRejectsUnknownFormatVersion) {
+  const std::string path = tempPath("future-version.nhsession");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.is_open());
+    appendFrame(out, makeHeaderRecord("99"));
+    ASSERT_TRUE(out.good());
+  }
+
+  // The mismatch is rejected at open, naming the found version.
+  auto reader_or = SessionReader::open(path);
+  ASSERT_FALSE(reader_or.ok());
+  EXPECT_EQ(reader_or.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(reader_or.status().message().find("\"99\""), std::string::npos) << reader_or.status();
+  EXPECT_NE(reader_or.status().message().find("\"1\""), std::string::npos) << reader_or.status();
+}
+
+TEST(TuiSessionTest, CloseTwiceFailsPrecondition) {
+  // Task-6 wiring constraint: call close() exactly once.
+  const std::string path = tempPath("close-twice.nhsession");
+  SessionHeader header;
+  header.set_format_version("1");
+  auto writer_or = SessionWriter::open(path, header);
+  ASSERT_TRUE(writer_or.ok()) << writer_or.status();
+  std::unique_ptr<SessionWriter> writer = std::move(*writer_or);
+  RunEndRecord run_end;
+  ASSERT_TRUE(writer->close(run_end).ok());
+  auto second = writer->close(run_end);
+  EXPECT_EQ(second.code(), absl::StatusCode::kFailedPrecondition);
 }
 
 } // namespace

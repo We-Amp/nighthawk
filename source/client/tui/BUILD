@@ -20,6 +20,7 @@ envoy_cc_library(
         "tui_app.cc",
     ],
     hdrs = [
+        "session_framing.h",
         "session_reader.h",
         "session_writer.h",
         "tui_app.h",

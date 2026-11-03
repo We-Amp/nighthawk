@@ -2,57 +2,11 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "source/client/tui/session_framing.h"
 
 namespace Nighthawk {
 namespace Client {
 namespace Tui {
-
-absl::Status writeVarint32(std::ostream& out, uint32_t value) {
-  if (!out.good()) {
-    return absl::InternalError("output stream is in a bad state before writing varint");
-  }
-  while ((value & ~0x7fu) != 0) {
-    const char byte = static_cast<char>((value & 0x7fu) | 0x80u);
-    out.put(byte);
-    value >>= 7;
-  }
-  out.put(static_cast<char>(value));
-  if (!out.good()) {
-    return absl::InternalError("failed writing varint length prefix");
-  }
-  return absl::OkStatus();
-}
-
-uint32_t varint32Length(uint32_t value) {
-  uint32_t length = 1;
-  while ((value & ~0x7fu) != 0) {
-    value >>= 7;
-    ++length;
-  }
-  return length;
-}
-
-VarintReadResult readVarint32(std::istream& in, uint32_t& value) {
-  value = 0;
-  uint32_t shift = 0;
-  for (;;) {
-    char byte = 0;
-    if (!in.get(byte)) {
-      if (in.eof() && shift == 0) {
-        return VarintReadResult::kEof;
-      }
-      return VarintReadResult::kError;
-    }
-    value |= static_cast<uint32_t>(static_cast<uint8_t>(byte) & 0x7fu) << shift;
-    if ((byte & 0x80u) == 0) {
-      return VarintReadResult::kOk;
-    }
-    shift += 7;
-    if (shift >= 32) {
-      return VarintReadResult::kError;
-    }
-  }
-}
 
 SessionRecordQueue::SessionRecordQueue(size_t capacity) : capacity_(capacity) {}
 
@@ -235,6 +189,11 @@ absl::Status SessionWriter::writeRecordLocked(const nighthawk::client::SessionRe
   index_file_ << "{\"byte_offset\":" << frame_offset << ",\"type\":\"" << type
               << "\",\"monotonic_ns\":" << monotonic_ns << "}\n";
   if (!index_file_.good()) {
+    // Divergence note: the data frame above was already written and offset_
+    // already advanced past it, so a failed index line leaves the sidecar
+    // under-counting relative to the data file (one index line fewer than
+    // data frames). Whoever debugs a diverging pair: the data file is the
+    // authority; the index is advisory for sequential reads.
     return absl::InternalError(
         absl::StrCat("failed writing session index line at offset ", frame_offset));
   }
