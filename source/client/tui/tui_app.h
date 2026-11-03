@@ -99,15 +99,19 @@ public:
   absl::Status finishSession(bool completed);
 
   // The loop-exit teardown, shared by every way the interactive shell's
-  // ScreenInteractive::Loop can return: the q handler runs finishSession
-  // inside the loop (stop + flush + exit, per the runbook), but FTXUI's
-  // Ctrl-C and EOF exits never reach that handler — the shell therefore calls
-  // this unconditionally once the loop is over. It drops the snapshot
-  // notification first (no stale postEvent into a finished screen), then runs
-  // the same flush/close sequence the q path uses. After a q exit this is a
-  // no-op: the session is already closed and finishSession returns OkStatus
-  // on a null writer. So a Ctrl-C mid-run leaves the same parseable,
-  // run-end-stamped session file a q would have.
+  // ScreenInteractive::Loop can return: the q and Ctrl-C handlers run
+  // finishSession inside the loop (stop + flush + exit, per the runbook; the
+  // shell disables FTXUI's Ctrl-C interception so the event reaches the key
+  // map), but an EOF exit never reaches that handler — the shell therefore
+  // calls this unconditionally once the loop is over. It drops the snapshot
+  // notification first (no stale postEvent into a finished screen), then
+  // runs the same flush/close sequence the q path uses. After a q or Ctrl-C
+  // exit this is a no-op: the session is already closed and finishSession
+  // returns OkStatus on a null writer. So a Ctrl-C mid-run leaves the same
+  // parseable, run-end-stamped session file a q would have. (A signal-driven
+  // exit — SIGTERM, or SIGHUP on terminal detach — terminates the process
+  // before this runs; FTXUI re-raises installed signals after PostMain, and
+  // installs no SIGHUP handler at all.)
   absl::Status handleLoopExit();
 
 private:
