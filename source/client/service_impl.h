@@ -55,17 +55,20 @@ public:
                                            nighthawk::client::ExecutionRequest>* stream) override;
 
 private:
-  void handleExecutionRequest(const nighthawk::client::ExecutionRequest& request,
-                              grpc::ServerContext* context);
-  void writeResponse(const nighthawk::client::ExecutionResponse& response);
+  void handleExecutionRequest(
+      const nighthawk::client::ExecutionRequest& request, grpc::ServerContext* context,
+      grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
+                               nighthawk::client::ExecutionRequest>* stream);
+  void writeResponse(
+      const nighthawk::client::ExecutionResponse& response,
+      grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
+                               nighthawk::client::ExecutionRequest>* stream);
   grpc::Status finishGrpcStream(const bool success, absl::string_view description = "");
 
   Envoy::Thread::MutexBasicLockable log_lock_;
   std::unique_ptr<Envoy::Logger::Context> logging_context_;
   std::shared_ptr<Envoy::ProcessWide> process_wide_;
   Envoy::Event::RealTimeSystem time_system_; // NO_CHECK_FORMAT(real_time)
-  grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
-                           nighthawk::client::ExecutionRequest>* stream_;
   std::future<void> future_;
   // accepted_lock_ and accepted_event_ are used to synchronize the threads
   // when starting up a future to service a test, and ensure the code servicing it

@@ -56,6 +56,39 @@ TEST(PerformNighthawkBenchmark, UsesSpecifiedCommandLineOptions) {
   EXPECT_EQ(request.start_request().options().requests_per_second().value(), kExpectedRps);
 }
 
+// FORK-ONLY (We-Amp): PerformNighthawkBenchmark is the shared choke point for
+// every legacy remote-execution consumer, and all of them RELEASE_ASSERT on
+// more than one response. The fork-only live-streaming opt-in (which makes the
+// service emit many snapshot responses) must therefore be stripped from the
+// options no matter how they reached us — e.g. adaptive load's
+// nighthawk_traffic_template carries a full CommandLineOptions.
+TEST(PerformNighthawkBenchmark, StripsLiveStreamingOptIn) {
+  ExecutionRequest request;
+  nighthawk::client::MockNighthawkServiceStub mock_nighthawk_service_stub;
+  EXPECT_CALL(mock_nighthawk_service_stub, ExecutionStreamRaw)
+      .WillOnce([&request](grpc::ClientContext*) {
+        auto* mock_reader_writer =
+            new MockClientReaderWriter<ExecutionRequest, ExecutionResponse>();
+        EXPECT_CALL(*mock_reader_writer, Read(_)).WillOnce(Return(true)).WillOnce(Return(false));
+        EXPECT_CALL(*mock_reader_writer, Write(_, _))
+            .WillOnce(DoAll(SaveArg<0>(&request), Return(true)));
+        EXPECT_CALL(*mock_reader_writer, WritesDone()).WillOnce(Return(true));
+        EXPECT_CALL(*mock_reader_writer, Finish()).WillOnce(Return(grpc::Status::OK));
+        return mock_reader_writer;
+      });
+
+  CommandLineOptions command_line_options;
+  command_line_options.mutable_requests_per_second()->set_value(123);
+  command_line_options.mutable_live_streaming();
+  NighthawkServiceClientImpl client;
+  absl::StatusOr<ExecutionResponse> response_or =
+      client.PerformNighthawkBenchmark(&mock_nighthawk_service_stub, command_line_options);
+  EXPECT_TRUE(response_or.ok());
+  EXPECT_FALSE(request.start_request().options().has_live_streaming());
+  // The rest of the options must survive the strip untouched.
+  EXPECT_EQ(request.start_request().options().requests_per_second().value(), 123);
+}
+
 TEST(PerformNighthawkBenchmark, ReturnsNighthawkResponseSuccessfully) {
   ExecutionResponse expected_response;
   nighthawk::client::MockNighthawkServiceStub mock_nighthawk_service_stub;

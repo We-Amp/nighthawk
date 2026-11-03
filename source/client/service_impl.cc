@@ -18,8 +18,10 @@
 namespace Nighthawk {
 namespace Client {
 
-void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionRequest& request,
-                                         grpc::ServerContext* context) {
+void ServiceImpl::handleExecutionRequest(
+    const nighthawk::client::ExecutionRequest& request, grpc::ServerContext* context,
+    grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
+                             nighthawk::client::ExecutionRequest>* stream) {
   std::unique_ptr<Envoy::Thread::LockGuard> busy_lock;
   {
     // Lock accepted_lock, in case we get here before accepted_event_.wait() is entered.
@@ -37,7 +39,7 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
   } catch (const MalformedArgvException& e) {
     response.mutable_error_detail()->set_code(grpc::StatusCode::INTERNAL);
     response.mutable_error_detail()->set_message(e.what());
-    writeResponse(response);
+    writeResponse(response, stream);
     return;
   }
   envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
@@ -51,7 +53,7 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
     response.mutable_error_detail()->set_code(grpc::StatusCode::INTERNAL);
     response.mutable_error_detail()->set_message(
         fmt::format("Unable to create ProcessImpl: {}", process_or_status.status().ToString()));
-    writeResponse(response);
+    writeResponse(response, stream);
     return;
   }
   ProcessPtr process = std::move(*process_or_status);
@@ -75,7 +77,8 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
                                         flush_duration.nanos() / 1000000)
             : std::chrono::seconds(options->statsFlushInterval());
     live_collector_thread =
-        std::thread([this, process_ptr = process.get(), live_interval, &stop_live_collector]() {
+        std::thread([this, stream, process_ptr = process.get(), live_interval,
+                     &stop_live_collector]() {
           auto next_tick = std::chrono::steady_clock::now() + live_interval;
           while (!stop_live_collector.load(std::memory_order_relaxed)) {
             // Sleep in small slices so a stop request joins this thread promptly.
@@ -91,7 +94,7 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
               // mutex; a failed write means the stream is gone (e.g. the
               // client cancelled the RPC), so stop producing snapshots.
               absl::MutexLock lock(&stream_write_mutex_);
-              if (!stream_->Write(snapshot_response)) {
+              if (!stream->Write(snapshot_response)) {
                 return;
               }
             }
@@ -179,16 +182,22 @@ void ServiceImpl::handleExecutionRequest(const nighthawk::client::ExecutionReque
   // coming in before we release the lock, which would lead up to us declining service when
   // we should not.
   busy_lock.reset();
-  writeResponse(response);
+  writeResponse(response, stream);
 }
 
-void ServiceImpl::writeResponse(const nighthawk::client::ExecutionResponse& response) {
+void ServiceImpl::writeResponse(
+    const nighthawk::client::ExecutionResponse& response,
+    grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
+                             nighthawk::client::ExecutionRequest>* stream) {
   ENVOY_LOG(debug, "Write response: {}", absl::StrCat(response));
   // Every stream write takes stream_write_mutex_: with live snapshot streaming
   // opted in, the collector thread writes snapshot responses concurrently with
   // this run thread, and gRPC stream writes are not safe for concurrent use.
+  // The stream is the one this run was started on, passed down from
+  // ExecutionStream: a member would let a second concurrent stream repoint it
+  // and deliver this run's responses to another client.
   absl::MutexLock lock(&stream_write_mutex_);
-  if (!stream_->Write(response)) {
+  if (!stream->Write(response)) {
     ENVOY_LOG(warn, "Failed to write response to the stream");
   }
 }
@@ -199,7 +208,6 @@ grpc::Status ServiceImpl::finishGrpcStream(const bool success, absl::string_view
   if (future_.valid()) {
     future_.wait();
   }
-  stream_ = nullptr;
   return success ? grpc::Status::OK
                  : grpc::Status(grpc::StatusCode::INTERNAL, std::string(description));
 }
@@ -213,7 +221,6 @@ grpc::Status ServiceImpl::ExecutionStream(
     grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
                              nighthawk::client::ExecutionRequest>* stream) {
   nighthawk::client::ExecutionRequest request;
-  stream_ = stream;
 
   while (stream->Read(&request)) {
     ENVOY_LOG(debug, "Read ExecutionRequest data {}", absl::StrCat(request));
@@ -225,7 +232,8 @@ grpc::Status ServiceImpl::ExecutionStream(
         // We pass in std::launch::async to avoid lazy evaluation, as we want this to run
         // asap. See: https://en.cppreference.com/w/cpp/thread/async
         future_ = std::future<void>(std::async(
-            std::launch::async, &ServiceImpl::handleExecutionRequest, this, request, context));
+            std::launch::async, &ServiceImpl::handleExecutionRequest, this, request, context,
+            stream));
         // Block until the thread associated to the future has acquired busy_lock_
         accepted_event_.wait(accepted_lock_);
       } else {
