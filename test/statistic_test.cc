@@ -411,6 +411,22 @@ TEST(StatisticTest, RawPercentileValueAt) {
   EXPECT_EQ(99, statistic.rawPercentileValueAt(99.0));
   EXPECT_EQ(0, statistic.rawPercentileValueAt(0.0));
 
+  // Circllhist answers through hist_approx_quantile(), which takes quantiles
+  // in [0, 1] while this interface takes percentiles in [0, 100]. Monotone
+  // values around a known median: the answer must sit within circllhist's
+  // base-10 bucket quantization of the true median, and percentile ordering
+  // must hold. A /100 scaling bug would clamp the quantile to the lowest
+  // bucket, making both answers 0 (or near-equal) and failing both checks.
+  CircllhistStatistic circllhist_statistic;
+  for (uint64_t i = 0; i < 101; i++) {
+    circllhist_statistic.addValue(i);
+  }
+  const uint64_t circllhist_p10 = circllhist_statistic.rawPercentileValueAt(10.0);
+  const uint64_t circllhist_p50 = circllhist_statistic.rawPercentileValueAt(50.0);
+  EXPECT_GE(circllhist_p50, 40);
+  EXPECT_LE(circllhist_p50, 60);
+  EXPECT_GT(circllhist_p50, circllhist_p10);
+
   // Implementations that cannot answer percentile queries return 0.
   StreamingStatistic streaming_statistic;
   EXPECT_EQ(0, streaming_statistic.rawPercentileValueAt(50.0));

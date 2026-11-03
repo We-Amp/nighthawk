@@ -1,5 +1,6 @@
 #include <grpc++/grpc++.h>
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <thread>
@@ -361,23 +362,39 @@ TEST_P(ServiceTest, CancelViaContext) {
   EXPECT_FALSE(r->Read(&response_));
   r->Finish();
 
-  // Give the service a bounded grace period to wind the cancelled run down
-  // (run cancellation polling plus run teardown).
-  std::this_thread::sleep_for(2s);
+  // The cancelled run winds down asynchronously (run cancellation polling plus
+  // run teardown), so poll for readiness instead of assuming a fixed grace
+  // period is always enough: retry the follow-up run every 500ms, up to 10s,
+  // and assert only once a follow-up is accepted or the budget expires. The
+  // service signals it is still busy by declining the run, which the client
+  // observes as Read() returning false.
+  std::unique_ptr<grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>> followup;
+  // grpc::ClientContext is neither copyable nor assignable, and each RPC needs
+  // its own, so the retry loop creates a fresh one per attempt.
+  std::unique_ptr<grpc::ClientContext> followup_context;
+  const auto readiness_deadline = std::chrono::steady_clock::now() + 10s;
+  bool followup_accepted = false;
+  while (!followup_accepted) {
+    ASSERT_LT(std::chrono::steady_clock::now(), readiness_deadline)
+        << "service did not accept a follow-up run within the readiness budget";
+    setupGrpcClient();
+    followup_context = std::make_unique<grpc::ClientContext>();
+    request_ = nighthawk::client::ExecutionRequest();
+    auto followup_options = request_.mutable_start_request()->mutable_options();
+    followup_options->mutable_uri()->set_value(listener.uri());
+    followup_options->mutable_duration()->set_seconds(2);
+    followup_options->mutable_requests_per_second()->set_value(10);
+    followup = stub_->ExecutionStream(followup_context.get());
+    followup_accepted =
+        followup->Write(request_, {}) && followup->WritesDone() && followup->Read(&response_);
+    if (!followup_accepted) {
+      followup->Finish();
+      std::this_thread::sleep_for(500ms);
+    }
+  }
 
   // A follow-up run must be served normally: status OK, output present, and
   // 2xx counters accumulated against the live listener.
-  setupGrpcClient();
-  grpc::ClientContext followup_context;
-  request_ = nighthawk::client::ExecutionRequest();
-  auto followup_options = request_.mutable_start_request()->mutable_options();
-  followup_options->mutable_uri()->set_value(listener.uri());
-  followup_options->mutable_duration()->set_seconds(2);
-  followup_options->mutable_requests_per_second()->set_value(10);
-  auto followup = stub_->ExecutionStream(&followup_context);
-  EXPECT_TRUE(followup->Write(request_, {}));
-  EXPECT_TRUE(followup->WritesDone());
-  EXPECT_TRUE(followup->Read(&response_));
   EXPECT_FALSE(response_.has_error_detail());
   EXPECT_TRUE(response_.has_output());
   uint64_t http_2xx = 0;
@@ -403,11 +420,14 @@ namespace {
 
 // Collected outcome of one benchmark request on a live-streaming (or legacy)
 // stream: every snapshot received, whether the run's final response arrived,
-// and whether any message arrived after the final response (which must never
-// happen: snapshots stop at run end).
+// the final response's output (kept so later assertions can bind to the run's
+// true final totals rather than to its last snapshot), and whether any message
+// arrived after the final response (which must never happen: snapshots stop at
+// run end).
 struct LiveStreamResult {
   std::vector<nighthawk::client::LiveSnapshot> snapshots;
   bool got_final_response{false};
+  nighthawk::client::Output final_output;
   bool message_after_final{false};
 };
 
@@ -453,6 +473,7 @@ readRunFromStream(grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>&
       result.snapshots.push_back(response.live_snapshot());
     } else if (response.has_output()) {
       result.got_final_response = true;
+      result.final_output = response.output();
       break;
     }
   }
@@ -460,13 +481,15 @@ readRunFromStream(grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>&
 }
 
 ExecutionRequest makeLiveRequest(const std::string& uri, uint32_t duration_seconds, uint32_t rps,
-                                 uint32_t flush_interval_seconds, bool live_streaming) {
+                                 uint32_t flush_interval_seconds, bool live_streaming,
+                                 uint32_t concurrency = 1) {
   ExecutionRequest request;
   auto* options = request.mutable_start_request()->mutable_options();
   options->mutable_uri()->set_value(uri);
   options->mutable_duration()->set_seconds(duration_seconds);
   options->mutable_requests_per_second()->set_value(rps);
   options->mutable_stats_flush_interval()->set_value(flush_interval_seconds);
+  options->mutable_concurrency()->set_value(fmt::format("{}", concurrency));
   if (live_streaming) {
     options->mutable_live_streaming();
   }
@@ -550,25 +573,31 @@ TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
 
   // The second run must produce fresh snapshots of its own, not a carry-over
   // of the first run's state. Its first snapshot (taken ~1s into the run) must
-  // not hold more 2xx responses than the last snapshot of run 1 showed: leaked
-  // counters would start run 2 at run 1's accumulated total and push every
-  // snapshot strictly above it. (Equality is legitimate: both snapshots can
-  // land at similar progress at 10 rps.) A stray snapshot left over from run 1
-  // would also surface as run 2's first snapshot here.
-  if (!first.snapshots.empty() && !second.snapshots.empty()) {
+  // hold strictly fewer 2xx responses than run 1's FINAL output total: leaked
+  // counters would start run 2 at run 1's accumulated total plus new responses,
+  // pushing every run-2 snapshot at or above that total. The binding is to the
+  // final output rather than run 1's last snapshot, because run 1's final tick
+  // can legitimately be lost to the collector's stop-check race (the last
+  // snapshot may then undershoot the true run-1 total, and comparing run 2
+  // against it could spuriously fail). A lost tick cannot push run 2 above the
+  // final total, so a strict comparison below it stays sound. A stray snapshot
+  // left over from run 1 would also surface as run 2's first snapshot here.
+  if (!second.snapshots.empty()) {
+    ASSERT_TRUE(first.got_final_response);
+    ASSERT_GT(first.final_output.results_size(), 0);
     uint64_t first_run_total_http_2xx = 0;
-    uint64_t second_run_first_http_2xx = 0;
-    for (const auto& [name, value] : first.snapshots.back().counters()) {
-      if (name == "benchmark.http_2xx") {
-        first_run_total_http_2xx = value;
+    for (const auto& counter : first.final_output.results(0).counters()) {
+      if (counter.name() == "benchmark.http_2xx") {
+        first_run_total_http_2xx = counter.value();
       }
     }
+    uint64_t second_run_first_http_2xx = 0;
     for (const auto& [name, value] : second.snapshots.front().counters()) {
       if (name == "benchmark.http_2xx") {
         second_run_first_http_2xx = value;
       }
     }
-    EXPECT_LE(second_run_first_http_2xx, first_run_total_http_2xx);
+    EXPECT_LT(second_run_first_http_2xx, first_run_total_http_2xx);
   }
 
   // Nothing may follow run 2's final response: snapshots stop at run end.
@@ -577,6 +606,139 @@ TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
   EXPECT_FALSE(stream->Read(&extra));
   auto status = stream->Finish();
   EXPECT_TRUE(status.ok());
+}
+
+// Two clients may hold open ExecutionStream RPCs at the same time (only one run
+// may be in flight, but a stream can idle while another run executes). Every
+// response a run produces must go to the stream the run was started on: the
+// run's snapshots and its final response may never be delivered to a different
+// client's stream that happens to be open. This test opens a second stream
+// mid-run-1 — precisely the window in which a shared stream pointer would get
+// repointed — and then drives a second run over it, reading both streams to
+// completion.
+TEST_P(ServiceTest, TwoConcurrentStreamsStayIsolated) {
+  TestHttpListener listener;
+
+  // Run 1: long enough to comfortably overlap the second stream being opened.
+  ExecutionRequest first_request = makeLiveRequest(listener.uri(), 10, 10, 1, true);
+  grpc::ClientContext first_context;
+  // A client-side deadline so a regression that strands run 1's responses on
+  // another stream makes this test fail instead of hanging forever.
+  first_context.set_deadline(std::chrono::system_clock::now() + 60s);
+  auto first_stream = stub_->ExecutionStream(&first_context);
+  ASSERT_NE(first_stream, nullptr);
+  EXPECT_TRUE(first_stream->Write(first_request, {}));
+  EXPECT_TRUE(first_stream->WritesDone());
+
+  // Mid-run, a second client opens a stream (it sends nothing yet: merely
+  // opening it must not affect where run 1's responses are delivered).
+  std::this_thread::sleep_for(2s);
+  grpc::ClientContext second_context;
+  auto second_stream = stub_->ExecutionStream(&second_context);
+  ASSERT_NE(second_stream, nullptr);
+
+  // Read run 1 to completion on stream 1.
+  LiveStreamResult first;
+  ExecutionResponse response;
+  while (first_stream->Read(&response)) {
+    if (response.has_live_snapshot()) {
+      first.snapshots.push_back(response.live_snapshot());
+    } else if (response.has_output()) {
+      first.got_final_response = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(first.got_final_response);
+  ASSERT_GE(first.snapshots.size(), 2);
+  int64_t first_run_max_monotonic_ns = -1;
+  for (const auto& snapshot : first.snapshots) {
+    first_run_max_monotonic_ns = std::max(first_run_max_monotonic_ns, snapshot.monotonic_ns());
+  }
+
+  // Run 1 is over (its final response was read), so run 2 can start on stream 2.
+  ExecutionRequest second_request = makeLiveRequest(listener.uri(), 2, 10, 1, true);
+  EXPECT_TRUE(second_stream->Write(second_request, {}));
+  EXPECT_TRUE(second_stream->WritesDone());
+  LiveStreamResult second;
+  bool run1_snapshot_on_stream2 = false;
+  while (second_stream->Read(&response)) {
+    if (second.got_final_response) {
+      second.message_after_final = true;
+      break;
+    }
+    if (response.has_live_snapshot()) {
+      // Every snapshot on stream 2 must be from run 2: run 1's snapshots were
+      // all emitted before run 1 ended, so any of them arriving here would
+      // carry a monotonic_ns at or below run 1's last stream-1 snapshot.
+      if (response.live_snapshot().monotonic_ns() <= first_run_max_monotonic_ns) {
+        run1_snapshot_on_stream2 = true;
+      }
+      second.snapshots.push_back(response.live_snapshot());
+    } else if (response.has_output()) {
+      second.got_final_response = true;
+    }
+  }
+  auto second_status = second_stream->Finish();
+  EXPECT_TRUE(second_status.ok());
+  EXPECT_FALSE(run1_snapshot_on_stream2);
+  EXPECT_TRUE(second.got_final_response);
+  EXPECT_FALSE(second.message_after_final);
+  ASSERT_GE(second.snapshots.size(), 1);
+  EXPECT_GT(second.snapshots.front().monotonic_ns(), first_run_max_monotonic_ns);
+
+  // Stream 1 must carry nothing more after run 1's final response: read it to
+  // completion and check it closes cleanly.
+  EXPECT_FALSE(first_stream->Read(&response));
+  auto first_status = first_stream->Finish();
+  EXPECT_TRUE(first_status.ok());
+}
+
+// The live snapshot merge runs per worker: counters are summed over the
+// workers, and per-statistic counts are summed with percentile values taking
+// the per-worker maximum. Every other live-streaming test runs at concurrency
+// 1, so this test drives a two-worker run and asserts the merged picture:
+// the merged statistic counts must exceed what any single worker could have
+// contributed at steady state, while counters keep growing and monotonic_ns
+// keeps increasing.
+TEST_P(ServiceTest, TwoWorkersMergeIntoLiveSnapshots) {
+  TestHttpListener listener;
+  const uint32_t kConcurrency = 2;
+  const uint32_t kDurationSeconds = 10;
+  const uint32_t kRps = 10;
+  ExecutionRequest request =
+      makeLiveRequest(listener.uri(), kDurationSeconds, kRps, 1, true, kConcurrency);
+  LiveStreamResult result = readLiveStream(stub_.get(), request);
+  EXPECT_TRUE(result.got_final_response);
+  EXPECT_FALSE(result.message_after_final);
+  ASSERT_GE(result.snapshots.size(), 2);
+
+  // Merged counts: a single worker can contribute at most half of the run's
+  // responses. At the final snapshot, the accumulated statistic count must
+  // therefore exceed the rps-driven half-duration bound that bounds any
+  // single worker's plausible contribution (each worker drives ~rps/2).
+  uint64_t max_merged_statistic_count = 0;
+  for (const nighthawk::client::StatisticSnapshot& statistic : result.snapshots.back().statistics()) {
+    max_merged_statistic_count = std::max(max_merged_statistic_count, statistic.count());
+  }
+  EXPECT_GT(max_merged_statistic_count, static_cast<uint64_t>(kRps * kDurationSeconds / 2))
+      << "merged statistic count does not exceed the single-worker bound; the multi-worker "
+         "merge did not sum per-worker counts";
+
+  int64_t last_monotonic_ns = -1;
+  std::map<std::string, uint64_t> last_counters;
+  for (const nighthawk::client::LiveSnapshot& snapshot : result.snapshots) {
+    EXPECT_GT(snapshot.monotonic_ns(), last_monotonic_ns);
+    last_monotonic_ns = snapshot.monotonic_ns();
+    for (const auto& [name, value] : snapshot.counters()) {
+      if (absl::StartsWith(name, "benchmark.")) {
+        auto it = last_counters.find(name);
+        if (it != last_counters.end()) {
+          EXPECT_GE(value, it->second) << "counter " << name << " went backwards";
+        }
+        last_counters[name] = value;
+      }
+    }
+  }
 }
 
 } // namespace
