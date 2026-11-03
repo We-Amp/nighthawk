@@ -43,6 +43,11 @@ struct RunViewModel {
   // "idle" | "running" | "completed" | "stopped". Owned by the feed's
   // lifecycle events, not by ApplySnapshot (a snapshot never changes state).
   std::string run_state;
+  // The accepted StartRequest's target uri, set by the controller the moment
+  // a run is launched (before the first snapshot). Once run_state leaves
+  // "idle" the status bar renders this — never "(no target)" — with
+  // "(target pending)" reserved for the sub-second pre-ack window.
+  std::string target_uri;
   // The primary latency series (the snapshot's first statistic WITH samples;
   // the aggregator's statistics order is unspecified, so the sampled
   // statistic is found by scanning, not assumed at index 0), capped at
@@ -52,7 +57,23 @@ struct RunViewModel {
   absl::flat_hash_map<std::string, std::vector<CounterPoint>> counters;
   // The most recent raw snapshot, for whatever the text panes want to show.
   nighthawk::client::LiveSnapshot last_snapshot;
+  // One-frame markers recomputed by every ApplySnapshot (true only on the
+  // frame whose snapshot changed the scale), so the chart renderer can print
+  // a one-frame "(rescaled)" marker when the latency window max grows.
+  bool latency_rescaled = false;
+  // Spike salience: while > 0, the chart renders the "!" excursion glyph and
+  // the "^Nx" numeric tail. Set to kSpikeFrames when the newest p99 exceeds
+  // kSpikeRatio over its recent floor; decremented otherwise.
+  int spike_frames_remaining = 0;
+  double spike_ratio = 0.0;
 };
+
+// How many consecutive flushes a detected spike stays annotated.
+inline constexpr int kSpikeFrames = 3;
+// The spike threshold: latest p99 over its recent floor (the minimum p99 of
+// the last kSpikeFloorWindow points).
+inline constexpr double kSpikeRatio = 2.0;
+inline constexpr size_t kSpikeFloorWindow = 20;
 
 // Pure reducer: folds one LiveSnapshot into the model, returning the updated
 // model (pass-by-value + move keeps the copy-on-write shape obvious at call
@@ -62,7 +83,9 @@ struct RunViewModel {
 // entirely and leave a gap; the aggregator's statistics order is unspecified,
 // so the sampled statistic is found by scanning, not assumed at index 0 —
 // and every counter to its series, both capped at kRunViewModelMaxPoints by
-// dropping the oldest points. Sets last_snapshot; never touches run_state.
+// dropping the oldest points. Sets last_snapshot; never touches run_state or
+// target_uri. Recomputes the one-frame chart markers (latency_rescaled,
+// spike_frames_remaining/spike_ratio) from the pre-append band.
 RunViewModel ApplySnapshot(RunViewModel model, const nighthawk::client::LiveSnapshot& snapshot);
 
 // Mutex-guarded immutable swap. Feed side stores fully-formed models; render

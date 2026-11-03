@@ -34,6 +34,19 @@ nighthawk::client::StartRequest StartRunDialogModel::build_request() const {
   return request;
 }
 
+std::string StartRunDialogModel::FieldError(const StartRunDialogModel& dialog, int field) {
+  switch (field) {
+  case kUri:
+    return dialog.uri_.empty() ? "uri: must not be empty" : "";
+  case kRps:
+    return dialog.rps_ >= 1 ? "" : "rps: must be > 0";
+  case kDuration:
+    return dialog.duration_seconds_ >= 1 ? "" : "duration (s): must be > 0";
+  default:
+    return "";
+  }
+}
+
 } // namespace Tui
 } // namespace Client
 } // namespace Nighthawk

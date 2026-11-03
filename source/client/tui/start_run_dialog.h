@@ -34,6 +34,15 @@ public:
   // builder still cannot silently lose live streaming.
   nighthawk::client::StartRequest build_request() const;
 
+  // The dialog's three fields, in render order (the dialog overlay's field
+  // rows and the shell's active-field tracking share this numbering).
+  enum DialogField { kUri = 0, kRps = 1, kDuration = 2 };
+
+  // The inline error text for one field ("rps: must be > 0"), or "" when the
+  // field is fine. Pure; the dialog overlay renders these on the offending
+  // field's own row after a rejected submit.
+  static std::string FieldError(const StartRunDialogModel& dialog, int field);
+
 private:
   std::string uri_;
   uint32_t rps_ = 0;

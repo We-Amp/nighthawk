@@ -21,16 +21,25 @@ namespace Tui {
 inline constexpr int kStatusBarFlushIntervalSeconds = 1;
 
 // Rows (top to bottom):
-//   0: run state | elapsed | target uri (the start-run dialog's field; empty
-//      renders "(no target)")
+//   0: "[editing] " prefix while a dialog owns the keyboard, run state,
+//      elapsed ("39s/60s | remaining Ns" against the run's duration,
+//      "elapsed Ns (open-ended)" when unset), and the target uri. Target
+//      invariant: once run_state leaves "idle" the row carries the accepted
+//      target — model.target_uri, then the dialog draft, then "(target
+//      pending)" for the sub-second pre-ack window; "(no target)" is
+//      reserved for idle.
 //   1: phase + "pre-phase-engine placeholder" marker, epoch + "[placeholder]"
 //      marker (empty renders "(none)"), flush cadence
-//   2: session path + input mode
+//   2: session path + input mode; the mode cell renders inverse-video while
+//      an input mode owns the keyboard, so the routing state also survives a
+//      monochrome paste next to row 0's "[editing] " prefix.
 //
-// `uri` is passed in by the layout (the dialog is the only pre-M3 source of a
-// target uri; the RunViewModel carries none). Pure function, no terminal I/O.
+// `uri` is the dialog draft (the only pre-M3 source of a target uri);
+// `duration_seconds` is the run's configured duration (0 = unset). Pure
+// function, no terminal I/O.
 ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
-                               absl::string_view session_path, absl::string_view uri = "");
+                               absl::string_view session_path, absl::string_view uri = "",
+                               int duration_seconds = 0);
 
 } // namespace Tui
 } // namespace Client

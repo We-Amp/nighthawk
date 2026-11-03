@@ -1,5 +1,7 @@
 #include "source/client/tui/run_view_model.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <utility>
 
 namespace Nighthawk {
@@ -35,6 +37,35 @@ RunViewModel ApplySnapshot(RunViewModel model, const nighthawk::client::LiveSnap
     }
   }
   if (sampled != nullptr) {
+    // One-frame chart markers, computed against the pre-append band: a p99
+    // above everything already stored rescales any window that contains it
+    // (the "(rescaled)" marker's trigger), and a p99 far above its recent
+    // floor opens the spike annotation window (kSpikeFrames flushes).
+    model.latency_rescaled = false;
+    if (!model.latency_band.empty()) {
+      uint64_t prev_max = 0;
+      uint64_t floor_min = UINT64_MAX;
+      const size_t start = model.latency_band.size() > kSpikeFloorWindow
+                               ? model.latency_band.size() - kSpikeFloorWindow
+                               : 0;
+      for (size_t i = start; i < model.latency_band.size(); ++i) {
+        prev_max = std::max(prev_max, model.latency_band[i].p99_ns);
+        floor_min = std::min(floor_min, model.latency_band[i].p99_ns);
+      }
+      if (sampled->p99_ns() > prev_max) {
+        model.latency_rescaled = true;
+      }
+      if (model.latency_band.size() >= 3 && floor_min > 0) {
+        const double ratio = static_cast<double>(sampled->p99_ns()) /
+                             static_cast<double>(floor_min);
+        if (ratio >= kSpikeRatio) {
+          model.spike_frames_remaining = kSpikeFrames;
+          model.spike_ratio = ratio;
+        } else if (model.spike_frames_remaining > 0) {
+          --model.spike_frames_remaining;
+        }
+      }
+    }
     appendCapped(model.latency_band, PercentilePoint{monotonic_ns, sampled->p50_ns(),
                                                      sampled->p90_ns(), sampled->p99_ns()});
   }

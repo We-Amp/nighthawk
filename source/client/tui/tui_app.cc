@@ -75,6 +75,10 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     final_output_ = nighthawk::client::Output{};
     knob_options_ = request.options();
     model_ = RunViewModel{};
+    // The target-slot invariant's source: the accepted request's uri lands in
+    // the model before the run launches, so row 0 never reads "(no target)"
+    // once the state leaves idle.
+    model_.target_uri = request.options().uri().value();
   }
   store_.store(model_);
 
@@ -257,6 +261,11 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   std::string uri_field;
   std::string rps_field;
   std::string duration_field;
+  // The `?` help overlay (navigate mode) and the rejected-submit flag that
+  // keeps the dialog open with its inline errors visible. Both are shell
+  // state the pure layout receives each frame via OverlayState.
+  bool help_open = false;
+  bool show_errors = false;
 
   Component uri_input = Input(&uri_field, "target uri");
   Component rps_input = Input(&rps_field, "requests per second");
@@ -280,19 +289,23 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     static const RunViewModel kIdleModel;
     std::shared_ptr<const RunViewModel> model = controller.model();
     const RunViewModel& view_model = model == nullptr ? kIdleModel : *model;
-    if (mode == InputMode::kEditingStartRun) {
-      // The dialog editor replaces the tab pane; the status bar stays.
-      return ftxui::vbox({
-          RenderStatusBar(view_model, mode, controller.sessionPath(), dialog.uri()),
-          ftxui::separator(),
-          ftxui::text("start a run - enter: start, esc: cancel"),
-          ftxui::hbox({ftxui::text("uri: "), uri_input->Render()}),
-          ftxui::hbox({ftxui::text("rps: "), rps_input->Render()}),
-          ftxui::hbox({ftxui::text("duration (s): "), duration_input->Render()}),
-      });
-    }
+    // The overlay state the pure layout renders from: draft fields, the
+    // active field (the vertical container's focus), the rejected-submit
+    // flag, and the help toggle.
+    OverlayState overlay;
+    overlay.uri_field = uri_field;
+    overlay.rps_field = rps_field;
+    overlay.duration_field = duration_field;
+    overlay.active_field = uri_input->Focused() ? StartRunDialogModel::kUri
+                          : rps_input->Focused() ? StartRunDialogModel::kRps
+                                                 : StartRunDialogModel::kDuration;
+    overlay.show_errors = show_errors;
+    overlay.help_open = help_open;
+    overlay.uri_input = uri_input;
+    overlay.rps_input = rps_input;
+    overlay.duration_input = duration_input;
     return RenderLayout(screen.dimx(), screen.dimy(), active_tab, mode, view_model, dialog,
-                        controller.sessionPath(), controller.knobOptions());
+                        controller.sessionPath(), controller.knobOptions(), &overlay);
   });
 
   Component app = CatchEvent(view, [&](Event event) {
@@ -301,6 +314,7 @@ int runInteractive(const std::string& address, const std::string& session_prefix
         uri_field.clear();
         rps_field.clear();
         duration_field.clear();
+        show_errors = false;
         mode = InputMode::kNavigate;
         mode_mirror.store(mode, std::memory_order_relaxed);
         // Exactly one forced redraw so the panes catch up on the state edited
@@ -321,12 +335,17 @@ int runInteractive(const std::string& address, const std::string& session_prefix
           uri_field.clear();
           rps_field.clear();
           duration_field.clear();
+          show_errors = false;
           mode = InputMode::kNavigate;
           mode_mirror.store(mode, std::memory_order_relaxed);
           // Exactly one forced redraw on the dialog close (input_mode.h).
           screen.PostEvent(Event::Custom);
+        } else {
+          // A failed enter is never silent and never closes the box: the
+          // inline errors render on the offending field rows until the form
+          // validates or esc cancels.
+          show_errors = true;
         }
-        // An invalid field or a declined start stays in editing mode.
         return true;
       }
       return false; // let the text inputs handle the character
@@ -341,10 +360,21 @@ int runInteractive(const std::string& address, const std::string& session_prefix
       active_tab = 1;
       return true;
     }
+    if (event == Event::Character('?')) {
+      help_open = !help_open;
+      return true;
+    }
+    if (help_open && event == Event::Escape) {
+      // Only escape's navigate-mode job is closing the help overlay; it is
+      // listed in the overlay's own footer line.
+      help_open = false;
+      return true;
+    }
     if (event == Event::Character('n')) {
       uri_field.clear();
       rps_field.clear();
       duration_field.clear();
+      show_errors = false;
       mode = InputMode::kEditingStartRun;
       mode_mirror.store(mode, std::memory_order_relaxed);
       return true;
