@@ -655,7 +655,7 @@ TEST_P(ServiceTest, CancellationRequestNotStalledBehindAckWait) {
   // applier was still blocked the whole time: the cancellation was dispatched
   // while the ack wait was in flight.
   const auto elapsed = std::chrono::steady_clock::now() - cancel_time;
-  EXPECT_LT(elapsed, 15s);
+  EXPECT_LT(elapsed, 2s);
   ASSERT_NE(applier_ptr, nullptr);
   EXPECT_FALSE(applier_ptr->Released());
   // The final output is the last response ever. Half-close before the final
@@ -663,6 +663,42 @@ TEST_P(ServiceTest, CancellationRequestNotStalledBehindAckWait) {
   EXPECT_TRUE(r->WritesDone());
   EXPECT_FALSE(r->Read(&response_));
   EXPECT_TRUE(r->Finish().ok());
+}
+
+// A run that unwinds through an exception must leave the in-flight registry
+// consistent: an update arm dispatched while the run thread unwinds (busy
+// lock still held) is rejected honestly — no ack, no hang, no dangling
+// orchestrator dereference — instead of tearing the stream down with a
+// success-looking status.
+TEST_P(ServiceTest, ArmDispatchAfterRunFailureIsHonestRejection) {
+  TestHttpListener listener;
+  service_->SetRunFailureInjectionForTest(
+      []() { throw NighthawkException("injected run failure"); });
+  auto r = startLiveRun(listener, 60, 10);
+  // The injected failure fires right before run(); give the unwind (watchdog
+  // join, registry guard, orchestrator teardown) time to complete, then
+  // dispatch: the arm must be rejected honestly — no ack, stream torn down
+  // with a clear failure status. (An arm dispatched DURING the unwind would
+  // either land on the aborted-dispatch rejection or, while the run was still
+  // alive, on the ordinary rejection ack — both honest; this test pins the
+  // settled post-failure state.)
+  std::this_thread::sleep_for(300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()
+      ->mutable_requests_per_second()
+      ->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  // The arm never acks: the run is gone. The stream is torn down with an
+  // honest failure status (either "run failed ..." while the unwind is still
+  // in flight, or "no benchmark run is in flight" once the busy lock is
+  // released) — never an ack, and never a hang.
+  EXPECT_FALSE(r->Read(&response_));
+  EXPECT_FALSE(response_.has_update_result());
+  auto status = r->Finish();
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.error_message(),
+              AnyOf(HasSubstr("benchmark run failed"),
+                    HasSubstr("No benchmark run is in flight")));
 }
 
 // M4 (Review Focus 6): a pending update whose run ends resolves WITHOUT any
@@ -699,8 +735,9 @@ TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterRunEnd) {
   }
   EXPECT_TRUE(saw_output);
   // The 2s run's final output arrived while the applier was still blocked:
-  // the pending ack wait never delayed the final output.
-  EXPECT_LT(std::chrono::steady_clock::now() - start_time, 6s);
+  // the pending ack wait never delayed the final output (2s run + ~2s
+  // winddown slack; the deadline-delayed case lands at ~5.3s and fails this).
+  EXPECT_LT(std::chrono::steady_clock::now() - start_time, 4s);
   EXPECT_FALSE(applier_ptr->Released());
   // Resolve the pending update (it would report applied=true); it must not
   // produce any write after the final output.

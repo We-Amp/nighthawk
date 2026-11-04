@@ -10,6 +10,7 @@
 #include "source/common/request_source_impl.h"
 
 #include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 
 #include <atomic>
 #include <chrono>
@@ -65,6 +66,21 @@ void ServiceImpl::handleExecutionRequest(
     return;
   }
   ProcessPtr process = std::move(*process_or_status);
+  // FORK-ONLY (We-Amp): ensures shutdown() runs on every exit path. The
+  // normal path calls it explicitly below (after the collector and watchdog
+  // joins) and marks this guard done; on an exception unwind the guard fires
+  // before the ProcessPtr destructor, whose ~ProcessImpl RELEASE_ASSERTs that
+  // shutdown was called. Declared immediately after the ProcessPtr, so it
+  // unwinds just before it (and after the orchestrator's own teardown).
+  struct ShutdownOnExit {
+    ~ShutdownOnExit() {
+      if (!done && *process != nullptr) {
+        (*process)->shutdown();
+      }
+    }
+    ProcessPtr* process;
+    bool done = false;
+  } shutdown_on_exit{&process};
 
   // FORK-ONLY (We-Amp): live steering (M3). One update orchestrator per run,
   // owned by this scope; the reader thread reaches it through the in-flight
@@ -97,6 +113,27 @@ void ServiceImpl::handleExecutionRequest(
     absl::MutexLock lock(&in_flight_mutex_);
     in_flight_orchestrator_ = &orchestrator;
   }
+  // FORK-ONLY (We-Amp): RAII unregister guard (mirrors CollectorJoin /
+  // WatchdogJoin). The normal path unregisters explicitly below, before
+  // process shutdown, and marks this guard done; if the run unwinds through
+  // an exception instead, this guard fires while busy_lock_ is still held —
+  // clearing the registry entry (so no dispatched arm can dereference the
+  // orchestrator that is about to be destroyed) and flagging the dispatch
+  // path to reject arms immediately and honestly.
+  struct InFlightUnregister {
+    ~InFlightUnregister() {
+      if (done) {
+        return;
+      }
+      absl::MutexLock lock(&mutex);
+      *orchestrator_slot = nullptr;
+      *aborted = true;
+    }
+    absl::Mutex& mutex;
+    LiveUpdateOrchestrator** orchestrator_slot;
+    bool* aborted;
+    bool done = false;
+  } in_flight_unregister{in_flight_mutex_, &in_flight_orchestrator_, &run_dispatch_aborted_};
 
   // FORK-ONLY (We-Amp): stream-at-boundary phase events (M2 Task 7 wiring,
   // DQ-3 ruling: boundary events are METADATA, never synthetic metric
@@ -230,6 +267,11 @@ void ServiceImpl::handleExecutionRequest(
   };
   const bool ok = [&]() {
     WatchdogJoin watchdog_join{&stop_watchdog, &watchdog_thread};
+    // FORK-ONLY (We-Amp): test seam — throws exercise the run-exception
+    // unwind path (registry guard, honest arm rejection).
+    if (run_failure_injection_) {
+      run_failure_injection_();
+    }
     return process->run(output_collector);
   }();
   // Stop and join the collector before we fill and write the final response
@@ -271,11 +313,14 @@ void ServiceImpl::handleExecutionRequest(
   {
     // Unregister before shutdown: the reader thread dispatches arms while
     // holding in_flight_mutex_, so no arm can be in flight against this
-    // process past this point.
+    // process past this point. Marks the RAII guard done (it would otherwise
+    // fire again at scope exit, after shutdown).
     absl::MutexLock lock(&in_flight_mutex_);
     in_flight_orchestrator_ = nullptr;
+    in_flight_unregister.done = true;
   }
   process->shutdown();
+  shutdown_on_exit.done = true;
   // We release before writing the response to avoid a race with the client's follow up request
   // coming in before we release the lock, which would lead up to us declining service when
   // we should not.
@@ -330,21 +375,20 @@ grpc::Status ServiceImpl::dispatchUpdateOrCancellation(
   }
   // The run thread registers the orchestrator shortly after acquiring
   // busy_lock_ (process construction happens between the two); wait a
-  // bounded moment for the registration instead of failing the arm.
+  // bounded moment for the registration instead of failing the arm. If the
+  // run aborted instead (exception unwind), reject immediately and honestly.
   // in_flight_mutex_ is held across the whole dispatch below: the run
   // thread's unregister-before-shutdown takes the same mutex, so a dispatched
   // arm can never race process shutdown.
   in_flight_mutex_.Lock();
-  const auto registration_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (in_flight_orchestrator_ == nullptr &&
-         std::chrono::steady_clock::now() < registration_deadline) {
-    in_flight_mutex_.Unlock();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    in_flight_mutex_.Lock();
-  }
+  in_flight_mutex_.AwaitWithDeadline(absl::Condition(this, &ServiceImpl::ArmDispatchable),
+                                     absl::Now() + absl::Seconds(2));
   if (in_flight_orchestrator_ == nullptr) {
+    const bool aborted = run_dispatch_aborted_;
     in_flight_mutex_.Unlock();
-    return finishGrpcStream(false, "Run did not become dispatchable in time.");
+    return finishGrpcStream(false, aborted ? "The benchmark run failed before it could accept "
+                                             "updates or cancellations."
+                                           : "Run did not become dispatchable in time.");
   }
   LiveUpdateOrchestrator* orchestrator = in_flight_orchestrator_;
   if (request.has_cancellation_request()) {

@@ -104,13 +104,30 @@ private:
   // ProcessImpl handle via its cancel/phase closures) and clears the entry
   // before process shutdown; the reader thread dispatches update/cancel arms
   // while holding in_flight_mutex_, so a dispatched arm can never race
-  // process shutdown.
+  // process shutdown. A RAII guard (InFlightUnregister) clears the entry on
+  // the exception path too, where busy_lock_ is still held while the run
+  // unwinds — dispatch then rejects honestly instead of dereferencing a
+  // dangling orchestrator.
   absl::Mutex in_flight_mutex_;
   LiveUpdateOrchestrator* in_flight_orchestrator_ ABSL_GUARDED_BY(in_flight_mutex_) = nullptr;
+  // Set by the RAII guard when the run exits without reaching its explicit
+  // unregister (i.e. it unwound through an exception): the dispatch path uses
+  // it to reject immediately instead of waiting out the registration window.
+  bool run_dispatch_aborted_ ABSL_GUARDED_BY(in_flight_mutex_) = false;
+  // True while in_flight_orchestrator_ is registered or the run aborted —
+  // the absl::Condition the dispatch waits on. Called with in_flight_mutex_
+  // held.
+  bool ArmDispatchable() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(in_flight_mutex_) {
+    return in_flight_orchestrator_ != nullptr || run_dispatch_aborted_;
+  }
   // FORK-ONLY (We-Amp): test seam — replaces the default applier (which
   // rejects every delta) with a test double. Must be set before the run
   // starts; read once per run on the run thread.
   std::function<std::unique_ptr<LiveUpdateOrchestrator::Applier>()> update_applier_factory_;
+  // FORK-ONLY (We-Amp): test seam — invoked on the run thread just before
+  // process->run(); throwing from it exercises the run-exception unwind path
+  // (registry guard, honest arm rejection).
+  std::function<void()> run_failure_injection_;
 
 public:
   // Test-only: inject a LiveUpdateOrchestrator::Applier factory for the next
@@ -118,6 +135,11 @@ public:
   void SetUpdateApplierFactoryForTest(
       std::function<std::unique_ptr<LiveUpdateOrchestrator::Applier>()> factory) {
     update_applier_factory_ = std::move(factory);
+  }
+  // Test-only: make the next and following runs throw just before the
+  // benchmark starts.
+  void SetRunFailureInjectionForTest(std::function<void()> failure) {
+    run_failure_injection_ = std::move(failure);
   }
 };
 

@@ -33,9 +33,7 @@ public:
     ENVOY_LOG(debug, "Live update rejected: no applier is wired yet");
     nighthawk::client::UpdateResult result;
     result.set_applied(false);
-    result.set_rejection_reason(
-        "live knob updates are not implemented yet: whitelist validation and the "
-        "rate-limiter capability fan-out land in later M3 tasks");
+    result.set_rejection_reason("live knob updates are not yet supported by this build");
     return result;
   }
 };
