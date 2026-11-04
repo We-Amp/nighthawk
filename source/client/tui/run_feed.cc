@@ -108,6 +108,10 @@ void RunFeed::readLoop() {
       if (callbacks_.on_snapshot) {
         callbacks_.on_snapshot(response.live_snapshot());
       }
+    } else if (response.has_phase_event()) {
+      if (callbacks_.on_phase_event) {
+        callbacks_.on_phase_event(response.phase_event());
+      }
     } else if (response.has_output()) {
       if (callbacks_.on_completed) {
         callbacks_.on_completed(response.output());

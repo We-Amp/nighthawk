@@ -874,7 +874,21 @@ void ProcessImpl::emitPhaseEvent(const PhaseEvent& event) {
   ENVOY_LOG(debug, "phase event: index {} ('{}') wall {} monotonic {}", event.phase_index,
             event.phase_id, event.wall_time_unix_ns, event.monotonic_ns);
   if (phase_event_cb_ != nullptr) {
-    phase_event_cb_(event);
+    // FORK-ONLY (T7 wiring): enrich a completed boundary with the worker
+    // subset facts (the orchestrator does not know the fleet plan). Same
+    // thread as runPhases (the sink is synchronous), so the subset vector is
+    // stable here.
+    PhaseEvent enriched = event;
+    if (enriched.boundary_complete && !phase_worker_subsets_.empty()) {
+      if (enriched.ending_phase_index < phase_worker_subsets_.size()) {
+        enriched.worker_count = phase_worker_subsets_[enriched.ending_phase_index].worker_count;
+      }
+      if (enriched.phase_index < phase_worker_subsets_.size()) {
+        enriched.next_phase_cold_started =
+            phase_worker_subsets_[enriched.phase_index].new_workers_cold_started;
+      }
+    }
+    phase_event_cb_(enriched);
   }
 }
 

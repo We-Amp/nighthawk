@@ -427,6 +427,41 @@ TEST(PhaseBoundaryTest, OldReaderReadingNewRecordHitsVersionSkewRejection) {
   EXPECT_NE(skewed.status().message().find("NEWER writer"), std::string::npos) << skewed.status();
 }
 
+// The stream-at-boundary conversion: the wire's PhaseBoundaryEvent becomes
+// the session's record, identity joined to the ENDING phase; the pool/claim
+// fields stay default (the final Output's PhaseMetadata is the post-run
+// completeness source).
+TEST(PhaseBoundaryTest, EventConversionJoinsEndingPhaseAndDefaultsClaims) {
+  nighthawk::client::PhaseBoundaryEvent event;
+  event.set_phase_index(1);
+  event.set_phase_id("spike");
+  event.set_wall_time_unix_ns(1'000'000'000);
+  event.set_monotonic_ns(42);
+  event.set_ending_phase_index(0);
+  event.set_ending_phase_id("warm");
+  event.mutable_drain_duration()->set_nanos(500'000'000);
+  event.mutable_idle_gap()->set_seconds(0);
+  event.mutable_idle_gap()->set_nanos(200'000'000);
+  event.set_worker_count(2);
+  event.set_next_phase_cold_started(true);
+
+  PhaseBoundaryRecord record = ToPhaseBoundaryRecord(event);
+  EXPECT_EQ(record.phase_id(), "warm");
+  EXPECT_EQ(record.next_phase_id(), "spike");
+  EXPECT_EQ(record.phase_index(), 0);
+  EXPECT_EQ(record.wall_time_unix_ns(), 1'000'000'000);
+  EXPECT_EQ(record.monotonic_ns(), 42);
+  EXPECT_EQ(record.drain_duration().nanos(), 500'000'000);
+  EXPECT_EQ(record.idle_gap().nanos(), 200'000'000);
+  EXPECT_EQ(record.worker_count(), 2);
+  EXPECT_TRUE(record.new_workers_cold_started());
+  // Defaults: post-run completeness comes from the Output's PhaseMetadata.
+  EXPECT_EQ(record.connections_created(), 0);
+  EXPECT_EQ(record.connections_active(), 0);
+  EXPECT_DOUBLE_EQ(record.completion_ratio(), 0.0);
+  EXPECT_EQ(record.gate_exceeded(), 0);
+}
+
 // Real phase ids flow into the persisted metric series (the placeholder
 // marker is dropped when real ids flow); the header conversion is unchanged.
 TEST(PhaseBoundaryTest, PhaseIdsFlowToSession) {

@@ -28,6 +28,10 @@ struct RunFeedCallbacks {
   // A live snapshot of the in-flight run (arrives only when the run opted in
   // to live streaming, which RunFeed::start() does on every request).
   std::function<void(const nighthawk::client::LiveSnapshot&)> on_snapshot;
+  // One completed phase boundary of a multi-phase run (DQ-3: METADATA, never
+  // a synthetic metric snapshot; api/client/live.proto's PhaseBoundaryEvent
+  // is the wire form). Fired in boundary order, between the snapshots.
+  std::function<void(const nighthawk::client::PhaseBoundaryEvent&)> on_phase_event;
   // The run's final output. Fired on natural run end ONLY; a cancelled run
   // never sees this.
   std::function<void(const nighthawk::client::Output&)> on_completed;

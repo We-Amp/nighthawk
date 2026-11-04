@@ -42,6 +42,11 @@ message ExecutionResponse {
   // free upstream. A live progress snapshot, streamed while the run is in
   // flight when the request opted in to live streaming.
   nighthawk.client.LiveSnapshot live_snapshot = 911;
+  // FORK-ONLY (We-Amp): rebase check - field number 912 is fork-specific and
+  // free upstream. One completed phase boundary (DQ-3: METADATA, never a
+  // synthetic metric snapshot), streamed at the boundary's completion when
+  // the request opted in to live streaming.
+  nighthawk.client.PhaseBoundaryEvent phase_event = 912;
 }
 
 service NighthawkService {

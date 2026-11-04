@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package nighthawk.client;
 
+import "google/protobuf/duration.proto";
+
 // FORK-ONLY (We-Amp): this file, and the messages it defines, are fork-specific
 // additions that do not exist upstream. Rebase check: if an upstream change
 // collides with the ones here, the fork's additions must give way before
@@ -70,4 +72,40 @@ message WorkerLiveSnapshotPartial {
   // slabs; the aggregator groups/labels by this stamp and never folds
   // statistics across different stamps.
   string phase_id = 4;
+}
+
+// FORK-ONLY (We-Amp): rebase check - fork-specific. One completed phase
+// boundary (spec 8.5), streamed on the ExecutionStream at the moment the
+// next phase's first work is scheduled — the only emit at which the
+// boundary's drain and idle gap are both final.
+//
+// NORMATIVE (the DQ-3 ruling, mirrored on session.proto's
+// PhaseBoundaryRecord): boundary events are METADATA, never synthetic metric
+// snapshots. The (wall, monotonic) pair is the join key for the TUI's
+// timeline and profile-window alignment and nothing else; the idle gap sits
+// INSIDE the drain-complete flag for purity accounting and is never folded
+// into any percentile series.
+message PhaseBoundaryEvent {
+  // The phase STARTING after the boundary: the event fires at its first
+  // scheduled work. Empty next_phase fields on the run's final emit carry no
+  // boundary at all.
+  uint32 phase_index = 1;
+  string phase_id = 2;
+  // The engine-emitted boundary clock pair (spec 8.5).
+  int64 wall_time_unix_ns = 3;
+  int64 monotonic_ns = 4;
+  // The boundary that ENDED the previous phase:
+  string ending_phase_id = 5;
+  uint32 ending_phase_index = 6;
+  // Duration of the boundary's non-destructive drain (spec 8.6: recorded,
+  // never zero-silent).
+  google.protobuf.Duration drain_duration = 7;
+  // Last drain completion -> this phase's first scheduled work (spec 8.6).
+  google.protobuf.Duration idle_gap = 8;
+  // The ending phase's active workers (the 8.4 non-comparability key).
+  uint32 worker_count = 9;
+  // True iff the transition INTO phase_id cold-started workers — the
+  // successor-attributed flag (see PhaseBoundaryRecord.new_workers_cold_started
+  // in api/client/session.proto for the explicit attribution rule).
+  bool next_phase_cold_started = 10;
 }

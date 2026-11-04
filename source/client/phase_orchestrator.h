@@ -27,11 +27,33 @@ namespace Client {
 // Engine-emitted phase event (spec 8.5): the boundary emits BOTH stamps, and
 // the TUI's phase timeline and window alignment (M2 Task 7) consume exactly
 // these, replacing the M1 first-snapshot clock anchor.
+//
+// FORK-ONLY (T7 wiring) boundary enrichment: exactly one emit per boundary —
+// the next-phase-start emit, whose state is kNextPhaseStarted — carries the
+// completed boundary (drain + idle gap final at that point) in the fields
+// below. The drain-complete and final-complete emits carry boundary_complete
+// == false and default fields: the final emit is the run's own end, and the
+// drain-complete emit's boundary is not yet idle-timed. The wire form of the
+// enriched event is api/client/live.proto's PhaseBoundaryEvent.
 struct PhaseEvent {
   uint32_t phase_index;
   std::string phase_id; // == PhaseSpec::name
   int64_t wall_time_unix_ns;
   int64_t monotonic_ns;
+  // True iff this event completes the boundary that ended phase
+  // (ending_phase_index | ending_phase_id):
+  bool boundary_complete = false;
+  uint32_t ending_phase_index = 0;
+  std::string ending_phase_id;
+  // The boundary's recorded timings; -1 when unknown (boundary_complete
+  // false).
+  int64_t drain_duration_ns = -1;
+  int64_t idle_gap_ns = -1;
+  // The ending phase's active workers and the successor-attributed cold
+  // flag (enriched by ProcessImpl from the worker-subset plan before the
+  // callback fires; 0/false when boundary_complete is false).
+  uint32_t worker_count = 0;
+  bool next_phase_cold_started = false;
 };
 
 // Boundary lifecycle states, in the order the orchestrator observes them.

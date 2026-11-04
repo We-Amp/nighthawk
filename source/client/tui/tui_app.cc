@@ -620,6 +620,7 @@ RunController::RunController(const std::shared_ptr<grpc::ChannelInterface>& chan
       scrape_admin_(AdminEndpoints{}),
       feed_(channel,
             RunFeedCallbacks{std::bind(&RunController::onSnapshot, this, std::placeholders::_1),
+                             std::bind(&RunController::onPhaseEvent, this, std::placeholders::_1),
                              std::bind(&RunController::onCompleted, this, std::placeholders::_1),
                              std::bind(&RunController::onFinished, this, std::placeholders::_1)}) {}
 
@@ -1113,6 +1114,7 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     run_finished_ = false;
     anchor_ = ClockAnchor{};
     has_prev_scrape_ = false;
+    boundary_events_.clear();
     const std::string& concurrency = request.options().concurrency().value();
     uint32_t parsed = 0;
     worker_count_ =
@@ -1206,6 +1208,11 @@ bool RunController::lastRunEndedCompleted() const {
 
 std::shared_ptr<const RunViewModel> RunController::model() const { return store_.load(); }
 
+std::vector<nighthawk::client::PhaseBoundaryEvent> RunController::boundaryEvents() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return boundary_events_;
+}
+
 std::string RunController::sessionPath() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return session_path_;
@@ -1292,6 +1299,28 @@ void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) 
     if (writer_ != nullptr) {
       nighthawk::client::SessionRecord record;
       *record.mutable_metric_series() = ToMetricSeries(snapshot);
+      writer_->enqueue(std::move(record));
+    }
+    notification = snapshot_notification_;
+  }
+  if (notification != nullptr) {
+    notification();
+  }
+}
+
+void RunController::onPhaseEvent(const nighthawk::client::PhaseBoundaryEvent& event) {
+  // Stream-at-boundary intake (M2 Task 7 wiring, DQ-3: METADATA only): the
+  // boundary event joins the timeline state and persists as the session's
+  // PhaseBoundaryRecord exactly when the engine emitted it. The pool/claim
+  // fields stay default until the final Output's PhaseMetadata completes
+  // them (the segment builder's post-run completeness source).
+  std::function<void()> notification;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    boundary_events_.push_back(event);
+    if (writer_ != nullptr) {
+      nighthawk::client::SessionRecord record;
+      *record.mutable_phase_boundary() = ToPhaseBoundaryRecord(event);
       writer_->enqueue(std::move(record));
     }
     notification = snapshot_notification_;

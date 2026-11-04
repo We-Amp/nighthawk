@@ -172,6 +172,13 @@ public:
   // snapshot of a session.
   std::shared_ptr<const RunViewModel> model() const;
 
+  // The boundary events of the current/most recent run, in boundary order
+  // (M2 Task 7 wiring: stream-at-boundary intake; cleared at every startRun).
+  // The timeline strip and the window-split intervals build from these; the
+  // final Output's PhaseMetadata (carried in the run end record) stays the
+  // post-run completeness source for the strip's claim/pool cells.
+  std::vector<nighthawk::client::PhaseBoundaryEvent> boundaryEvents() const;
+
   // The open session's data file path (empty when none is open).
   std::string sessionPath() const;
 
@@ -269,6 +276,7 @@ public:
 private:
   // The feed callbacks; all fire on the feed's read thread.
   void onSnapshot(const nighthawk::client::LiveSnapshot& snapshot);
+  void onPhaseEvent(const nighthawk::client::PhaseBoundaryEvent& event);
   void onCompleted(const nighthawk::client::Output& output);
   void onFinished(const absl::Status& status);
 
@@ -291,6 +299,9 @@ private:
   nighthawk::client::Output final_output_;
   std::function<void()> snapshot_notification_;
   nighthawk::client::CommandLineOptions knob_options_;
+  // M2 Task 7 wiring: the run's boundary events, in boundary order (the
+  // feed's read thread appends; the render side copies under the mutex).
+  std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events_;
 
   // --- M1 state (guarded by mutex_ unless noted) ---------------------------
   // Configure-once pipeline configuration; read by pool jobs by value.

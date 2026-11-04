@@ -1108,6 +1108,107 @@ TEST_F(SessionPipelineTest, FailedStartLeavesNoHeaderOnlySession) {
   std::filesystem::remove_all(dir, ec);
 }
 
+// M2 Task 7 wiring, end to end: a two-phase run through the SAME pipeline the
+// TUI drives. The service streams each completed boundary as a phase_event
+// response; the controller's intake stores it AND persists it as the
+// session's phase_boundary record at boundary time (stream-at-boundary; DQ-3:
+// metadata only, never a synthetic snapshot). The final Output's
+// PhaseMetadata (in the run end record) is the post-run completeness source.
+TEST_F(SessionPipelineTest, PhaseBoundariesStreamAndPersist) {
+  StartRequest request;
+  auto* options = request.mutable_options();
+  options->mutable_uri()->set_value(listener().uri());
+  options->mutable_connections()->set_value(4);
+  options->mutable_timeout()->set_seconds(5);
+  options->mutable_live_streaming();
+  options->mutable_stats_flush_interval()->set_value(1);
+  const char* names[] = {"p0", "p1"};
+  for (uint32_t i = 0; i < 2; ++i) {
+    nighthawk::client::PhaseSpec* phase = options->add_phases();
+    phase->set_name(names[i]);
+    phase->mutable_duration()->set_seconds(2);
+    phase->set_requests_per_second(50);
+    phase->mutable_concurrency()->set_value("1");
+  }
+
+  const std::string prefix = tempPath("tui-pipeline-boundary");
+  auto controller = std::make_unique<RunController>(channel(), prefix);
+  ASSERT_EQ(controller->startRun(request), absl::OkStatus());
+  const std::string session_path = controller->sessionPath();
+
+  // The run completes naturally (4s of phases + teardown).
+  for (int i = 0; i < 200 && controller->runInProgress(); ++i) {
+    std::this_thread::sleep_for(100ms);
+  }
+  EXPECT_FALSE(controller->runInProgress());
+  ASSERT_TRUE(controller->finishSession(/*completed=*/true).ok());
+
+  // The intake holds the boundary, joined on the engine event: one boundary
+  // for the two-phase run, ending p0, next p1.
+  const std::vector<nighthawk::client::PhaseBoundaryEvent> events = controller->boundaryEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].ending_phase_id(), "p0");
+  EXPECT_EQ(events[0].phase_id(), "p1");
+  EXPECT_GT(events[0].wall_time_unix_ns(), 0);
+  EXPECT_GT(events[0].monotonic_ns(), 0);
+  EXPECT_GT(events[0].drain_duration().seconds() + events[0].drain_duration().nanos(), 0);
+
+  // The session carries the persisted record, field-joined to the event.
+  auto reader_or = SessionReader::open(session_path);
+  ASSERT_TRUE(reader_or.status().ok()) << reader_or.status();
+  std::unique_ptr<SessionReader> reader = std::move(*reader_or);
+  bool have_header = false;
+  bool have_boundary = false;
+  bool have_run_end = false;
+  size_t series_count = 0;
+  while (true) {
+    auto record_or = reader->next();
+    ASSERT_TRUE(record_or.status().ok()) << record_or.status();
+    if (!record_or->has_value()) {
+      break;
+    }
+    switch ((*record_or)->record_case()) {
+    case SessionRecord::kHeader:
+      have_header = true;
+      break;
+    case SessionRecord::kMetricSeries:
+      series_count++;
+      break;
+    case SessionRecord::kPhaseBoundary: {
+      have_boundary = true;
+      const auto& got = (*record_or)->phase_boundary();
+      EXPECT_EQ(got.phase_id(), "p0");
+      EXPECT_EQ(got.next_phase_id(), "p1");
+      EXPECT_EQ(got.phase_index(), 0);
+      EXPECT_EQ(got.wall_time_unix_ns(), events[0].wall_time_unix_ns());
+      EXPECT_EQ(got.monotonic_ns(), events[0].monotonic_ns());
+      EXPECT_EQ(got.worker_count(), 1);
+      // Stream-at-boundary fields stay default: the Output's PhaseMetadata
+      // (in the run end record) is the post-run completeness source.
+      EXPECT_EQ(got.connections_created(), 0);
+      EXPECT_EQ(got.gate_exceeded(), 0);
+      break;
+    }
+    case SessionRecord::kRunEnd:
+      have_run_end = true;
+      EXPECT_TRUE((*record_or)->run_end().has_output());
+      EXPECT_GT((*record_or)->run_end().output().phase_metadata_size(), 0);
+      break;
+    case SessionRecord::kProfileWindow:
+      // This run opens no profile windows.
+      ADD_FAILURE() << "unexpected profile_window frame";
+      break;
+    case SessionRecord::RECORD_NOT_SET:
+      ADD_FAILURE() << "unset record frame";
+      break;
+    }
+  }
+  EXPECT_TRUE(have_header);
+  EXPECT_TRUE(have_boundary) << "the boundary was not persisted at stream time";
+  EXPECT_GT(series_count, 0u);
+  EXPECT_TRUE(have_run_end);
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client

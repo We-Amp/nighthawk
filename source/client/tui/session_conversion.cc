@@ -60,6 +60,26 @@ ToPhaseBoundaryRecord(uint32_t phase_index, absl::string_view phase_id,
   return record;
 }
 
+nighthawk::client::PhaseBoundaryRecord
+ToPhaseBoundaryRecord(const nighthawk::client::PhaseBoundaryEvent& event) {
+  nighthawk::client::PhaseBoundaryRecord record;
+  // The record's identity is the boundary's ENDING phase; the event's own
+  // phase fields name the phase starting after the boundary.
+  record.set_phase_id(event.ending_phase_id());
+  record.set_next_phase_id(event.phase_id());
+  record.set_phase_index(event.ending_phase_index());
+  record.set_wall_time_unix_ns(event.wall_time_unix_ns());
+  record.set_monotonic_ns(event.monotonic_ns());
+  *record.mutable_drain_duration() = event.drain_duration();
+  *record.mutable_idle_gap() = event.idle_gap();
+  record.set_worker_count(event.worker_count());
+  record.set_new_workers_cold_started(event.next_phase_cold_started());
+  // Pool-health and claim fields stay default: the engine computes them in
+  // the output pass; the final Output's PhaseMetadata is the post-run
+  // completeness source (DQ-3: metadata, never a synthetic snapshot).
+  return record;
+}
+
 } // namespace Tui
 } // namespace Client
 } // namespace Nighthawk

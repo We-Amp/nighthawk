@@ -59,6 +59,15 @@ ToPhaseBoundaryRecord(uint32_t phase_index, absl::string_view phase_id,
                       int64_t monotonic_ns, const nighthawk::client::PhaseMetadata& metadata,
                       bool next_phase_cold_started);
 
+// The stream-at-boundary conversion: the wire's PhaseBoundaryEvent (streamed
+// by the service the moment the boundary completes) becomes the session's
+// persisted record. The pool-health and claim-discipline fields stay at
+// their defaults here — the engine computes them in the output pass, and the
+// final Output's PhaseMetadata is the post-run completeness source (the
+// timeline builder prefers it once the run finished). METADATA only (DQ-3).
+nighthawk::client::PhaseBoundaryRecord
+ToPhaseBoundaryRecord(const nighthawk::client::PhaseBoundaryEvent& event);
+
 } // namespace Tui
 } // namespace Client
 } // namespace Nighthawk

@@ -67,6 +67,20 @@ void PhaseOrchestrator::emit(uint32_t phase_index) {
     event.phase_id = phases_[phase_index].name();
     event.wall_time_unix_ns = wallNowNs();
     event.monotonic_ns = steadyNowNs();
+    // FORK-ONLY (T7 wiring): only the next-phase-start emit completes a
+    // boundary — by then the drain was collected (collectDrainAcks pushed
+    // the timing) and the idle gap was recorded against it (immediately
+    // above, in markNextPhaseStarted). The drain-complete emit's boundary is
+    // not yet idle-timed, and the final-complete emit is the run's own end.
+    if (state_ == BoundaryState::kNextPhaseStarted && phase_index > 0 && !timings_.empty() &&
+        timings_.back().idle_gap_ns >= 0) {
+      const PhaseBoundaryTiming& timing = timings_.back();
+      event.boundary_complete = true;
+      event.ending_phase_index = timing.phase_index;
+      event.ending_phase_id = timing.phase_id;
+      event.drain_duration_ns = timing.drain_duration_ns;
+      event.idle_gap_ns = timing.idle_gap_ns;
+    }
     event_sink_(event);
   }
 }

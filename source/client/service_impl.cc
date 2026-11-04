@@ -58,6 +58,40 @@ void ServiceImpl::handleExecutionRequest(
   }
   ProcessPtr process = std::move(*process_or_status);
 
+  // FORK-ONLY (We-Amp): stream-at-boundary phase events (M2 Task 7 wiring,
+  // DQ-3 ruling: boundary events are METADATA, never synthetic metric
+  // snapshots). The callback fires on the run-calling thread — inside
+  // process->run() below — so each boundary response is written before the
+  // final output response; the only concurrent writer is the live snapshot
+  // collector, and the shared stream-write mutex serializes both. A failed
+  // write means the stream is gone (client cancelled); stop delivering.
+  if (options->liveStreamingEnabled()) {
+    static_cast<ProcessImpl&>(*process).setPhaseEventCallback(
+        [this, stream](const Nighthawk::Client::PhaseEvent& event) {
+          if (!event.boundary_complete) {
+            return;
+          }
+          nighthawk::client::ExecutionResponse response;
+          nighthawk::client::PhaseBoundaryEvent* boundary = response.mutable_phase_event();
+          boundary->set_phase_index(event.phase_index);
+          boundary->set_phase_id(event.phase_id);
+          boundary->set_wall_time_unix_ns(event.wall_time_unix_ns);
+          boundary->set_monotonic_ns(event.monotonic_ns);
+          boundary->set_ending_phase_index(event.ending_phase_index);
+          boundary->set_ending_phase_id(event.ending_phase_id);
+          boundary->mutable_drain_duration()->set_seconds(event.drain_duration_ns / 1000000000);
+          boundary->mutable_drain_duration()->set_nanos(event.drain_duration_ns % 1000000000);
+          if (event.idle_gap_ns >= 0) {
+            boundary->mutable_idle_gap()->set_seconds(event.idle_gap_ns / 1000000000);
+            boundary->mutable_idle_gap()->set_nanos(event.idle_gap_ns % 1000000000);
+          }
+          boundary->set_worker_count(event.worker_count);
+          boundary->set_next_phase_cold_started(event.next_phase_cold_started);
+          absl::MutexLock lock(&stream_write_mutex_);
+          stream->Write(response);
+        });
+  }
+
   OutputCollectorImpl output_collector(time_system_, *options);
 
   // FORK-ONLY (We-Amp): when the request opted in to live snapshot streaming,

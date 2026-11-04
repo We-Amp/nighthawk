@@ -420,6 +420,41 @@ TEST_F(PhaseRunTest, PhaseEventsCarryClockPairs) {
   }
 }
 
+// T7 wiring: exactly one emit per boundary carries the completed boundary —
+// the next-phase-start emit, with drain and idle both final and the worker
+// facts enriched from the subset plan. The other emits carry no boundary.
+TEST_F(PhaseRunTest, PhaseEventsCarryCompletedBoundary) {
+  RunOutcome outcome = runPhases(makeTwoPhaseOptions(listener().uri()));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(4u, outcome.events.size());
+
+  int completed_boundaries = 0;
+  for (const PhaseEvent& event : outcome.events) {
+    if (!event.boundary_complete) {
+      EXPECT_EQ(event.drain_duration_ns, -1);
+      EXPECT_EQ(event.idle_gap_ns, -1);
+      continue;
+    }
+    ++completed_boundaries;
+    // The boundary that ended phase0, observed at phase1's first scheduled
+    // work (the event's own phase fields name the STARTING phase).
+    EXPECT_EQ(event.ending_phase_index, 0u);
+    EXPECT_EQ(event.ending_phase_id, "phase0");
+    EXPECT_EQ(event.phase_index, 1u);
+    EXPECT_EQ(event.phase_id, "phase1");
+    // Both timings are final and non-negative; the drain is bounded by
+    // --timeout (5s here).
+    EXPECT_GE(event.drain_duration_ns, 0);
+    EXPECT_GE(event.idle_gap_ns, 0);
+    EXPECT_LT(event.drain_duration_ns, 5000000000);
+    // Same concurrency ("1") in both phases: one active worker, no cold
+    // start at the transition.
+    EXPECT_EQ(event.worker_count, 1u);
+    EXPECT_FALSE(event.next_phase_cold_started);
+  }
+  EXPECT_EQ(completed_boundaries, 1);
+}
+
 // --- M2 Task 5: per-phase resource limits without rebuilding clusters. ---
 
 // Two 2s phases at rps 100 against a SUT with ~100ms service time: both
