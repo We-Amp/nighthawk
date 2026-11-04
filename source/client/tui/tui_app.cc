@@ -637,6 +637,24 @@ void RunController::set_snapshot_notification(std::function<void()> callback) {
   snapshot_notification_ = std::move(callback);
 }
 
+// TEST-ONLY retriever decorator (see ProfilePipelineConfig's
+// test_retriever_delay_ms): delays the retrieval so tests can land events
+// inside the pool job's retrieval window.
+class DelayedRetriever : public ProfileRetriever {
+public:
+  DelayedRetriever(std::unique_ptr<ProfileRetriever> delegate, int delay_ms)
+      : delegate_(std::move(delegate)), delay_ms_(delay_ms) {}
+
+  absl::StatusOr<std::string> Retrieve(absl::string_view sut_path) override {
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
+    return delegate_->Retrieve(sut_path);
+  }
+
+private:
+  std::unique_ptr<ProfileRetriever> delegate_;
+  int delay_ms_;
+};
+
 void RunController::ConfigureProfiling(ProfilePipelineConfig config) {
   // Configure-once, before use (pool jobs capture config by value at submit;
   // nothing here is hot-swappable — a second call is a no-op).
@@ -646,13 +664,20 @@ void RunController::ConfigureProfiling(ProfilePipelineConfig config) {
   }
   profiling_configured_ = true;
   profile_config_ = std::move(config);
-  fetcher_ = std::make_unique<ProfileFetcher>(
-      AdminClient(profile_config_.admin),
+  std::unique_ptr<ProfileRetriever> retriever =
       profile_config_.retriever_kind == ProfilePipelineConfig::RetrieverKind::kVolumeMount
           ? std::unique_ptr<ProfileRetriever>(
                 std::make_unique<VolumeMountRetriever>(profile_config_.mount_root))
-          : std::unique_ptr<ProfileRetriever>(std::make_unique<ScpRetriever>(profile_config_.scp_host)),
-      profile_config_.sut_profile_path, profile_config_.staging_dir);
+          : std::unique_ptr<ProfileRetriever>(
+                std::make_unique<ScpRetriever>(profile_config_.scp_host));
+  if (profile_config_.test_retriever_delay_ms > 0) {
+    retriever = std::make_unique<DelayedRetriever>(std::move(retriever),
+                                                   profile_config_.test_retriever_delay_ms);
+  }
+  fetcher_ = std::make_unique<ProfileFetcher>(AdminClient(profile_config_.admin),
+                                              std::move(retriever),
+                                              profile_config_.sut_profile_path,
+                                              profile_config_.staging_dir);
   scrape_admin_ = AdminClient(profile_config_.admin);
 }
 
@@ -673,6 +698,13 @@ absl::Status RunController::StartProfileWindow() {
           "no run to align against: open profile windows during a run - only "
           "windows pulled inside a run can be pure");
     }
+  }
+  // M1 final fixes: an in-flight close owns fetcher_ (its retrieval is
+  // running on the pool); re-arming here would race it on the shared fetcher
+  // and can tear the staged profile. Refuse until the close job lands.
+  if (folding_.load(std::memory_order_relaxed)) {
+    return absl::FailedPreconditionError(
+        "a profile window is still folding: wait for it to land before opening the next");
   }
   if (window_open_.exchange(true)) {
     return absl::FailedPreconditionError("a profile window is already open (p closes it)");
@@ -713,15 +745,47 @@ absl::Status RunController::StopProfileWindowAndFold() {
   }
   folding_.store(true, std::memory_order_relaxed);
 
+  // Deferred-close fix (M1 final fixes): disable the SUT profiler HERE, on
+  // the steering thread — one small POST, symmetric with StartWindow's. The
+  // pool job keeps retrieve -> symbolize -> ... -> align only, so pool
+  // latency can never extend the SUT profiler window (or the purity
+  // interval) past this p-press. The requested_end stamp is taken inside
+  // StopWindow, before the disable result is inspected (a wedged state never
+  // persists; the honest interval end is the p-press).
+  const absl::Status stopped = fetcher_->StopWindow();
+  if (!stopped.ok()) {
+    // Post-failed-disable recovery (profile_fetcher.h's contract): the SUT
+    // profiler may still be RUNNING — best-effort disable with this job's
+    // own client, then surface the reason. No window: a retrieval would race
+    // a live profiler and read a partial file.
+    AdminClient recovery(profile_config_.admin);
+    (void)recovery.EnableCpuProfiler(false);
+    folding_.store(false, std::memory_order_relaxed);
+    {
+      absl::MutexLock lock(&diff_mu_);
+      flame_note_ = absl::StrCat("profile close failed: ", stopped.message(),
+                                 "; sent a best-effort disable");
+    }
+    std::function<void()> notification;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      notification = snapshot_notification_;
+    }
+    if (notification != nullptr) {
+      notification();
+    }
+    return stopped;
+  }
+
   // Capture the job inputs on the steering thread, under the model mutex:
   // the completed-work series as of the stop moment, the anchor, and the run
-  // stamps. A run that ENDS while the fetch runs is the straddle case and is
-  // handled inside the job (run_finished was captured before the fetch).
+  // stamps. A run that ENDS while the retrieval runs is handled inside the
+  // job (it upgrades the stamps after the fetch — M1 final fixes).
   // shared_ptr (not unique_ptr): Submit's queue is a std::function, which
   // needs a copyable callable.
   auto input = std::make_shared<ProfileJobInput>();
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     input->anchor = anchor_;
     input->run_start_unix_ns = run_start_unix_ns_;
     input->run_finished = run_finished_;
@@ -730,18 +794,28 @@ absl::Status RunController::StopProfileWindowAndFold() {
     input->completed_series = MergeCompletedSeries(model_.counters);
     // RunFeed clears its running flag BEFORE on_finished fires (run_feed.cc's
     // teardown order), so "feed idle but stamp not yet recorded" means the
-    // terminal event is in flight. Treat the run as ended now: the window's
-    // fetch stamp will land past this moment, which is exactly the
-    // straddle case — never a silently pure window over a dead run.
+    // terminal event is in flight — wait briefly for the REAL stamp.
     if (!feed_.running() && !input->run_finished) {
-      input->run_finished = true;
-      input->run_end_unix_ns = nowUnixNs();
+      cv_.wait_for(lock, std::chrono::seconds(2), [this]() { return finished_; });
+      if (run_finished_) {
+        input->run_finished = true;
+        input->run_end_unix_ns = run_end_unix_ns_;
+      } else {
+        // The stamp never landed: the run demonstrably ended BEFORE this
+        // p-press (the feed is idle and the SUT profiler kept sampling until
+        // the disable above). Take the conservative bound — phase end just
+        // BEFORE the window end (the fetcher's requested-end stamp) — so the
+        // unverifiable tail is EXCLUDED, never a fabricated pure window.
+        input->run_finished = true;
+        input->run_end_unix_ns = fetcher_->requested_end_unix_ns() - 1;
+      }
     }
   }
 
-  // ONE pool job: fetch + retrieve -> symbolize -> load -> fold -> align ->
-  // store + session record (plan task 6 pipeline). The job owns copies of
-  // everything mutable it touches.
+  // ONE pool job: retrieve -> symbolize -> load -> fold -> align -> store +
+  // session record (plan task 6 pipeline; the admin calls stayed on the
+  // steering thread — see above). The job owns copies of everything mutable
+  // it touches.
   PprofWorkerPool* pool = &pool_;
   RunController* self = this;
   pool->Submit([self, input]() { self->FinishProfileWindowJob(*input); });
@@ -754,16 +828,16 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
     std::lock_guard<std::mutex> lock(mutex_);
     config = profile_config_;
   }
-  // The job's own admin client: AdminClient is not thread-safe, and the
-  // scrape cadence may be running on its own client concurrently.
+  // The job's own admin client for the metadata-only clock read: AdminClient
+  // is not thread-safe, and the scrape cadence may be running on its own
+  // client concurrently. (The profiler enable/disable admin calls stay on
+  // the steering thread — M1 final fixes.)
   AdminClient job_admin(config.admin);
 
-  absl::StatusOr<FetchedProfile> fetched = fetcher_->StopWindowAndFetch();
+  // Retrieval only: the profiler was disabled on the steering thread at the
+  // p-press (profile_fetcher.h's split contract).
+  absl::StatusOr<FetchedProfile> fetched = fetcher_->FetchProfile();
   if (!fetched.ok()) {
-    // Post-failed-disable recovery (profile_fetcher.h's contract): the
-    // window is closed; the SUT profiler may still run. Best-effort disable
-    // with the job's own client, then surface the reason.
-    (void)job_admin.EnableCpuProfiler(false);
     {
       absl::MutexLock lock(&diff_mu_);
       flame_note_ = absl::StrCat("profile fetch failed: ", fetched.status().message());
@@ -780,6 +854,21 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
     return;
   }
 
+  // Straddle belt (M1 final fixes): the run may have ENDED while this
+  // retrieval ran; upgrade the stamps with the real terminal record when it
+  // has landed. NO fabrication here: without a real stamp the capture-time
+  // classification stands (it was taken conservatively on the steering
+  // thread). With the deferred close the interval end is the p-press stamp,
+  // so a run ending during retrieval does NOT taint purity — the samples
+  // stopped at the disable.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (run_finished_) {
+      input.run_finished = true;
+      input.run_end_unix_ns = run_end_unix_ns_;
+    }
+  }
+
   // Clock-offset uncertainty (plan major-fix): the observed mac<->SUT offset
   // beyond the admin Date granularity. Unavailable (no clock surface) -> 0,
   // recorded-absent.
@@ -790,7 +879,7 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
     uncertainty_ns = std::max<int64_t>(0, observed - kDateGranularityNs);
   }
 
-  const ProfileJobOutcome outcome = RunProfilePipeline(config, *fetched, input, uncertainty_ns);
+  ProfileJobOutcome outcome = RunProfilePipeline(config, *fetched, input, uncertainty_ns);
 
   if (outcome.has_window) {
     // Append to the immutable store; the render side only ever reads it.
@@ -801,7 +890,9 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
 
     // Session record: the raw staged bytes ride along (self-describing
     // session). Enqueued under the writer mutex; enqueue after close counts
-    // as a drop, so a race with finishSession is safe by contract.
+    // as a drop, so a race with finishSession is safe by contract. When the
+    // session closed before this job landed, say so (review minor): the
+    // window renders, but it is not in the session file.
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (writer_ != nullptr) {
@@ -809,6 +900,8 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
         *record.mutable_profile_window() =
             ToProfileWindowRecord(outcome.window, outcome.raw_bytes, outcome.symbolizer_tool);
         writer_->enqueue(std::move(record));
+      } else {
+        absl::StrAppend(&outcome.note, " | record not persisted: session already closed");
       }
     }
   }
@@ -885,8 +978,13 @@ void RunController::ComputeWindowDiffForLastTwoPureWindows(bool noise_floor) {
       auto paired = DiffOverlay::Pair(snapshots, *std::move(result));
       if (paired.ok()) {
         overlay = *std::move(paired);
+        // Claim discipline (the plan's Global Constraint, minor b): until M3
+        // adds knob epochs every differential IS a same-state pair, so the
+        // d-view's label says so on-screen — the "effect size" reading the
+        // name implies is not claimable at M1.
         note = absl::StrCat(noise_floor ? "noise floor" : "differential", ": windows #", base + 1,
                             " vs #", cur + 1,
+                            noise_floor ? "" : " (same-state; no knob epochs until M3)",
                             overlay->result().comparable
                                 ? ""
                                 : absl::StrCat(" (non-comparable: ",
@@ -1085,7 +1183,11 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
       store_.store(model_);
     }
     has_run_stamp_ = true;
-    if (profiling_configured_ && !scraping_.exchange(true)) {
+    // The scrape cadence arms only while the run is demonstrably live (the
+    // !finished_ guard is the T8-parked one-liner, legal in this wave: a run
+    // that finished between start() and this block — possible in principle —
+    // must not start a scraper).
+    if (profiling_configured_ && !finished_ && !scraping_.exchange(true)) {
       RunController* self = this;
       scraper_ = std::thread([self]() { self->ScrapeLoop(); });
     }

@@ -68,6 +68,12 @@ std::string tempPath(const std::string& name) {
   return absl::StrCat(dir == nullptr ? "/tmp" : dir, "/", name);
 }
 
+int64_t nowUnixNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 std::string nowRfc7231() {
   // Advancing RFC 7231 date, second resolution: the scraper's engine-wall
   // stamps must move forward between scrapes (DeltaScrapes needs forward
@@ -395,12 +401,15 @@ public:
   }
 
   // Starts a run on the in-proc service and waits for the first snapshot
-  // (the anchor capture signal).
-  void StartRunAndWaitForSnapshot() {
+  // (the anchor capture signal). `retriever_delay_ms` arms the TEST-ONLY
+  // retrieval delay (see ProfilePipelineConfig).
+  void StartRunAndWaitForSnapshot(int retriever_delay_ms = 0) {
     auto channel = grpc::CreateChannel(absl::StrCat("127.0.0.1:", grpc_port_),
                                        grpc::InsecureChannelCredentials());
     controller_ = std::make_unique<RunController>(channel, tempPath("tui-flame-pipeline"));
-    controller_->ConfigureProfiling(MakeConfig({"/nonexistent/nh-test-pprof-tool"}));
+    ProfilePipelineConfig config = MakeConfig({"/nonexistent/nh-test-pprof-tool"});
+    config.test_retriever_delay_ms = retriever_delay_ms;
+    controller_->ConfigureProfiling(config);
     ASSERT_EQ(controller_->startRun(makeStartRequest(listener_->uri(), /*rps=*/10,
                                                      /*duration_seconds=*/60)),
               absl::OkStatus());
@@ -560,13 +569,26 @@ TEST_F(FlamePipelineTest, WindowStraddlingRunEndIsExcludedAndMarked) {
   StartRunAndWaitForSnapshot();
 
   ASSERT_EQ(controller().StartProfileWindow(), absl::OkStatus());
-  // End the run while the window is still open: the window's fetch stamp
-  // lands after the recorded run end -> the straddle.
+  // End the run while the window is still open, and WAIT FOR THE TERMINAL
+  // STAMP: with the deferred close (M1 final fixes) the interval end is the
+  // p-press, so the straddle needs the CLOSE to land after the run's real
+  // end — the feed's running flag alone clears before on_finished fires, and
+  // a close inside that window is honestly PURE (window inside the run).
   controller().stopRun();
   for (int i = 0; i < 100 && controller().runInProgress(); ++i) {
     std::this_thread::sleep_for(100ms);
   }
   ASSERT_FALSE(controller().runInProgress());
+  bool run_stamp_landed = false;
+  for (int i = 0; i < 100 && !run_stamp_landed; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller().model();
+    const std::string state = model != nullptr ? model->run_state : "";
+    run_stamp_landed = state == "stopped" || state == "completed";
+    if (!run_stamp_landed) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(run_stamp_landed);
 
   StopAndFoldAndWait(/*want_windows=*/1);
 
@@ -718,6 +740,53 @@ TEST_F(FlamePipelineTest, FailedStartLeavesNothingArmedAndNextStartScrapes) {
   }
   ASSERT_TRUE(controller.finishSession(/*completed=*/false).ok());
   std::filesystem::remove_all(parent, ec);
+}
+
+// M1 final fixes, straddle belt: the run may END while the pool job's
+// retrieval is still in flight. Post deferred-close the interval END is the
+// p-press stamp (the SUT profiler stops at the disable, on the steering
+// thread), so such a window stays HONESTLY PURE — the belt re-read only
+// keeps the phase interval honest for close-after-run-end shapes, which the
+// straddle test above pins as excluded-and-marked. This test lands the run's
+// end INSIDE the delayed retrieval and asserts purity 1.0 with the interval
+// ending at the p-press — not tainted by the post-run world.
+TEST_F(FlamePipelineTest, RunEndingDuringRetrievalKeepsTheWindowPureAtThePpress) {
+  StageCannedProfile(/*with_functions=*/true);
+  StartRunAndWaitForSnapshot(/*retriever_delay_ms=*/1500);
+
+  ASSERT_EQ(controller().StartProfileWindow(), absl::OkStatus());
+  // A 2.2 s window: with 1 s stats flushes, a 500 ms window can legitimately
+  // compute ZERO completed work between flushes — 2.2 s guarantees points on
+  // both sides of the interval.
+  std::this_thread::sleep_for(2200ms);
+  EXPECT_EQ(controller().StopProfileWindowAndFold(), absl::OkStatus());
+  const int64_t close_press_ns = nowUnixNs();
+
+  // The run ends while the (delayed) retrieval runs.
+  controller().stopRun();
+  for (int i = 0; i < 100 && controller().runInProgress(); ++i) {
+    std::this_thread::sleep_for(100ms);
+  }
+  ASSERT_FALSE(controller().runInProgress());
+
+  // The window lands after the run is long gone: still pure, interval at the
+  // p-press.
+  for (int i = 0; i < 200; ++i) {
+    const auto windows = controller().loadWindows();
+    if (windows != nullptr && windows->size() >= 1) {
+      break;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+  const auto windows = controller().loadWindows();
+  ASSERT_NE(windows, nullptr);
+  ASSERT_EQ(windows->size(), 1u);
+  EXPECT_DOUBLE_EQ((*windows)[0].purity_fraction, 1.0);
+  EXPECT_GT((*windows)[0].work_units, 0u);
+  // The interval end is the p-press stamp, NOT the post-retrieval world.
+  EXPECT_LE((*windows)[0].end_unix_ns, close_press_ns + 1'000'000'000LL);
+
+  ASSERT_TRUE(controller().finishSession(/*completed=*/false).ok());
 }
 
 } // namespace

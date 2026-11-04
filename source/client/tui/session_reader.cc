@@ -80,10 +80,15 @@ absl::StatusOr<std::optional<nighthawk::client::SessionRecord>> SessionReader::r
         absl::StrCat("unparseable frame at offset ", offset_, " (", length, " bytes)"));
   }
   if (record.record_case() == nighthawk::client::SessionRecord::RECORD_NOT_SET) {
-    // Length-consistent but content-free: without this check the frame would
-    // surface as a silent {} record instead of the corruption it is.
+    // Length-consistent but content-free. NOT necessarily corruption: an
+    // unknown oneof case (a record type from a NEWER writer) parses to an
+    // unset record right here — the session format's own evolution rule
+    // (api/client/session.proto) calls that a version-skew signal, so the
+    // message says so instead of crying corruption (M1 final fixes).
     return absl::DataLossError(
-        absl::StrCat("corrupted frame at offset ", offset_, ": parses but sets no record"));
+        absl::StrCat("frame at offset ", offset_, ": parses but sets no record - unknown "
+                     "record type from a NEWER writer (version skew; see the format "
+                     "evolution rule in api/client/session.proto)?"));
   }
   offset_ += varint32Length(length) + length;
   return std::optional<nighthawk::client::SessionRecord>(std::move(record));

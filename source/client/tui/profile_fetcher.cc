@@ -102,31 +102,36 @@ ProfileFetcher::ProfileFetcher(AdminClient admin, std::unique_ptr<ProfileRetriev
 
 absl::Status ProfileFetcher::StartWindow(int window_seconds) {
   (void)window_seconds; // advisory only — the admin mutator takes no duration
-  if (window_open_) {
+  if (window_open_.load(std::memory_order_relaxed)) {
     return absl::FailedPreconditionError(
-        "a profile window is already open; close it with StopWindowAndFetch first");
+        "a profile window is already open; close it with StopWindow first");
   }
   absl::Status status = admin_.EnableCpuProfiler(true);
   if (!status.ok()) {
     return status;
   }
-  window_open_ = true;
   requested_start_unix_ns_ = absl::GetCurrentTimeNanos();
+  window_open_.store(true, std::memory_order_relaxed);
   return absl::OkStatus();
 }
 
-absl::StatusOr<FetchedProfile> ProfileFetcher::StopWindowAndFetch() {
-  if (!window_open_) {
+absl::Status ProfileFetcher::StopWindow() {
+  if (!window_open_.load(std::memory_order_relaxed)) {
     return absl::FailedPreconditionError("no profile window is open");
   }
-  window_open_ = false;
-  int64_t requested_end_unix_ns = absl::GetCurrentTimeNanos();
+  // The window is closed and the interval end stamped BEFORE the disable
+  // result is inspected: a wedged state never persists, and the honest
+  // interval end is the p-press — never when the pool job later fetches.
+  window_open_.store(false, std::memory_order_relaxed);
+  requested_end_unix_ns_ = absl::GetCurrentTimeNanos();
+  return admin_.EnableCpuProfiler(false);
+}
 
-  // Ordering contract: the profiler must be off before the profile is
-  // fetched — a fetch racing a live profiler reads a partial file.
-  absl::Status disable = admin_.EnableCpuProfiler(false);
-  if (!disable.ok()) {
-    return disable;
+absl::StatusOr<FetchedProfile> ProfileFetcher::FetchProfile() {
+  if (window_open_.load(std::memory_order_relaxed)) {
+    return absl::FailedPreconditionError(
+        "the profiler is still enabled: StopWindow must run before FetchProfile "
+        "(a fetch racing a live profiler reads a partial file)");
   }
 
   auto retrieved = retriever_->Retrieve(sut_profile_path_);
@@ -137,7 +142,7 @@ absl::StatusOr<FetchedProfile> ProfileFetcher::StopWindowAndFetch() {
   // Staged in the legacy gperftools binary format, verbatim from the SUT —
   // NOT gzip, NOT a pprof proto (see FetchedProfile's format boundary):
   // readable only via ProfileSymbolizer's go-tool conversion (Task 3).
-  std::string staged = absl::StrCat(staging_dir_, "/cpu-", requested_end_unix_ns, ".pprof");
+  std::string staged = absl::StrCat(staging_dir_, "/cpu-", requested_end_unix_ns_, ".pprof");
   absl::Status staged_status = StageFile(*retrieved, staged);
   if (!staged_status.ok()) {
     return staged_status;
@@ -147,7 +152,7 @@ absl::StatusOr<FetchedProfile> ProfileFetcher::StopWindowAndFetch() {
   fetched.local_path = staged;
   fetched.profile_type = "cpu";
   fetched.requested_start_unix_ns = requested_start_unix_ns_;
-  fetched.requested_end_unix_ns = requested_end_unix_ns;
+  fetched.requested_end_unix_ns = requested_end_unix_ns_;
   return fetched;
 }
 

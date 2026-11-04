@@ -18,6 +18,12 @@ nighthawk::client::ProfileWindowRecord ToProfileWindowRecord(
   record.set_symbolized(w.symbolized);
   record.set_symbolizer_tool(symbolizer_tool.data(), symbolizer_tool.size());
   record.set_raw_profile(raw_bytes.data(), raw_bytes.size());
+  // Clock-domain discipline (M1 final fixes): the record says which clock
+  // bounded its interval, and carries the offset uncertainty.
+  record.set_interval_source(w.interval_source == WindowIntervalSource::kProfileTimestamps
+                                 ? nighthawk::client::WINDOW_INTERVAL_SOURCE_PROFILE_TIMESTAMPS
+                                 : nighthawk::client::WINDOW_INTERVAL_SOURCE_FETCH_ORCHESTRATION);
+  record.set_clock_offset_uncertainty_ns(w.clock_offset_uncertainty_ns);
   return record;
 }
 

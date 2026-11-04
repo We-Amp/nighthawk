@@ -27,7 +27,10 @@ namespace Tui {
 // profile_fetcher.h); `symbolizer_tool` is the --pprof-tool argv prefix
 // (provenance; may be empty when symbolization was not attempted). An impure
 // window converts too, purity_fraction carrying the exclusion mark — a
-// session never hides an excluded-and-marked window.
+// session never hides an excluded-and-marked window. The record carries the
+// window's interval_source (which clock bounded [start, end]) and its
+// clock_offset_uncertainty_ns — clock-domain discipline rides WITH the
+// record (M1 final fixes).
 nighthawk::client::ProfileWindowRecord ToProfileWindowRecord(
     const ProfileWindow& w, absl::string_view raw_bytes,
     absl::string_view symbolizer_tool);

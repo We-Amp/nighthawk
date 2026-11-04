@@ -72,7 +72,7 @@ ProfileWindow makeWindow() {
   w.profile_type = "cpu";
   w.symbolized = true;
   w.interval_source = WindowIntervalSource::kFetchOrchestration;
-  w.clock_offset_uncertainty_ns = 0;
+  w.clock_offset_uncertainty_ns = 12'345;
   return w;
 }
 
@@ -117,6 +117,11 @@ TEST(ProfileSessionConversionTest, ToProfileWindowRecordCarriesAllFields) {
   EXPECT_EQ(record.symbolizer_tool(), "go tool pprof");
   // The raw staged bytes land verbatim: the session is self-describing.
   EXPECT_EQ(record.raw_profile(), raw);
+  // Clock-domain discipline rides WITH the record (M1 final fixes): which
+  // clock bounded the interval, and the offset uncertainty.
+  EXPECT_EQ(record.interval_source(),
+            nighthawk::client::WINDOW_INTERVAL_SOURCE_FETCH_ORCHESTRATION);
+  EXPECT_EQ(record.clock_offset_uncertainty_ns(), 12'345);
 }
 
 TEST(ProfileSessionConversionTest, EmptyToolLabelIsCarriedAsEmpty) {

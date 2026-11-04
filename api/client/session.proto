@@ -62,6 +62,19 @@ message RunEndRecord {
   int64 ended_unix_ns = 4;
 }
 
+// Which clock bounded a profile window's [start, end] interval (spec §8.5;
+// mirrors the TUI's WindowIntervalSource — profile_windows.h).
+enum WindowIntervalSource {
+  // The parsed profile carried no sample timestamps: the interval boundary
+  // is the fetch orchestration's own collector clock (the p-key's steering
+  // stamps; mac wall on the local venue). The live M1 route — the legacy
+  // gperftools conversion carries no time_nanos.
+  WINDOW_INTERVAL_SOURCE_FETCH_ORCHESTRATION = 0;
+  // The parsed profile carried sample timestamps: the interval is the
+  // profile's own SUT clock — the §8.5 sanctioned join key.
+  WINDOW_INTERVAL_SOURCE_PROFILE_TIMESTAMPS = 1;
+}
+
 // One pulled and phase-aligned profile window, appended to the session per
 // spec §4 session recording (M1). FORK-ONLY.
 message ProfileWindowRecord {
@@ -69,9 +82,10 @@ message ProfileWindowRecord {
   string profile_type = 1;
   // Window interval on the SUT clock (spec §8.5): the parsed profile's own
   // stamps when it carries timestamps, otherwise the fetch orchestration's
-  // collector boundary (mac wall; local venue). The record's
-  // purity_fraction/interval facts must be read against that clock, never
-  // cross-compared with a metric series' stamps from the other domain.
+  // collector boundary (mac wall; local venue) — see interval_source. The
+  // record's purity_fraction/interval facts must be read against that
+  // clock, never cross-compared with a metric series' stamps from the
+  // other domain.
   int64 start_unix_ns = 2;
   int64 end_unix_ns = 3;
   // Fraction of the window inside one drain-complete phase (spec §8.3).
@@ -97,6 +111,12 @@ message ProfileWindowRecord {
   // through the symbolizer machine route, never parseable in-process. The
   // session is self-describing: zero re-fetch to re-analyze.
   bytes raw_profile = 10;
+  // Which clock bounded [start, end] (M1 final fixes: the record preaches
+  // clock-domain discipline, so it must say which domain its interval is in).
+  WindowIntervalSource interval_source = 11;
+  // mac<->SUT clock-offset uncertainty in ns (0 on the local venue / when no
+  // clock surface answered). Metadata only (spec §8.5).
+  int64 clock_offset_uncertainty_ns = 12;
 }
 
 // One frame of a session file.
