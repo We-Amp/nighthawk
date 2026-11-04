@@ -80,10 +80,12 @@ inline PhaseInterval PreA1RunInterval(int64_t run_start_unix_ns, int64_t run_end
 // flushes). Interval i spans [start_i, start_{i+1}) where the starts are the
 // run start, then each boundary's wall stamp; the final interval ends at
 // `run_end_unix_ns` (a live run's caller passes the fetch boundary — never a
-// fabricated future end). Every event-opened interval is drain-complete by
-// construction (the event fires after the boundary's drain was collected);
-// the first interval counts as drain-complete like the M1 producer did (no
-// preceding drain exists to wait for). Worker counts resolve from the specs
+// fabricated future end). An event-opened interval is drain-complete UNLESS
+// its boundary was CENSORED (8.3: a still-draining phase is never pure — the
+// censored drain means in-flight work was still completing at the interval's
+// end, so the ending interval's parts are excluded-and-marked); the final
+// interval counts as drain-complete like the M1 producer did (no observed
+// censoring to attribute). Worker counts resolve from the specs
 // by phase id (an unparseable/absent concurrency leaves 0 — such intervals
 // still align but carry the unknown count, which marks differentials
 // non-comparable per 8.4 rather than guessing). Pure.

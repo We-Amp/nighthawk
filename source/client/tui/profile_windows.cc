@@ -92,7 +92,13 @@ std::vector<PhaseInterval> PhaseIntervalsFromBoundaries(
     interval.phase_id = event.ending_phase_id();
     interval.start_unix_ns = cursor;
     interval.end_unix_ns = boundary;
-    interval.drain_complete = true;
+    // 8.3 (re-review remainder): a CENSORED boundary means the ending
+    // phase's drain gave up — in-flight work was still completing at the
+    // interval's end — so the ending interval is NOT drain-complete and its
+    // parts are excluded-and-marked ("a still-draining phase is never
+    // pure"). The interval the boundary OPENS is unaffected: its own drain
+    // lies in its future.
+    interval.drain_complete = !event.drain_censored();
     interval.worker_count = event.worker_count();
     intervals.push_back(std::move(interval));
     cursor = boundary;

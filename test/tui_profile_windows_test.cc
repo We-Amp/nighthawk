@@ -552,6 +552,52 @@ TEST(ProducerReplacementTest, TooShortPartExcludedAndMarked) {
   EXPECT_NE(split.reasons[0].find("meaningful-minimum"), std::string::npos) << split.reasons[0];
 }
 
+// 8.3 via the censoring flag (re-review remainder): a CENSORED boundary
+// makes the ENDING phase's interval not drain-complete, so the straddling
+// window's adjacent part is EXCLUDED-AND-MARKED — never purity 1.0.
+TEST(ProducerReplacementTest, CensoredBoundaryExcludesTheAdjacentPart) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 100)});
+  PhaseBoundaryEvent event;
+  event.set_phase_index(1);
+  event.set_phase_id("spike");
+  event.set_wall_time_unix_ns(5'000'000'000);
+  event.set_ending_phase_index(0);
+  event.set_ending_phase_id("warm");
+  event.mutable_drain_duration()->set_seconds(5); // the capped full budget
+  event.mutable_idle_gap()->set_nanos(100'000'000);
+  event.set_worker_count(2);
+  event.set_drain_censored(true);
+
+  PhaseSpec warm;
+  warm.set_name("warm");
+  warm.mutable_concurrency()->set_value("2");
+  PhaseSpec spike;
+  spike.set_name("spike");
+  spike.mutable_concurrency()->set_value("4");
+
+  const std::vector<PhaseInterval> intervals =
+      PhaseIntervalsFromBoundaries(/*run_start_unix_ns=*/1'000'000'000,
+                                   /*run_end_unix_ns=*/9'000'000'000, {event}, {warm, spike});
+  ASSERT_EQ(intervals.size(), 2u);
+  // The ENDING interval ("warm") carries the censoring: not drain-complete.
+  EXPECT_FALSE(intervals[0].drain_complete);
+  // The interval the boundary opened ("spike") is unaffected.
+  EXPECT_TRUE(intervals[1].drain_complete);
+
+  SplitAlignment split = WindowPhaseAlignment::AlignSplit(
+      tree, intervals, /*start=*/4'000'000'000, /*end=*/8'000'000'000, "cpu", 0, {}, 0);
+  // The "warm" part [4s, 5s] contains the censored drain: EXCLUDED with the
+  // rule-naming reason; the "spike" part [5s, 8s] stays pure.
+  ASSERT_EQ(split.pure.size(), 1u);
+  ASSERT_EQ(split.excluded.size(), 1u);
+  EXPECT_EQ(split.pure[0].phase_id, "spike");
+  EXPECT_DOUBLE_EQ(split.pure[0].purity_fraction, 1.0);
+  EXPECT_EQ(split.excluded[0].phase_id, "warm");
+  EXPECT_DOUBLE_EQ(split.excluded[0].purity_fraction, 0.0);
+  ASSERT_EQ(split.reasons.size(), 1u);
+  EXPECT_NE(split.reasons[0].find("drain not complete"), std::string::npos) << split.reasons[0];
+}
+
 }  // namespace
 }  // namespace Tui
 }  // namespace Client
