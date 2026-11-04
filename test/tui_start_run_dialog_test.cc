@@ -86,6 +86,47 @@ TEST(InputModeTest, RefreshSuspendedWhileEditing) {
   EXPECT_TRUE(RefreshSuspended(InputMode::kEditingStartRun));
 }
 
+// M2: the phase-vector entry. A two-phase vector builds a phase run whose
+// phases carry through to the StartRequest; the mutually-exclusive top-level
+// duration is never written alongside it; the dialog's validation REUSES the
+// pure phase-vector validation (a duplicate phase name fails it, with the
+// reused message surfacing on the duration field's slot).
+TEST(StartRunDialogTest, PhaseDialogBuildsVectorRequest) {
+  StartRunDialogModel dialog = validDialog();
+  std::vector<nighthawk::client::PhaseSpec> phases;
+  for (const char* name : {"warm", "spike"}) {
+    nighthawk::client::PhaseSpec phase;
+    phase.set_name(name);
+    phase.mutable_duration()->set_seconds(5);
+    phase.set_requests_per_second(100);
+    phase.mutable_concurrency()->set_value("2");
+    phases.push_back(phase);
+  }
+  dialog.set_phases(phases);
+  ASSERT_TRUE(dialog.valid());
+
+  const nighthawk::client::StartRequest request = dialog.build_request();
+  const nighthawk::client::CommandLineOptions& options = request.options();
+  ASSERT_EQ(options.phases_size(), 2);
+  EXPECT_EQ(options.phases(0).name(), "warm");
+  EXPECT_EQ(options.phases(1).name(), "spike");
+  // Mutual exclusion by construction: the vector replaces the top-level
+  // duration; run-level rps stays legal alongside it.
+  EXPECT_FALSE(options.has_duration());
+  EXPECT_EQ(options.requests_per_second().value(), 100);
+  EXPECT_TRUE(options.has_live_streaming());
+
+  // The reused validation rejects a vector the dialog must not start.
+  StartRunDialogModel invalid = validDialog();
+  phases[1].set_name("warm"); // duplicate name
+  invalid.set_phases(phases);
+  EXPECT_FALSE(invalid.valid());
+  EXPECT_NE(StartRunDialogModel::FieldError(invalid, StartRunDialogModel::kDuration)
+                .find("warm"),
+            std::string::npos)
+      << StartRunDialogModel::FieldError(invalid, StartRunDialogModel::kDuration);
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client

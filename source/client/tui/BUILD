@@ -65,6 +65,9 @@ envoy_cc_library(
         "//api/client:base_cc_proto",
         "//api/client:grpc_service_lib",
         "//api/pprof:profile_cc_proto",
+        # The pure phase-vector validation the dialog reuses (proto+absl deps
+        # only — quarantine-clean; the cquery guard proves it).
+        "//source/client:options_validation_phases_lib",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
