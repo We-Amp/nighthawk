@@ -33,10 +33,13 @@ namespace Nighthawk {
 namespace Client {
 namespace Tui {
 
-// The flamegraph pane's interaction state. Paths address the DISPLAYED tree
-// (after zoom re-rooting and collapse); a stored path is re-validated with
-// ResolveSelection against whatever tree it is about to be applied to, so a
-// zoom or a collapse that removes a frame simply drops the selection.
+// The flamegraph pane's interaction state. Paths address the tree AFTER zoom
+// re-rooting but BEFORE collapse pruning (the uncollapsed displayed tree);
+// the renderer translates the selection through the collapse (see
+// CollapseTranslatePath), so a cursor whose frame survives collapse keeps
+// addressing the same frame even when pruned siblings shift indices.
+// ResolveSelection validates a path against the tree it is about to be
+// applied to; a pruned-away frame drops the selection.
 struct FlamegraphViewState {
   // nullopt = the whole tree; a set path zooms by RE-ROOTING the tree at the
   // addressed frame (the addressed frame's subtree becomes the display).
@@ -86,7 +89,26 @@ FoldedTree ZoomToFrame(const FoldedTree& tree, const FramePath& path);
 // below `threshold` (root row included), recursively. Conservation: pruning
 // HIDES a subtree — the value stays counted at the surviving ancestors and
 // tree.total_value is unchanged; the render shows it as blank gap.
+//
+// ADDRESSING: pruning shifts sibling indices. For a well-formed (total-sorted)
+// tree pruning only removes a suffix, so indices are stable — but nothing in
+// this pane may DEPEND on that invariant. Any path expressed against the
+// uncollapsed tree (search hits, diff child_paths, the view-state selection)
+// must be carried through CollapseTranslatePath before it addresses the
+// collapsed tree.
 FoldedTree CollapseBelowThreshold(const FoldedTree& tree, double threshold);
+
+// Translates a path expressed against `uncollapsed` into `collapsed`
+// coordinates: the collapsed tree's children are a subsequence of the
+// uncollapsed children (order preserved; a folded tree has no same-name
+// siblings), so each surviving index re-ranks to its post-collapse position.
+// nullopt when any level of the path was pruned away (or the path is invalid
+// against the uncollapsed tree). The empty path (the root) translates to
+// itself. Idempotence is NOT guaranteed in general — always translate from
+// the uncollapsed coordinates, never re-translate a translated path.
+std::optional<FramePath> CollapseTranslatePath(const FoldedTree& uncollapsed,
+                                               const FoldedTree& collapsed,
+                                               const FramePath& path);
 
 // All paths whose frame function contains `query` (case-insensitive
 // substring), in DFS root-first order. Empty query: no hits.
@@ -95,7 +117,9 @@ std::vector<FramePath> SearchMatches(const FoldedTree& tree, absl::string_view q
 // The scroll row that keeps the selected row inside a `viewport_rows`-tall
 // viewport: starts from state.scroll_row (clamped to the tree's depth), then
 // moves just enough to make the selected row visible. No selection (or the
-// root path): the clamped base scroll. Pass the DISPLAYED tree (zoomed +
+// root path): the clamped base scroll. `state.selected` is read as a path in
+// displayed_tree coordinates (the renderer passes a collapse-translated
+// copy; direct callers must do the same). Pass the DISPLAYED tree (zoomed +
 // collapsed), the same tree the renderer will draw.
 int DeriveScrollRow(const FoldedTree& displayed_tree, const FlamegraphViewState& state,
                     int viewport_rows);
@@ -123,13 +147,18 @@ int DeriveScrollRow(const FoldedTree& displayed_tree, const FlamegraphViewState&
 // Render contract: one row per stack depth, rectangle width proportional to
 // total_value's share of the displayed root; frames under three columns (or
 // whose label cannot fit) render as '_' blocks with the band's density;
-// labels truncate with "..." at the cell width; the selected frame is
+// labels truncate with "..." and RESERVE ONE TRAILING CELL for the band's
+// density glyph, so even a fully truncated diff cell keeps its non-color
+// hue/band signal (the monochrome-paste promise); the selected frame is
 // inverted + bold with a '>' label prefix; search matches invert; diff_mode
-// colors the (zoomed/collapsed) tree per the palette above and adds the
-// two-row legend; unsymbolized trees render the explicit banner first.
-// Headers/legend live on the top rows; frame rows scroll per
-// DeriveScrollRow. diff only consulted when state.diff_mode is set; an
-// incomparable result renders the non-comparable mark instead of the legend.
+// colors the tree per the palette above (mark keys are translated through
+// zoom and collapse) and adds the two-row legend; unsymbolized trees render
+// the explicit banner first. The header carries overflow honesty cues: rows
+// scrolled out of the viewport ("rows N-M of D") and root rectangles wider
+// than the terminal ("+K roots hidden"). Headers/legend live on the top
+// rows; frame rows scroll per DeriveScrollRow. diff only consulted when
+// state.diff_mode is set; an incomparable result renders the
+// non-comparable mark instead of the legend.
 ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewState& state,
                                 const DifferentialResult* diff, int width, int height);
 
@@ -137,21 +166,32 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
 
 // A DifferentialResult's frame pointers point into the window vector of a
 // ProfileWindowStore snapshot; a diff set is therefore only ever held
-// TOGETHER WITH the snapshot that owns it. This struct is that pairing —
-// the pane (task 6 wiring) stores a DiffOverlay, never a bare result.
-struct DiffOverlay {
-  // The store snapshot that owns every DifferentialNodeDiff::frame in
-  // `result`. Never null (PairDiffOverlay enforces).
-  std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot;
-  DifferentialResult result;
-};
+// TOGETHER WITH the snapshot that owns it. The pairing is TYPE-LEVEL: the
+// constructor is private and DiffOverlay::Pair is the only way to build one,
+// so a bare result cannot masquerade as an owned overlay. The pane (task 6
+// wiring) stores a DiffOverlay, never a bare result.
+class DiffOverlay {
+ public:
+  // Pairs a differential with the store snapshot that owns its frame
+  // pointers. kInvalidArgument when the snapshot is null — the renderer
+  // would otherwise be handed dangling frames.
+  static absl::StatusOr<DiffOverlay> Pair(
+      std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot,
+      DifferentialResult result);
 
-// Pairs a differential with the store snapshot that owns its frame pointers.
-// kInvalidArgument when the snapshot is null — the renderer would otherwise
-// be handed dangling frames.
-absl::StatusOr<DiffOverlay> PairDiffOverlay(
-    std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot,
-    DifferentialResult result);
+  // The owning store snapshot — hold it for as long as result() is used.
+  const std::shared_ptr<const std::vector<ProfileWindow>>& snapshot() const;
+  // The paired differential. Valid while this DiffOverlay (and its snapshot)
+  // is alive.
+  const DifferentialResult& result() const;
+
+ private:
+  DiffOverlay(std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot,
+              DifferentialResult result);
+
+  std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot_;
+  DifferentialResult result_;
+};
 
 }  // namespace Tui
 }  // namespace Client
