@@ -139,6 +139,20 @@ public:
    */
   const std::vector<uint64_t>& phaseGateExceededCounts() const { return phase_gate_exceeded_; }
 
+  /**
+   * FORK-ONLY (We-Amp): per-phase worker-subset bookkeeping (M2 Task 6), one
+   * entry per phase in order: the active worker count, whether it changed
+   * against the prior phase, and whether workers beyond the high-water mark
+   * cold-started at the boundary (rejoins within the mark come back on
+   * preserved pools and do not set it; see computeWorkerSubsets). This is
+   * the engine-side data that feeds PhaseMetadata's worker_count /
+   * workers_changed_vs_prior_phase / new_workers_cold_started fields (M2
+   * Task 4 wiring) and the TUI's cold-start line (M2 Task 7).
+   */
+  const std::vector<PhaseWorkerSubset>& phaseWorkerSubsets() const {
+    return phase_worker_subsets_;
+  }
+
 private:
   // Use CreateProcessImpl to construct an instance of ProcessImpl.
   ProcessImpl(const Options& options, Envoy::Event::TimeSystem& time_system,
@@ -199,6 +213,14 @@ private:
   std::function<void(const PhaseEvent&)> phase_event_cb_;
   std::vector<PhaseBoundaryTiming> boundary_timings_;
   std::vector<uint64_t> phase_gate_exceeded_;
+  // FORK-ONLY (We-Amp): M2 Task 6 worker subsets. Filled by runPhases.
+  std::vector<PhaseWorkerSubset> phase_worker_subsets_;
+  // Per worker (indexed like workers_), the phase indexes this worker began,
+  // in begin order. The workers keep their per-phase vectors POSITIONAL over
+  // the phases they began; this maps positions to phase indexes for the
+  // per-phase folds (statistics, durations, gate counts) -- a
+  // removed-and-rejoined worker begins a non-contiguous set.
+  std::vector<std::vector<uint32_t>> worker_begun_phases_;
   std::vector<std::shared_future<void>> worker_ready_futures_;
   mutable std::mutex current_phase_id_mutex_;
   std::string current_phase_id_{"main"};

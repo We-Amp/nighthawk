@@ -56,6 +56,31 @@ struct PhaseBoundaryTiming {
   bool drain_censored{false};
 };
 
+// FORK-ONLY (We-Amp): per-phase worker-subset bookkeeping (M2 Task 6). One
+// entry per phase, in order. Feeds PhaseMetadata's worker_count /
+// workers_changed_vs_prior_phase / new_workers_cold_started fields (M2 Task 4
+// wiring) and the TUI's cold-start surfacing (M2 Task 7).
+struct PhaseWorkerSubset {
+  // Workers active in the phase: the declared per-phase concurrency, or the
+  // bootstrapped count when the phase declares none.
+  uint32_t worker_count{0};
+  bool workers_changed_vs_prior_phase{false};
+  bool new_workers_cold_started{false};
+};
+
+// Pure: derives the active worker count per phase and the boundary flags.
+// Subset convention: the active subset of a phase is the worker PREFIX
+// [0, worker_count) -- it maximizes survivor overlap, so pools carry warm
+// across same-count boundaries and removed workers idle beyond the prefix.
+// The first phase marks neither flag (the run start is not a boundary).
+// new_workers_cold_started tracks the high-water mark: workers beyond it
+// open their first connections at this boundary (a true cold start);
+// workers rejoining within the high-water mark come back on preserved pools
+// (warm) and do not set it. Never hidden: the flags surface at the boundary
+// log line and in the per-phase metadata.
+std::vector<PhaseWorkerSubset> computeWorkerSubsets(
+    const std::vector<nighthawk::client::PhaseSpec>& phases, uint32_t bootstrapped_workers);
+
 class PhaseOrchestrator {
 public:
   using EventSink = std::function<void(const PhaseEvent&)>;
@@ -113,6 +138,10 @@ private:
 // which ends at the run teardown rather than at a boundary drain. Pool
 // health is appended by the caller, which reads the engine's pool counters.
 //
+// `worker_subset` is the phase's worker-subset bookkeeping (M2 Task 6): it
+// carries the ACTIVE worker count and the boundary's worker-set deltas,
+// which are surfaced into the metadata, never silent.
+//
 // Claim discipline (spec 8.2): reset_or_timed_out counts the phase's stream
 // resets, plus -- only when the boundary drain was censored -- the requests
 // still in flight when the deadline fired (initiated minus completed; at an
@@ -127,9 +156,9 @@ private:
 // queued).
 nighthawk::client::PhaseMetadata
 BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
-                   const PhaseBoundaryTiming* boundary, uint32_t worker_count, uint64_t initiated,
-                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded,
-                   uint64_t inherited_straggler_completions);
+                   const PhaseBoundaryTiming* boundary, const PhaseWorkerSubset& worker_subset,
+                   uint64_t initiated, uint64_t completed, uint64_t stream_resets,
+                   uint64_t gate_exceeded, uint64_t inherited_straggler_completions);
 
 } // namespace Client
 } // namespace Nighthawk

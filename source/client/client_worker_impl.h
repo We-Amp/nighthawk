@@ -126,6 +126,7 @@ public:
   std::future<PhaseDrainAck> beginPhaseAsync(uint32_t phase_index,
                                              const nighthawk::client::PhaseSpec& phase,
                                              bool final_phase) override;
+  void goIdleAsync(bool exit_dispatcher) override;
   const std::vector<StatisticPtrMap>& phaseStatistics() const override {
     return phase_statistics_;
   }
@@ -162,6 +163,12 @@ private:
   void beginPhase(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
                   bool final_phase);
   void startDrainWatch(int64_t stop_monotonic_ns);
+  // FORK-ONLY (We-Amp): M2 Task 6 worker subsets. Runs on this worker's own
+  // dispatcher (posted via goIdleAsync): cancels the boundary drain watch of
+  // the last phase, emits the fold's final live partial, stops the live
+  // snapshot timer, and optionally exits the dispatcher (final phase) so the
+  // run's join sees this worker complete.
+  void goIdle(bool exit_dispatcher);
 
   Envoy::Api::Api& api_;
   std::unique_ptr<Envoy::TimeSource> time_source_;

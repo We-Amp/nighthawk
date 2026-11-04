@@ -15,6 +15,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +32,8 @@
 #include "source/client/output_collector_impl.h"
 #include "source/client/phase_orchestrator.h"
 #include "source/client/process_impl.h"
+
+#include "source/common/protobuf/protobuf.h"
 
 #include "test/mocks/event/mocks.h"
 #include "test/test_common/environment.h"
@@ -220,6 +223,8 @@ public:
     std::vector<nighthawk::client::LiveSnapshot> live_snapshots;
     // FORK-ONLY (M2 Task 5): per-phase counts of gate-refused starts.
     std::vector<uint64_t> phase_gate_exceeded;
+    // FORK-ONLY (M2 Task 6): per-phase worker-subset bookkeeping.
+    std::vector<PhaseWorkerSubset> phase_worker_subsets;
   };
 
   RunOutcome runPhases(
@@ -274,6 +279,7 @@ public:
     outcome.output = collector.toProto();
     outcome.boundary_timings = process_impl.phaseBoundaryTimings();
     outcome.phase_gate_exceeded = process_impl.phaseGateExceededCounts();
+    outcome.phase_worker_subsets = process_impl.phaseWorkerSubsets();
     process->shutdown();
     return outcome;
   }
@@ -565,6 +571,226 @@ TEST_F(PhaseRunTest, NoClusterMutationAtBoundaries) {
         << "connection churn at boundary " << boundary
         << " (cluster mutation / destructive drain violation)";
   }
+}
+
+// --- M2 Task 6: worker subsets -- bootstrap at max, start/stop per phase. ---
+
+// A phase vector with an explicit per-phase concurrency per entry.
+nighthawk::client::CommandLineOptions makeSubsetPhaseOptions(
+    const std::string& uri, const std::vector<uint32_t>& concurrencies) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(uri);
+  cmd.mutable_connections()->set_value(4);
+  cmd.mutable_timeout()->set_seconds(5);
+  for (uint32_t i = 0; i < concurrencies.size(); ++i) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(fmt::format("phase{}", i));
+    phase->mutable_duration()->set_seconds(2);
+    phase->set_requests_per_second(50);
+    phase->mutable_concurrency()->set_value(fmt::format("{}", concurrencies[i]));
+  }
+  return cmd;
+}
+
+const nighthawk::client::Result* findResult(const nighthawk::client::Output& output,
+                                            absl::string_view name) {
+  for (const nighthawk::client::Result& result : output.results()) {
+    if (result.name() == name) {
+      return &result;
+    }
+  }
+  return nullptr;
+}
+
+uint64_t counterValue(const nighthawk::client::Result& result, absl::string_view name) {
+  for (const nighthawk::client::Counter& counter : result.counters()) {
+    if (counter.name() == name) {
+      return counter.value();
+    }
+  }
+  return 0;
+}
+
+// Sample count carried by the phase group's sequencer completion statistic.
+uint64_t sequencerCallbackCount(const nighthawk::client::Output& output,
+                                absl::string_view group_name) {
+  const nighthawk::client::Result* result = findResult(output, group_name);
+  if (result == nullptr) {
+    return 0;
+  }
+  for (const nighthawk::client::Statistic& statistic : result->statistics()) {
+    if (statistic.id() == "sequencer.callback") {
+      return statistic.count();
+    }
+  }
+  return 0;
+}
+
+// Three phases declaring concurrency [2, 4, 2]: four workers are bootstrapped
+// (the max over phases), phase traffic comes from exactly the declared subset
+// per phase, and the workers that sit out the last phase keep their
+// cumulative counters.
+TEST_F(PhaseRunTest, SubsetPhasesRunCorrectWorkers) {
+  RunOutcome outcome = runPhases(makeSubsetPhaseOptions(listener().uri(), {2, 4, 2}));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(6u, outcome.events.size());
+
+  // Bootstrap at max-over-phases: a result group per bootstrapped worker,
+  // four of them, even though no phase declares more than 4 and the first
+  // and last phases use only 2.
+  int worker_groups = 0;
+  for (const nighthawk::client::Result& result : outcome.output.results()) {
+    if (absl::StartsWith(result.name(), "worker_")) {
+      worker_groups++;
+    }
+  }
+  EXPECT_EQ(4, worker_groups);
+
+  // Per-phase request traffic (per-worker rps 50, 2s per phase): phase 1
+  // runs twice the workers of phases 0 and 2, so it serves roughly twice the
+  // completions.
+  const int64_t p0_from = outcome.events[0].wall_time_unix_ns;
+  const int64_t p0_to = outcome.events[1].wall_time_unix_ns;
+  const int64_t p1_from = outcome.events[2].wall_time_unix_ns;
+  const int64_t p1_to = outcome.events[3].wall_time_unix_ns;
+  const int64_t p2_from = outcome.events[4].wall_time_unix_ns;
+  const int64_t p2_to = outcome.events[5].wall_time_unix_ns;
+  const std::vector<RequestSpan> spans = listener().requestSpans();
+  const int p0_completions = completionsInWindow(spans, p0_from, p0_to);
+  const int p1_completions = completionsInWindow(spans, p1_from, p1_to);
+  const int p2_completions = completionsInWindow(spans, p2_from, p2_to);
+  EXPECT_GT(p0_completions, 50);
+  EXPECT_GT(p1_completions, 50);
+  EXPECT_GT(p2_completions, 50);
+  EXPECT_GT(p1_completions * 2, p0_completions * 3)
+      << "phase 1 did not serve ~2x the traffic of phase 0 (subset not applied)";
+  EXPECT_LT(p2_completions * 3, p1_completions * 2)
+      << "phase 2 did not shrink back to the [2]-worker subset";
+
+  // The workers beyond phase 2's subset sat it out: worker_0 ran all three
+  // phases, worker_2 only the first two, on identical per-phase load.
+  const nighthawk::client::Result* worker_0 = findResult(outcome.output, "worker_0");
+  const nighthawk::client::Result* worker_2 = findResult(outcome.output, "worker_2");
+  ASSERT_NE(worker_0, nullptr);
+  ASSERT_NE(worker_2, nullptr);
+  const uint64_t w0_requests = counterValue(*worker_0, "benchmark.http_2xx");
+  const uint64_t w2_requests = counterValue(*worker_2, "benchmark.http_2xx");
+  EXPECT_GT(w0_requests, w2_requests);
+  EXPECT_GT(w2_requests, 0u) << "worker_2 never ran any phase";
+}
+
+// A worker removed at a phase boundary folds its last phase's slab fully into
+// that phase's result, and its cumulative counters survive into the final
+// output. Phase 1 here runs a single worker; the removed worker's phase-0
+// work must not leak into phase 1's group.
+TEST_F(PhaseRunTest, RemovedWorkerFoldsIntoLastPhase) {
+  RunOutcome outcome = runPhases(makeSubsetPhaseOptions(listener().uri(), {2, 1}));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(4u, outcome.events.size());
+
+  // Phase 0 ran two workers at rps 50 for 2s (~200 completions); phase 1 ran
+  // the single remaining worker (~100). The removed worker's slab lands in
+  // phase 0's group only.
+  const uint64_t p0 = sequencerCallbackCount(outcome.output, "phase_0_phase0");
+  const uint64_t p1 = sequencerCallbackCount(outcome.output, "phase_1_phase1");
+  EXPECT_GT(p0, 150u) << "phase 0 group missing the removed worker's slab";
+  EXPECT_LT(p0, 300u);
+  EXPECT_GT(p1, 40u) << "phase 1 group missing entirely";
+  EXPECT_LT(p1, 160u) << "phase 1 group holds more than the single active worker's slab";
+
+  // The removed worker's cumulative counters are preserved in the final
+  // output: worker_1 shows its phase-0 work, worker_0 shows more (it also ran
+  // phase 1).
+  const nighthawk::client::Result* worker_0 = findResult(outcome.output, "worker_0");
+  const nighthawk::client::Result* worker_1 = findResult(outcome.output, "worker_1");
+  ASSERT_NE(worker_0, nullptr);
+  ASSERT_NE(worker_1, nullptr);
+  const uint64_t w0_requests = counterValue(*worker_0, "benchmark.http_2xx");
+  const uint64_t w1_requests = counterValue(*worker_1, "benchmark.http_2xx");
+  EXPECT_GT(w1_requests, 0u) << "removed worker's cumulative counters lost";
+  EXPECT_GT(w0_requests, w1_requests);
+}
+
+// New workers joining at a later phase are surfaced, never silent: the
+// engine-side per-phase subset bookkeeping that feeds PhaseMetadata
+// (M2 Task 4 wiring) marks the growth as a worker-count change with a cold
+// start, and an unchanged subset marks neither.
+TEST_F(PhaseRunTest, ColdStartSurfacedInPhaseMetadata) {
+  RunOutcome outcome = runPhases(makeSubsetPhaseOptions(listener().uri(), {1, 2}));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(2u, outcome.phase_worker_subsets.size());
+  EXPECT_EQ(1u, outcome.phase_worker_subsets[0].worker_count);
+  EXPECT_FALSE(outcome.phase_worker_subsets[0].workers_changed_vs_prior_phase);
+  EXPECT_FALSE(outcome.phase_worker_subsets[0].new_workers_cold_started);
+  EXPECT_EQ(2u, outcome.phase_worker_subsets[1].worker_count);
+  EXPECT_TRUE(outcome.phase_worker_subsets[1].workers_changed_vs_prior_phase);
+  EXPECT_TRUE(outcome.phase_worker_subsets[1].new_workers_cold_started)
+      << "cold start of the joining worker not surfaced";
+}
+
+// After a removed worker's final partial is folded, the live aggregation
+// excludes it without losing its contribution: counter sums stay monotonic
+// across the boundary and match the cumulative expectations at the end (no
+// double-count of the final partial).
+TEST_F(PhaseRunTest, LiveAggregationIgnoresIdleWorkers) {
+  nighthawk::client::CommandLineOptions cmd = makeSubsetPhaseOptions(listener().uri(), {2, 1});
+  cmd.mutable_live_streaming();
+  cmd.mutable_stats_flush_interval()->set_value(1);
+  RunOutcome outcome = runPhases(cmd, /*sample_live_snapshots=*/true);
+  ASSERT_TRUE(outcome.success);
+
+  std::vector<uint64_t> totals;
+  {
+    std::lock_guard<std::mutex> lock(outcome_mutex);
+    for (const nighthawk::client::LiveSnapshot& snapshot : outcome.live_snapshots) {
+      auto it = snapshot.counters().find("benchmark.http_2xx");
+      if (it != snapshot.counters().end()) {
+        totals.push_back(it->second);
+      }
+    }
+  }
+  ASSERT_GT(totals.size(), 2u);
+  for (size_t i = 1; i < totals.size(); ++i) {
+    EXPECT_GE(totals[i], totals[i - 1])
+        << "live counter sum decreased at sample " << i
+        << " (removed worker double-counted or dropped)";
+  }
+
+  // The final live total matches the cumulative per-worker counters of the
+  // final output (the removed worker counted exactly once).
+  const nighthawk::client::Result* worker_0 = findResult(outcome.output, "worker_0");
+  const nighthawk::client::Result* worker_1 = findResult(outcome.output, "worker_1");
+  ASSERT_NE(worker_0, nullptr);
+  ASSERT_NE(worker_1, nullptr);
+  const uint64_t output_total =
+      counterValue(*worker_0, "benchmark.http_2xx") + counterValue(*worker_1, "benchmark.http_2xx");
+  EXPECT_GT(output_total, 0u);
+  EXPECT_GE(totals.back(), output_total * 9 / 10);
+  EXPECT_LE(totals.back(), output_total + output_total / 10)
+      << "live aggregation diverged from the cumulative counters (fold double-counted)";
+}
+
+// Phase begins are same-instant across the active subset (the documented
+// ruling: the legacy bootstrap-time inter-worker stagger does not apply at
+// phase boundaries). Both workers of a [1, 2] vector run the final phase, so
+// their per-worker result groups carry that phase's first rate-limiter
+// acquisition time; the two must be near-simultaneous.
+TEST_F(PhaseRunTest, SubsetStartIsSameInstant) {
+  RunOutcome outcome = runPhases(makeSubsetPhaseOptions(listener().uri(), {1, 2}));
+  ASSERT_TRUE(outcome.success);
+  const nighthawk::client::Result* worker_0 = findResult(outcome.output, "worker_0");
+  const nighthawk::client::Result* worker_1 = findResult(outcome.output, "worker_1");
+  ASSERT_NE(worker_0, nullptr);
+  ASSERT_NE(worker_1, nullptr);
+  ASSERT_TRUE(worker_0->has_execution_start());
+  ASSERT_TRUE(worker_1->has_execution_start());
+  const int64_t t0 = Envoy::Protobuf::util::TimeUtil::TimestampToNanoseconds(
+      worker_0->execution_start());
+  const int64_t t1 = Envoy::Protobuf::util::TimeUtil::TimestampToNanoseconds(
+      worker_1->execution_start());
+  const int64_t spread_ns = t1 > t0 ? t1 - t0 : t0 - t1;
+  EXPECT_LT(spread_ns, std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count())
+      << "new worker's phase start not same-instant with the survivor's";
 }
 
 // --- PhaseOrchestrator unit tests: the boundary state machine, without a run. ---
@@ -947,7 +1173,8 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
   censored.idle_gap_ns = 1000000;
   censored.drain_censored = true;
   const nighthawk::client::PhaseMetadata censored_metadata =
-      BuildPhaseMetadata(0, spec, &censored, /*worker_count=*/1, /*initiated=*/100,
+      BuildPhaseMetadata(0, spec, &censored, PhaseWorkerSubset{/*worker_count=*/1},
+                         /*initiated=*/100,
                          /*completed=*/97, /*stream_resets=*/1, /*gate_exceeded=*/3,
                          /*inherited_stragglers=*/0);
   EXPECT_EQ(4u, censored_metadata.reset_or_timed_out()); // 1 reset + 3 hung in flight
@@ -970,7 +1197,8 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
   clean.idle_gap_ns = 2000;
   clean.drain_censored = false;
   const nighthawk::client::PhaseMetadata clean_metadata =
-      BuildPhaseMetadata(0, spec, &clean, 1, 100, 100, 1, /*gate_exceeded=*/2,
+      BuildPhaseMetadata(0, spec, &clean, PhaseWorkerSubset{/*worker_count=*/1}, 100, 100, 1,
+                         /*gate_exceeded=*/2,
                          /*inherited_stragglers=*/0);
   EXPECT_EQ(1u, clean_metadata.reset_or_timed_out());
   EXPECT_EQ(2u, clean_metadata.gate_exceeded());
@@ -978,7 +1206,8 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
 
   // The run's final phase has no boundary timing at all.
   const nighthawk::client::PhaseMetadata final_metadata =
-      BuildPhaseMetadata(1, spec, /*boundary=*/nullptr, 1, 50, 50, 0, /*gate_exceeded=*/0,
+      BuildPhaseMetadata(1, spec, /*boundary=*/nullptr, PhaseWorkerSubset{/*worker_count=*/1},
+                         50, 50, 0, /*gate_exceeded=*/0,
                          /*inherited_stragglers=*/0);
   EXPECT_EQ(0, final_metadata.drain_duration().seconds());
   EXPECT_EQ(0, final_metadata.drain_duration().nanos());
@@ -1004,7 +1233,8 @@ TEST(BuildPhaseMetadataTest, StragglerCompletionsAreExcludedFromTheSuccessor) {
   clean.idle_gap_ns = 2000;
   clean.drain_censored = false;
   const nighthawk::client::PhaseMetadata successor = BuildPhaseMetadata(
-      1, spec, &clean, 1, /*initiated=*/8, /*completed=*/10, /*stream_resets=*/0,
+      1, spec, &clean, PhaseWorkerSubset{/*worker_count=*/1}, /*initiated=*/8,
+      /*completed=*/10, /*stream_resets=*/0,
       /*gate_exceeded=*/0, /*inherited_stragglers=*/3);
   EXPECT_EQ(7u, successor.completed()); // 10 raw - 3 stragglers
   EXPECT_EQ(8u, successor.initiated());
@@ -1016,7 +1246,8 @@ TEST(BuildPhaseMetadataTest, StragglerCompletionsAreExcludedFromTheSuccessor) {
   // underflowing; the ratio then honestly reads 0 (the phase's only own
   // request did not complete).
   const nighthawk::client::PhaseMetadata floored =
-      BuildPhaseMetadata(1, spec, &clean, 1, /*initiated=*/1, /*completed=*/3,
+      BuildPhaseMetadata(1, spec, &clean, PhaseWorkerSubset{/*worker_count=*/1},
+                         /*initiated=*/1, /*completed=*/3,
                          /*stream_resets=*/0, /*gate_exceeded=*/0,
                          /*inherited_stragglers=*/3);
   EXPECT_EQ(0u, floored.completed());
@@ -1031,10 +1262,74 @@ TEST(BuildPhaseMetadataTest, StragglerCompletionsAreExcludedFromTheSuccessor) {
   censored.phase_id = "phase0";
   censored.drain_censored = true;
   const nighthawk::client::PhaseMetadata predecessor = BuildPhaseMetadata(
-      0, predecessor_spec, &censored, 1, /*initiated=*/10, /*completed=*/7, /*stream_resets=*/1,
+      0, predecessor_spec, &censored, PhaseWorkerSubset{/*worker_count=*/1},
+      /*initiated=*/10, /*completed=*/7, /*stream_resets=*/1,
       /*gate_exceeded=*/0, /*inherited_stragglers=*/0);
   EXPECT_EQ(4u, predecessor.reset_or_timed_out());
   EXPECT_EQ("phase0", predecessor.phase_id());
+}
+
+// ---------------------------------------------------------------------------
+// FORK-ONLY (We-Amp): worker subsets (M2 Task 6).
+// ---------------------------------------------------------------------------
+
+// --- M2 Task 6: the pure worker-subset bookkeeping, without a run. ---
+
+std::vector<nighthawk::client::PhaseSpec>
+subsetSpecs(const std::vector<std::optional<uint32_t>>& concurrencies) {
+  std::vector<nighthawk::client::PhaseSpec> phases;
+  for (size_t i = 0; i < concurrencies.size(); ++i) {
+    nighthawk::client::PhaseSpec phase;
+    phase.set_name(fmt::format("phase{}", i));
+    phase.mutable_duration()->set_seconds(2);
+    phase.set_requests_per_second(50);
+    if (concurrencies[i].has_value()) {
+      phase.mutable_concurrency()->set_value(fmt::format("{}", concurrencies[i].value()));
+    }
+    phases.push_back(phase);
+  }
+  return phases;
+}
+
+TEST(WorkerSubsetTest, SubsetsTrackChangeAndColdStart) {
+  // [2, 4, 2]: growth at phase 1 is a cold start; the shrink at phase 2 is a
+  // change without a cold start.
+  const std::vector<PhaseWorkerSubset> subsets =
+      computeWorkerSubsets(subsetSpecs({2, 4, 2}), /*bootstrapped_workers=*/4);
+  ASSERT_EQ(3, subsets.size());
+  EXPECT_EQ(2, subsets[0].worker_count);
+  EXPECT_FALSE(subsets[0].workers_changed_vs_prior_phase);
+  EXPECT_FALSE(subsets[0].new_workers_cold_started);
+  EXPECT_EQ(4, subsets[1].worker_count);
+  EXPECT_TRUE(subsets[1].workers_changed_vs_prior_phase);
+  EXPECT_TRUE(subsets[1].new_workers_cold_started);
+  EXPECT_EQ(2, subsets[2].worker_count);
+  EXPECT_TRUE(subsets[2].workers_changed_vs_prior_phase);
+  EXPECT_FALSE(subsets[2].new_workers_cold_started);
+}
+
+TEST(WorkerSubsetTest, RejoiningWorkersAreNotColdStarts) {
+  // [4, 2, 4]: the phase-2 growth stays within the high-water mark -- those
+  // workers rejoined on preserved pools, so the flag stays false.
+  const std::vector<PhaseWorkerSubset> subsets =
+      computeWorkerSubsets(subsetSpecs({4, 2, 4}), /*bootstrapped_workers=*/4);
+  ASSERT_EQ(3, subsets.size());
+  EXPECT_FALSE(subsets[1].new_workers_cold_started);
+  EXPECT_TRUE(subsets[1].workers_changed_vs_prior_phase);
+  EXPECT_TRUE(subsets[2].workers_changed_vs_prior_phase);
+  EXPECT_FALSE(subsets[2].new_workers_cold_started);
+}
+
+TEST(WorkerSubsetTest, UndeclaredConcurrencyInheritsBootstrapCount) {
+  const std::vector<PhaseWorkerSubset> subsets =
+      computeWorkerSubsets(subsetSpecs({std::nullopt, 1}), /*bootstrapped_workers=*/3);
+  ASSERT_EQ(2, subsets.size());
+  EXPECT_EQ(3, subsets[0].worker_count);
+  EXPECT_FALSE(subsets[0].workers_changed_vs_prior_phase);
+  EXPECT_FALSE(subsets[0].new_workers_cold_started);
+  EXPECT_EQ(1, subsets[1].worker_count);
+  EXPECT_TRUE(subsets[1].workers_changed_vs_prior_phase);
+  EXPECT_FALSE(subsets[1].new_workers_cold_started);
 }
 
 } // namespace

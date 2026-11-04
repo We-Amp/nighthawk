@@ -93,6 +93,20 @@ public:
                   bool final_phase) PURE;
 
   /**
+   * FORK-ONLY (We-Amp): retires this worker from the phase rotation (M2
+   * Task 6 worker subsets). Posted to the worker's own dispatcher; the task
+   * cancels the boundary drain watch of the worker's last phase, emits one
+   * final live snapshot partial (the fold into the live aggregation), and
+   * stops the live snapshot timer so no post-fold partials are produced.
+   * With `exit_dispatcher` set -- the run's final phase, where the worker
+   * sits out the rest of the run -- the dispatcher is exited afterwards so
+   * the run's join sees the worker complete. Valid to call once the
+   * worker's drain ack for its last phase was collected (or the boundary
+   * was censored).
+   */
+  virtual void goIdleAsync(bool exit_dispatcher) PURE;
+
+  /**
    * FORK-ONLY (We-Amp): per-phase counts of starts refused by the per-phase
    * in-flight gates (M2 Task 5 refuse-and-count ruling: the refusal sheds the
    * offered load and is counted, never queued). One entry per phase begun by

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 
 #include "source/common/common/logger.h"
@@ -25,6 +26,33 @@ int64_t wallNowNs() {
 }
 
 } // namespace
+
+std::vector<PhaseWorkerSubset>
+computeWorkerSubsets(const std::vector<nighthawk::client::PhaseSpec>& phases,
+                     uint32_t bootstrapped_workers) {
+  std::vector<PhaseWorkerSubset> subsets;
+  subsets.reserve(phases.size());
+  uint32_t prior_count = 0;
+  uint32_t high_water_mark = 0;
+  for (const nighthawk::client::PhaseSpec& phase : phases) {
+    PhaseWorkerSubset subset;
+    subset.worker_count = bootstrapped_workers;
+    if (phase.has_concurrency()) {
+      uint32_t declared = 0;
+      if (absl::SimpleAtoi(phase.concurrency().value(), &declared) && declared > 0) {
+        subset.worker_count = declared;
+      }
+    }
+    if (!subsets.empty()) {
+      subset.workers_changed_vs_prior_phase = subset.worker_count != prior_count;
+      subset.new_workers_cold_started = subset.worker_count > high_water_mark;
+    }
+    prior_count = subset.worker_count;
+    high_water_mark = std::max(high_water_mark, subset.worker_count);
+    subsets.push_back(subset);
+  }
+  return subsets;
+}
 
 PhaseOrchestrator::PhaseOrchestrator(const std::vector<nighthawk::client::PhaseSpec>& phases,
                                      EventSink event_sink)
@@ -105,9 +133,9 @@ void PhaseOrchestrator::markFinalPhaseComplete() {
 
 nighthawk::client::PhaseMetadata
 BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
-                   const PhaseBoundaryTiming* boundary, uint32_t worker_count, uint64_t initiated,
-                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded,
-                   uint64_t inherited_straggler_completions) {
+                   const PhaseBoundaryTiming* boundary, const PhaseWorkerSubset& worker_subset,
+                   uint64_t initiated, uint64_t completed, uint64_t stream_resets,
+                   uint64_t gate_exceeded, uint64_t inherited_straggler_completions) {
   nighthawk::client::PhaseMetadata metadata;
   metadata.set_phase_id(phase_spec.name());
   metadata.set_phase_index(phase_index);
@@ -123,11 +151,14 @@ BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& pha
       metadata.mutable_idle_gap()->set_nanos(boundary->idle_gap_ns % 1000000000);
     }
   }
-  metadata.set_worker_count(worker_count);
-  // Worker-set deltas are Task 6's bookkeeping; a fixed worker set has
-  // neither changed members nor cold starts.
-  metadata.set_workers_changed_vs_prior_phase(false);
-  metadata.set_new_workers_cold_started(false);
+  // Task 6's worker-subset bookkeeping: worker_count is the phase's ACTIVE
+  // subset, and the boundary's worker-set deltas are surfaced, never silent
+  // (a cold start is a joining worker opening its first connections at this
+  // boundary; a rejoin within the high-water mark comes back warm and sets
+  // only the changed flag).
+  metadata.set_worker_count(worker_subset.worker_count);
+  metadata.set_workers_changed_vs_prior_phase(worker_subset.workers_changed_vs_prior_phase);
+  metadata.set_new_workers_cold_started(worker_subset.new_workers_cold_started);
   metadata.set_initiated(initiated);
   // Straggler completions inherited from a censored predecessor boundary are
   // excluded: the predecessor already counted them in its reset_or_timed_out

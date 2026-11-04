@@ -137,9 +137,9 @@ public:
   static uint32_t determineConcurrency(const Options& options) {
     // FORK-ONLY (We-Amp): with a phase vector the top-level concurrency is
     // rejected by validation, so the worker count is the maximum concurrency
-    // declared over the phases. (M2 Task 6 owns the bootstrap-at-max /
-    // start-stop-subset semantics on top of this count; until then every
-    // phase runs on every worker.)
+    // declared over the phases. (M2 Task 6: this bootstraps the full fleet --
+    // phases activate the declared prefix subset per phase and retire the
+    // rest; see runPhases / computeWorkerSubsets.)
     if (options.hasPhaseVector()) {
       uint32_t declared_max = 0;
       bool any_declared = false;
@@ -921,6 +921,11 @@ void ProcessImpl::runPhases() {
   const std::chrono::milliseconds drain_budget(options_.timeout());
   PhaseOrchestrator orchestrator(
       options_.phases(), [this](const PhaseEvent& event) { emitPhaseEvent(event); });
+  // FORK-ONLY (We-Amp): worker subsets (M2 Task 6). The bootstrap already
+  // constructed the max-over-phases worker count (determineConcurrency);
+  // phases activate the declared PREFIX of that fleet and retire the rest.
+  phase_worker_subsets_ = computeWorkerSubsets(options_.phases(), workers_.size());
+  worker_begun_phases_.assign(workers_.size(), {});
   // Every worker must have finished thread-local initialization and entered
   // its dispatcher loop before the first begin-phase post (the warmup's
   // nested dispatcher run must not pick it up). These futures always
@@ -946,9 +951,48 @@ void ProcessImpl::runPhases() {
     setCurrentPhaseId(phase.name());
     orchestrator.markNextPhaseStarted(phase_index);
     const bool final_phase = orchestrator.isFinalPhase(phase_index);
+    // M2 Task 6: activate this phase's subset (the worker prefix) and retire
+    // the workers it drops. The posts are one-way, per-dispatcher FIFO; the
+    // retiring workers' boundary drain for their last phase was already
+    // collected at the previous boundary.
+    const PhaseWorkerSubset& subset = phase_worker_subsets_[phase_index];
+    const uint32_t active_workers = subset.worker_count;
+    const uint32_t prior_active =
+        phase_index == 0 ? 0 : phase_worker_subsets_[phase_index - 1].worker_count;
+    if (final_phase) {
+      // Every worker outside the final subset sits out the rest of the run:
+      // fold its final live partial and let it exit, so the run's join (which
+      // waits on all workers) completes.
+      for (uint32_t w = active_workers; w < workers_.size(); ++w) {
+        workers_[w]->goIdleAsync(/*exit_dispatcher=*/true);
+      }
+    } else if (active_workers < prior_active) {
+      // Removed workers: their slabs stay folded into the phase that just
+      // ended; they idle (no sequencer, no requests) on their live
+      // dispatchers, ready for a later phase to re-activate them.
+      for (uint32_t w = active_workers; w < prior_active; ++w) {
+        workers_[w]->goIdleAsync(/*exit_dispatcher=*/false);
+      }
+    }
+    if (subset.new_workers_cold_started) {
+      // Surfaced, never silent (spec 8.4/Task 6): the joining workers open
+      // their first connections at this boundary.
+      ENVOY_LOG(info, "phase {} ('{}'): {} workers active, {} new worker(s) cold-starting",
+                phase_index, phase.name(), active_workers, active_workers - prior_active);
+    } else if (active_workers > prior_active) {
+      // A growth within the high-water mark: rejoined workers on preserved
+      // (warm) pools -- a worker-count change, but not a cold start.
+      ENVOY_LOG(info,
+                "phase {} ('{}'): {} workers active, {} worker(s) rejoining on preserved pools",
+                phase_index, phase.name(), active_workers, active_workers - prior_active);
+    } else if (active_workers < prior_active) {
+      ENVOY_LOG(info, "phase {} ('{}'): {} workers active, {} worker(s) retired to idle",
+                phase_index, phase.name(), active_workers, prior_active - active_workers);
+    }
     std::vector<std::future<PhaseDrainAck>> drain_acks;
-    for (auto& worker : workers_) {
-      drain_acks.push_back(worker->beginPhaseAsync(phase_index, effective_phase, final_phase));
+    for (uint32_t w = 0; w < active_workers; ++w) {
+      worker_begun_phases_[w].push_back(phase_index);
+      drain_acks.push_back(workers_[w]->beginPhaseAsync(phase_index, effective_phase, final_phase));
     }
     if (final_phase) {
       // The final phase keeps today's exact behavior: its sequencer stops
@@ -969,12 +1013,18 @@ void ProcessImpl::runPhases() {
 
   // FORK-ONLY (We-Amp): fold the per-phase gate-refusal counts over all
   // workers (the workers are joined once the final phase completed; M2 Task
-  // 4's PhaseMetadata surfaces these as gate_exceeded).
+  // 4's PhaseMetadata surfaces these as gate_exceeded). The workers keep
+  // their per-phase counts positional over the phases they began; map the
+  // positions through worker_begun_phases_ (a removed-and-rejoined worker
+  // begins a non-contiguous set).
   phase_gate_exceeded_.assign(orchestrator.phaseCount(), 0);
-  for (auto& worker : workers_) {
-    const std::vector<uint64_t> worker_counts = worker->phaseGateExceededCounts();
-    for (size_t i = 0; i < worker_counts.size() && i < phase_gate_exceeded_.size(); ++i) {
-      phase_gate_exceeded_[i] += worker_counts[i];
+  for (size_t w = 0; w < workers_.size(); ++w) {
+    const std::vector<uint64_t> worker_counts = workers_[w]->phaseGateExceededCounts();
+    const std::vector<uint32_t>& begun = worker_begun_phases_[w];
+    for (size_t p = 0; p < worker_counts.size() && p < begun.size(); ++p) {
+      if (begun[p] < phase_gate_exceeded_.size()) {
+        phase_gate_exceeded_[begun[p]] += worker_counts[p];
+      }
     }
   }
 
@@ -1492,14 +1542,32 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
       uint64_t initiated = 0;
       uint64_t completed = 0;
       uint64_t stream_resets = 0;
-      for (auto& worker : workers_) {
+      for (size_t w = 0; w < workers_.size(); ++w) {
+        auto& worker = workers_[w];
         const std::vector<StatisticPtrMap>& phase_statistics = worker->phaseStatistics();
-        if (phase_index >= phase_statistics.size() ||
-            phase_index >= worker->phaseExecutionDurations().size()) {
+        // The worker's per-phase vectors are positional over the phases it
+        // began (M2 Task 6 subsets: a removed-and-rejoined worker begins a
+        // non-contiguous set); map this phase's slot through the begin
+        // bookkeeping. Workers that never began this phase (removed before
+        // it) contribute nothing to it -- their slabs already live in the
+        // phases they ran.
+        uint32_t slot = 0;
+        bool began_this_phase = false;
+        for (const uint32_t begun : worker_begun_phases_[w]) {
+          if (begun == phase_index) {
+            began_this_phase = true;
+            break;
+          }
+          slot++;
+        }
+        if (!began_this_phase || slot >= phase_statistics.size() ||
+            slot >= worker->phaseExecutionDurations().size()) {
           continue;
         }
-        // Sequencer statistics of this phase.
-        for (const auto& [id, statistic] : phase_statistics[phase_index]) {
+        // Sequencer statistics of this phase, at the worker's positional
+        // slot for it (mapped above: a removed-and-rejoined worker begins a
+        // non-contiguous set, M2 Task 6).
+        for (const auto& [id, statistic] : phase_statistics[slot]) {
           combineStatisticIntoMap(merged_statistics, id, *statistic);
         }
         // Benchmark-client slabs of this phase (matched by phase id; the
@@ -1516,7 +1584,7 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
           stream_resets += slab.stream_resets;
         }
         total_phase_duration +=
-            std::chrono::nanoseconds(worker->phaseExecutionDurations()[phase_index]);
+            std::chrono::nanoseconds(worker->phaseExecutionDurations()[slot]);
         contributing_workers++;
       }
       if (contributing_workers == 0) {
@@ -1558,14 +1626,20 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
           }
         }
       }
+      // M2 Task 6: worker_count is this phase's ACTIVE subset (not the
+      // bootstrapped fleet), and the worker-set delta flags come from the
+      // subset bookkeeping (surfaced, never silent).
       nighthawk::client::PhaseMetadata metadata =
-          BuildPhaseMetadata(phase_index, phase, boundary, workers_.size(), initiated, completed,
-                             stream_resets,
+          BuildPhaseMetadata(phase_index, phase, boundary, phase_worker_subsets_[phase_index],
+                             initiated, completed, stream_resets,
                              phase_index < phase_gate_exceeded_.size()
                                  ? phase_gate_exceeded_[phase_index]
                                  : 0,
                              inherited_stragglers);
-      for (uint32_t worker_number = 0; worker_number < workers_.size(); ++worker_number) {
+      // One pool-health entry per worker ACTIVE in the phase (the prefix
+      // subset); retired workers carry no phase traffic.
+      const uint32_t phase_active_workers = phase_worker_subsets_[phase_index].worker_count;
+      for (uint32_t worker_number = 0; worker_number < phase_active_workers; ++worker_number) {
         *metadata.add_pool_health() = readWorkerPoolHealth(store_root_, worker_number);
       }
       collector.addPhaseMetadata(std::move(metadata));

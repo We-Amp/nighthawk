@@ -229,9 +229,43 @@ std::future<PhaseDrainAck> ClientWorkerImpl::beginPhaseAsync(
   return future;
 }
 
+void ClientWorkerImpl::goIdleAsync(bool exit_dispatcher) {
+  dispatcher_->post([this, exit_dispatcher]() { goIdle(exit_dispatcher); });
+}
+
+void ClientWorkerImpl::goIdle(bool exit_dispatcher) {
+  if (drain_watch_ != nullptr) {
+    drain_watch_->cancel();
+    drain_watch_.reset();
+  }
+  // The fold (M2 Task 6): one final live partial carrying this worker's
+  // frozen cumulative values, then silence -- no post-fold partials, so the
+  // live aggregation cannot double-count the worker after its removal.
+  emitLiveSnapshotPartial();
+  if (live_snapshot_timer_ != nullptr) {
+    live_snapshot_timer_->disableTimer();
+    live_snapshot_timer_.reset();
+  }
+  ENVOY_LOG(debug, "worker {}: idle after its last phase (exit: {})", worker_number_,
+            exit_dispatcher);
+  if (exit_dispatcher) {
+    // The worker sits out the rest of the run: leave the blocking dispatcher
+    // loop in work() so the run's join sees this worker complete.
+    dispatcher_->exit();
+  }
+}
+
 void ClientWorkerImpl::beginPhase(uint32_t phase_index,
                                   const nighthawk::client::PhaseSpec& phase_spec,
                                   bool final_phase) {
+  // Phase-start ruling (M2 Task 6): phase begins are SAME-INSTANT across the
+  // active subset, including workers joining at this phase. The legacy run
+  // staggers the per-worker sequencer start anchors at BOOTSTRAP
+  // (computeInterWorkerDelay, process_impl.cc); a phase boundary is not a
+  // bootstrap -- every joining sequencer takes its start from its own
+  // dispatcher's now, which lands within microseconds of the survivors'
+  // (the begin posts are issued back-to-back from the orchestrator thread).
+  // Documented as the explicit alternative to staggering subset starts.
   // Cancel the drain watch of the previous boundary (e.g. a censored drain
   // whose hung request never completed). The old watch holds its own
   // boundary's promise by value, so even a firing that slipped through
@@ -275,12 +309,18 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   current_phase_ = phase.get();
   phases_history_.push_back(std::move(phase));
   phase_statistics_.push_back(sequencer_impl.statistics());
+  // The per-phase vectors are POSITIONAL over the phases this worker began
+  // (a removed-and-rejoined worker begins a non-contiguous set, M2 Task 6);
+  // the process maps positions to phase indexes via its own begin
+  // bookkeeping. The stop hook writes through the slot, never the phase
+  // index.
+  const size_t duration_slot = phase_execution_durations_.size();
   phase_execution_durations_.push_back(0);
   sequencer_impl.setExitDispatcherOnStop(final_phase);
-  sequencer_impl.setStopHook([this, final_phase, phase_index](bool /*timed_out*/) {
+  sequencer_impl.setStopHook([this, final_phase, duration_slot](bool /*timed_out*/) {
     // On this dispatcher, inside the sequencer's stop.
     dispatcher_->updateApproximateMonotonicTime();
-    phase_execution_durations_[phase_index] =
+    phase_execution_durations_[duration_slot] =
         static_cast<SequencerImpl&>(current_phase_->sequencer()).executionDuration().count();
     if (final_phase) {
       // The final phase keeps today's exact behavior: the dispatcher exits
