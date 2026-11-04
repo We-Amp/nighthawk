@@ -15,6 +15,12 @@ enum class InputMode {
   // the start-run dialog: while the query is being typed, pane refresh is
   // suspended so live redraw never fights the editor.
   kEditingSearch,
+  // M2 (Task 7): the staged next-phase editor (knobs tab, running runs
+  // only). Same suspension rule; the staged values are preview-only until
+  // the engine confirms a boundary (which in M2 never applies them — the
+  // phase vector is fixed at start; the preview exists so the M3 steering
+  // surface has its state machine already exercised).
+  kEditingStagedPhase,
 };
 
 // True while an input mode owns the keyboard and the pane refresh cadence is
@@ -23,7 +29,8 @@ enum class InputMode {
 // refresh storm, never a stale first frame. The posting side is wired in
 // Task 6's dialog close; Task 7 exercises it by hand.
 inline bool RefreshSuspended(InputMode mode) {
-  return mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch;
+  return mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch ||
+         mode == InputMode::kEditingStagedPhase;
 }
 
 } // namespace Tui

@@ -11,8 +11,10 @@
 
 #include "source/client/tui/flamegraph.h"
 #include "source/client/tui/input_mode.h"
+#include "source/client/tui/knob_pane.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/start_run_dialog.h"
+#include "source/client/tui/status_bar.h"
 
 namespace Nighthawk {
 namespace Client {
@@ -116,7 +118,10 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                                 nighthawk::client::CommandLineOptions{},
                             const OverlayState* overlay = nullptr,
                             const FlamePaneState* flame = nullptr,
-                            absl::string_view profiler_state = "");
+                            absl::string_view profiler_state = "",
+                            const std::vector<PhaseTimelineSegment>* timeline = nullptr,
+                            const std::vector<KnobDisplay>* staged_preview = nullptr,
+                            const std::string* staged_workers_annotation = nullptr);
 
 // The charts tab (tab 0): on a completed run a completion-summary block
 // first (backlog item 7: totals, error ratio, final percentiles, the saved

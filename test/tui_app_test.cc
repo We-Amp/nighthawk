@@ -49,6 +49,7 @@ TEST(KeyMapTest, BindingsMatchTheDocumentedTable) {
       {"p", "start/stop a profile window"},
       {"d", "differential (default: last two pure)"},
       {"N", "noise-floor view (plain n stays dialog)"},
+      {"e", "stage an edit for the next phase (knobs tab; esc discards)"},
   };
   ASSERT_EQ(bindings.size(), expected.size());
   for (size_t i = 0; i < expected.size(); ++i) {
@@ -153,6 +154,55 @@ TEST_F(KeyMapDispatchTest, FlameNavigationWithoutWindowsIsANoOp) {
   // 'd' with fewer than two pure windows refuses with a note, consumed.
   EXPECT_TRUE(Press(ftxui::Event::Character('d')));
   EXPECT_NE(controller_->flameNote().find("pure windows"), std::string::npos)
+      << controller_->flameNote();
+}
+
+// The staged next-phase state machine (M2): edits stage into the preview,
+// the staged state is inspectable, and esc discards EVERYTHING staged. The
+// values are preview-only — nothing here reaches the running engine.
+TEST_F(KeyMapDispatchTest, StagedPhaseEditingStagesAndDiscards) {
+  // Refusal without a live run: an honest note, never a silent no-op, and
+  // the mode stays navigate.
+  EXPECT_TRUE(Press(ftxui::Event::Character('k')));
+  EXPECT_TRUE(Press(ftxui::Event::Character('e')));
+  EXPECT_EQ(state_.mode, InputMode::kNavigate);
+  EXPECT_NE(controller_->flameNote().find("no run to stage for"), std::string::npos)
+      << controller_->flameNote();
+
+  // Enter the editing mode directly (the live-run gate is the controller's;
+  // the state machine below is the model under test).
+  state_.mode = InputMode::kEditingStagedPhase;
+  state_.staged_field = 0;
+  // Field 0 (concurrency): "4" + Enter stages it.
+  EXPECT_TRUE(Press(ftxui::Event::Character('4')));
+  EXPECT_EQ(state_.staged_draft, "4");
+  EXPECT_TRUE(Press(ftxui::Event::Return));
+  EXPECT_EQ(state_.staged_next_phase.name(), "next");
+  EXPECT_EQ(state_.staged_next_phase.concurrency().value(), "4");
+  EXPECT_TRUE(state_.staged_draft.empty());
+  // Tab cycles to field 1 (connections): "6" + Enter stages it too.
+  EXPECT_TRUE(Press(ftxui::Event::Tab));
+  EXPECT_EQ(state_.staged_field, 1);
+  EXPECT_TRUE(Press(ftxui::Event::Character('6')));
+  EXPECT_TRUE(Press(ftxui::Event::Return));
+  EXPECT_EQ(state_.staged_next_phase.connections().value(), 6u);
+  // Esc discards everything staged: the empty spec name is the discarded
+  // state (the preview renders nothing).
+  EXPECT_TRUE(Press(ftxui::Event::Escape));
+  EXPECT_EQ(state_.mode, InputMode::kNavigate);
+  EXPECT_TRUE(state_.staged_next_phase.name().empty());
+  EXPECT_TRUE(state_.staged_draft.empty());
+  EXPECT_EQ(state_.staged_field, 0);
+}
+
+// A staged edit with a non-numeric draft is refused with a note and stages
+// nothing.
+TEST_F(KeyMapDispatchTest, StagedEditRefusesNonNumericDraft) {
+  state_.mode = InputMode::kEditingStagedPhase;
+  EXPECT_TRUE(Press(ftxui::Event::Character('x')));
+  EXPECT_TRUE(Press(ftxui::Event::Return));
+  EXPECT_TRUE(state_.staged_next_phase.name().empty());
+  EXPECT_NE(controller_->flameNote().find("positive integer"), std::string::npos)
       << controller_->flameNote();
 }
 

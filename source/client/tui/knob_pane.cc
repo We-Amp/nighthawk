@@ -211,6 +211,25 @@ std::string WorkerSetAnnotation(uint32_t current_workers, uint32_t staged_worker
   return "";
 }
 
+ftxui::Element RenderNextPhasePreviewBlock(const std::vector<KnobDisplay>& preview_knobs,
+                                           absl::string_view workers_annotation) {
+  if (preview_knobs.empty()) {
+    return ftxui::emptyElement();
+  }
+  std::vector<ftxui::Element> rows;
+  // The header states the preview's contract: next phase only, discardable,
+  // nothing marked until the engine confirms the boundary.
+  rows.push_back(ftxui::text(
+      "[staged: next phase -- applies at the next boundary only; discardable]"));
+  for (const KnobDisplay& knob : preview_knobs) {
+    rows.push_back(ftxui::text(knobLine(knob)));
+  }
+  if (!workers_annotation.empty()) {
+    rows.push_back(ftxui::text(std::string(workers_annotation)));
+  }
+  return ftxui::vbox(std::move(rows));
+}
+
 ftxui::Element RenderNextPhasePreview(const nighthawk::client::PhaseSpec& staged,
                                       const nighthawk::client::CommandLineOptions& run_options,
                                       uint32_t current_workers, uint32_t next_phase_index,

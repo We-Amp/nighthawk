@@ -6,6 +6,7 @@
 #include "absl/strings/string_view.h"
 #include "ftxui/dom/elements.hpp"
 
+#include "api/client/live.pb.h"
 #include "api/client/output.pb.h"
 #include "api/client/options.pb.h"
 #include "source/client/tui/input_mode.h"
@@ -45,10 +46,12 @@ inline constexpr int kStatusBarFlushIntervalSeconds = 1;
 // "window open <n>s" | "folding..."; empty renders "idle"). The M1 SUT-stats
 // cells (reset-or-label-set-change marker, histogram-drop count) render from
 // the model's scrape state. Pure function, no terminal I/O.
+struct PhaseTimelineSegment;
 ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
                                absl::string_view session_path, absl::string_view uri = "",
                                int duration_seconds = 0,
-                               absl::string_view profiler_state = "");
+                               absl::string_view profiler_state = "",
+                               const std::vector<PhaseTimelineSegment>* timeline = nullptr);
 
 // ---------------------------------------------------------------------------
 // M2: the phase timeline (spec §4 layout contract). One entry per phase
@@ -103,6 +106,28 @@ struct PhaseTimelineSegment {
 // cumulative counts out of the successor's sum). Pure.
 std::vector<PhaseTimelineSegment> PhaseTimelineSegments(
     const std::vector<nighthawk::client::PhaseSpec>& specs,
+    const std::vector<nighthawk::client::PhaseMetadata>& metadata,
+    absl::string_view current_phase_id);
+
+// The LIVE builder: segments from the streamed boundary events (M2 Task 7
+// wiring), one segment per spec. Boundary fields (drain/idle/cold) come from
+// each event; the §8.4 cmp! mark compares the specs' declared worker counts
+// around the boundary (unparseable/absent concurrency = unknown = no mark).
+// The pool and claim cells stay unset — the engine computes them in the
+// output pass, and the strip renders only what it knows (DQ-3: never a
+// fabricated cell). Pure.
+std::vector<PhaseTimelineSegment> PhaseTimelineSegmentsFromEvents(
+    const std::vector<nighthawk::client::PhaseSpec>& specs,
+    const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
+    absl::string_view current_phase_id);
+
+// The render-side source selection: post-run metadata (complete cells) when
+// the Output has arrived, else the streamed boundary events. Empty input
+// (no phases configured) yields no segments and the bar renders the legacy
+// placeholder row. Pure.
+std::vector<PhaseTimelineSegment> BuildPhaseTimeline(
+    const nighthawk::client::CommandLineOptions& options,
+    const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
     const std::vector<nighthawk::client::PhaseMetadata>& metadata,
     absl::string_view current_phase_id);
 

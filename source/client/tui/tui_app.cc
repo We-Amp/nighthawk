@@ -56,6 +56,24 @@ constexpr auto kScrapeCadence = std::chrono::seconds(kStatusBarFlushIntervalSeco
 // truncation, not skew. Clock-offset uncertainty is recorded only beyond it.
 constexpr int64_t kDateGranularityNs = 1'000'000'000;
 
+// The live run's worker count, for the staged preview's worker-set
+// annotation: the last declared phase's workers when the run carries a phase
+// vector, else the run-level concurrency; 1 when nothing is declared.
+uint32_t CurrentRunWorkerCount(const nighthawk::client::CommandLineOptions& options) {
+  std::string concurrency;
+  if (!options.phases().empty()) {
+    if (options.phases().rbegin()->has_concurrency()) {
+      concurrency = options.phases().rbegin()->concurrency().value();
+    }
+  } else if (options.has_concurrency()) {
+    concurrency = options.concurrency().value();
+  }
+  int parsed = 0;
+  return !concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0
+             ? static_cast<uint32_t>(parsed)
+             : 1;
+}
+
 int64_t nowUnixNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::system_clock::now().time_since_epoch())
@@ -476,6 +494,71 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     return false;
   }
 
+  // The staged next-phase editor (M2, knobs tab + a running run): typed
+  // digits edit the draft for the selected knob; Tab cycles the knob; Enter
+  // stages the draft into the preview; Esc discards EVERYTHING staged and
+  // returns to navigate. The staged values are preview-only — the timeline
+  // marks nothing until the engine confirms a boundary, and in M2 no staged
+  // value ever reaches the running engine.
+  if (state.mode == InputMode::kEditingStagedPhase) {
+    const char* field_names[] = {"concurrency", "connections", "pending", "active"};
+    if (event == Event::Escape) {
+      state.staged_next_phase = nighthawk::client::PhaseSpec{};
+      state.staged_draft.clear();
+      state.staged_field = 0;
+      state.mode = InputMode::kNavigate;
+      state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+      force_redraw();
+      return true;
+    }
+    if (event == Event::Tab) {
+      state.staged_field = (state.staged_field + 1) % 4;
+      state.staged_draft.clear();
+      controller.NoteFlameStatus(
+          absl::StrCat("staged edit field: ", field_names[state.staged_field]));
+      return true;
+    }
+    if (event == Event::Return) {
+      uint32_t value = 0;
+      if (!absl::SimpleAtoi(state.staged_draft, &value) || value == 0) {
+        controller.NoteFlameStatus("staged edit: enter a positive integer");
+        return true;
+      }
+      switch (state.staged_field) {
+      case 0:
+        state.staged_next_phase.mutable_concurrency()->set_value(std::to_string(value));
+        break;
+      case 1:
+        state.staged_next_phase.mutable_connections()->set_value(value);
+        break;
+      case 2:
+        state.staged_next_phase.mutable_max_pending_requests()->set_value(value);
+        break;
+      default:
+        state.staged_next_phase.mutable_max_active_requests()->set_value(value);
+        break;
+      }
+      // A staged spec needs a non-empty name to render its preview.
+      state.staged_next_phase.set_name("next");
+      state.staged_draft.clear();
+      controller.NoteFlameStatus(absl::StrCat("staged for the next phase: ",
+                                              field_names[state.staged_field], "=", value,
+                                              " (preview only; esc discards)"));
+      return true;
+    }
+    if (event == Event::Backspace) {
+      if (!state.staged_draft.empty()) {
+        state.staged_draft.pop_back();
+      }
+      return true;
+    }
+    if (event.is_character()) {
+      state.staged_draft += event.character();
+      return true;
+    }
+    return false;
+  }
+
   // Navigate mode key map. Tab indices match the tab strip's order: c ->
   // charts (0), f -> flame (1, M1), k -> knobs (2).
   if (event == Event::Character('c')) {
@@ -514,6 +597,24 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
   if (event == Event::Character('s')) {
     // Stop key: feed stop() only; the service's watchdog ends the run.
     controller.stopRun();
+    return true;
+  }
+  if (event == Event::Character('e')) {
+    // Staged next-phase editing (M2): only while a run is active — the
+    // preview describes the NEXT phase of a live run. Refusals surface as a
+    // transient flame-pane note, never a silent no-op.
+    if (state.active_tab != 2) {
+      controller.NoteFlameStatus("staged edits live on the knobs tab (k, then e)");
+      return true;
+    }
+    if (!controller.runInProgress()) {
+      controller.NoteFlameStatus("no run to stage for: e stages edits while a run is live");
+      return true;
+    }
+    state.staged_draft.clear();
+    state.staged_field = 0;
+    state.mode = InputMode::kEditingStagedPhase;
+    state.mode_mirror.store(state.mode, std::memory_order_relaxed);
     return true;
   }
   if (event == Event::Character('q')) {
@@ -1213,6 +1314,11 @@ std::vector<nighthawk::client::PhaseBoundaryEvent> RunController::boundaryEvents
   return boundary_events_;
 }
 
+std::vector<nighthawk::client::PhaseMetadata> RunController::finalPhaseMetadata() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return {final_output_.phase_metadata().begin(), final_output_.phase_metadata().end()};
+}
+
 std::string RunController::sessionPath() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return session_path_;
@@ -1430,9 +1536,36 @@ int runInteractive(const std::string& address, const std::string& session_prefix
                                           controller.flameNote(),
                                           overlay_optional.has_value() ? &*overlay_optional
                                                                        : nullptr);
+    // The phase timeline (M2): post-run metadata when the Output landed,
+    // else the streamed boundary events; empty for legacy runs (the bar
+    // keeps its placeholder row). Built fresh per frame from the
+    // controller's immutable snapshots.
+    const nighthawk::client::CommandLineOptions knob_options = controller.knobOptions();
+    const std::vector<PhaseTimelineSegment> timeline =
+        BuildPhaseTimeline(knob_options, controller.boundaryEvents(),
+                           controller.finalPhaseMetadata(),
+                           view_model.last_snapshot.phase_id());
+    // The staged next-phase preview (M2): nothing staged renders nothing.
+    const std::vector<KnobDisplay> staged_preview =
+        state.staged_next_phase.name().empty()
+            ? std::vector<KnobDisplay>{}
+            : NextPhasePreviewKnobs(state.staged_next_phase, knob_options);
+    std::string staged_annotation;
+    if (!staged_preview.empty()) {
+      int parsed = 0;
+      if (state.staged_next_phase.has_concurrency() &&
+          absl::SimpleAtoi(state.staged_next_phase.concurrency().value(), &parsed) &&
+          parsed > 0) {
+        staged_annotation = WorkerSetAnnotation(CurrentRunWorkerCount(knob_options),
+                                                static_cast<uint32_t>(parsed),
+                                                static_cast<uint32_t>(knob_options.phases_size()));
+      }
+    }
     return RenderLayout(screen.dimx(), screen.dimy(), state.active_tab, state.mode, view_model,
-                        state.dialog, controller.sessionPath(), controller.knobOptions(),
-                        &overlay, &flame, controller.profileWindowState());
+                        state.dialog, controller.sessionPath(), knob_options, &overlay, &flame,
+                        controller.profileWindowState(), &timeline,
+                        staged_preview.empty() ? nullptr : &staged_preview,
+                        staged_preview.empty() ? nullptr : &staged_annotation);
   });
 
   Component app = CatchEvent(view, [&](Event event) {

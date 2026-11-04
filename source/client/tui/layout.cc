@@ -400,6 +400,7 @@ const std::vector<KeyBinding>& KeyBindingTable() {
       {"p", "start/stop a profile window"},
       {"d", "differential (default: last two pure)"},
       {"N", "noise-floor view (plain n stays dialog)"},
+      {"e", "stage an edit for the next phase (knobs tab; esc discards)"},
   };
   return *table;
 }
@@ -492,7 +493,10 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                             absl::string_view session_path,
                             const nighthawk::client::CommandLineOptions& knob_options,
                             const OverlayState* overlay, const FlamePaneState* flame,
-                            absl::string_view profiler_state) {
+                            absl::string_view profiler_state,
+                            const std::vector<PhaseTimelineSegment>* timeline,
+                            const std::vector<KnobDisplay>* staged_preview,
+                            const std::string* staged_workers_annotation) {
   // The min-size gate wraps everything: below the declared minimum, render
   // the message and nothing else — no partial status bar, no wrapped charts.
   if (width < kMinTerminalWidth || height < kMinTerminalHeight) {
@@ -543,13 +547,27 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
     }
     break;
   }
-  case 2:
+  case 2: {
     // Tab 2 is the knob pane, rendered from the most recent run's options
     // (unset defaults before any run). Empty options never render an empty
     // pane: KnobsFromOptions yields the five knobs with "unset"/"not
-    // configured" values.
-    pane = RenderKnobPane(KnobsFromOptions(knob_options), width, height - 5);
+    // configured" values. While a run is active and edits are staged, the
+    // staged next-phase preview renders below the current knobs (visually
+    // distinct; discardable; never applied to the current phase).
+    const std::vector<KnobDisplay> current = KnobsFromOptions(knob_options);
+    if (staged_preview == nullptr || staged_preview->empty()) {
+      pane = RenderKnobPane(current, width, height - 5);
+    } else {
+      std::vector<ftxui::Element> rows;
+      rows.push_back(RenderKnobPane(current, width, height - 5));
+      rows.push_back(RenderNextPhasePreviewBlock(*staged_preview,
+                                                 staged_workers_annotation == nullptr
+                                                     ? ""
+                                                     : *staged_workers_annotation));
+      pane = ftxui::vbox(std::move(rows));
+    }
     break;
+  }
   default:
     pane = ftxui::text(absl::StrCat("unknown tab ", active_tab));
     break;
@@ -560,7 +578,7 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
   // reads from the same row in every frame and every mode.
   ftxui::Element frame = ftxui::vbox({
       RenderStatusBar(model, mode, session_path, dialog.uri(),
-                      knob_options.duration().seconds(), profiler_state),
+                      knob_options.duration().seconds(), profiler_state, timeline),
       RenderTabStrip(active_tab),
       pane,
       ftxui::filler(),

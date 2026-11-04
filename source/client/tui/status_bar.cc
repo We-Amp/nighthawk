@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "ftxui/dom/elements.hpp"
@@ -35,15 +37,32 @@ std::string modeName(InputMode mode) {
     return "editing (start run)";
   case InputMode::kEditingSearch:
     return "editing (search)";
+  case InputMode::kEditingStagedPhase:
+    return "editing (staged phase)";
   }
   return "unknown";
+}
+
+// The declared worker count of a phase spec (8.4's key); nullopt when the
+// spec leaves concurrency unset or non-numeric — an unknown count marks
+// nothing.
+std::optional<uint32_t> declaredWorkers(const nighthawk::client::PhaseSpec& spec) {
+  if (!spec.has_concurrency() || spec.concurrency().value().empty()) {
+    return std::nullopt;
+  }
+  int parsed = 0;
+  if (!absl::SimpleAtoi(spec.concurrency().value(), &parsed) || parsed <= 0) {
+    return std::nullopt;
+  }
+  return static_cast<uint32_t>(parsed);
 }
 
 } // namespace
 
 ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
                                absl::string_view session_path, absl::string_view uri,
-                               int duration_seconds, absl::string_view profiler_state) {
+                               int duration_seconds, absl::string_view profiler_state,
+                               const std::vector<PhaseTimelineSegment>* timeline) {
   const std::string state =
       model.run_state.empty() ? "idle" : model.run_state;
   const bool left_idle = state != "idle";
@@ -91,16 +110,29 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
   }
   absl::StrAppend(&row0, target);
 
-  // Row 1: phase/epoch placeholder markers + flush cadence. Pre-A1 the phase
-  // id is the constant "main" and no steering exists, so both fields are
-  // placeholders — labeled as such so nobody mistakes them for real phase
-  // attribution (that lands with M2's real phase ids).
+  // Row 1: the phase timeline during phase runs (the strip replaces the
+  // placeholder phase cell; the strip is built from the streamed boundary
+  // events while the run is live and from the final Output's metadata after
+  // it — BuildPhaseTimeline picks the source), else the phase/epoch row.
+  // Pre-A1 the phase id is the constant "main" and no steering exists, so
+  // the fields are placeholders — labeled as such; the placeholder marker
+  // drops when real phase ids flow (M2).
   const std::string phase = model.last_snapshot.phase_id();
   const std::string epoch = model.last_snapshot.epoch_id();
-  const std::string row1 = absl::StrCat(
-      "phase: ", phase.empty() ? "(none)" : phase,
-      " [pre-phase-engine placeholder] | epoch: ", epoch.empty() ? "(none)" : epoch,
-      epoch.empty() ? "" : " [placeholder]", " | flush ", kStatusBarFlushIntervalSeconds, "s");
+  const bool phase_id_real = !phase.empty() && phase != "main";
+  std::string row1;
+  if (timeline != nullptr && !timeline->empty()) {
+    row1 = absl::StrCat(PhaseTimelineStrip(*timeline), " | epoch: ",
+                        epoch.empty() ? "(none)" : epoch,
+                        epoch.empty() ? "" : " [placeholder]", " | flush ",
+                        kStatusBarFlushIntervalSeconds, "s");
+  } else {
+    row1 = absl::StrCat("phase: ", phase.empty() ? "(none)" : phase,
+                        phase_id_real ? "" : " [pre-phase-engine placeholder]",
+                        " | epoch: ", epoch.empty() ? "(none)" : epoch,
+                        epoch.empty() ? "" : " [placeholder]", " | flush ",
+                        kStatusBarFlushIntervalSeconds, "s");
+  }
 
   // Row 2: session path + input mode + the M1 SUT-stats and profiler cells.
   // The mode cell renders inverse-video while an input mode owns the
@@ -270,6 +302,63 @@ ftxui::Element RenderPhaseTimeline(const std::vector<PhaseTimelineSegment>& segm
     strip.resize(static_cast<size_t>(width));
   }
   return ftxui::vbox({ftxui::text(strip)});
+}
+
+std::vector<PhaseTimelineSegment> PhaseTimelineSegmentsFromEvents(
+    const std::vector<nighthawk::client::PhaseSpec>& specs,
+    const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
+    absl::string_view current_phase_id) {
+  if (specs.empty()) {
+    return {};
+  }
+  std::vector<PhaseTimelineSegment> segments;
+  segments.reserve(specs.size());
+  for (size_t i = 0; i < specs.size(); ++i) {
+    PhaseTimelineSegment segment;
+    segment.phase_id = specs[i].name();
+    segment.duration_seconds = specs[i].duration().seconds();
+    segment.is_current = segment.phase_id == current_phase_id;
+    // The 8.4 mark from the declared worker counts around the boundary; an
+    // unparseable/absent concurrency marks nothing.
+    if (i + 1 < specs.size()) {
+      const std::optional<uint32_t> here = declaredWorkers(specs[i]);
+      const std::optional<uint32_t> next = declaredWorkers(specs[i + 1]);
+      segment.worker_count_changed = here.has_value() && next.has_value() && *here != *next;
+    }
+    segments.push_back(std::move(segment));
+  }
+  // The streamed boundaries land on their ending phase's segment. DQ-3:
+  // metadata only — the pool/claim cells stay unset until the Output lands.
+  for (const nighthawk::client::PhaseBoundaryEvent& wire_event : events) {
+    if (wire_event.ending_phase_index() >= segments.size()) {
+      continue;
+    }
+    PhaseTimelineSegment& segment = segments[wire_event.ending_phase_index()];
+    segment.drain_seconds =
+        wire_event.drain_duration().seconds() + wire_event.drain_duration().nanos() / 1e9;
+    segment.idle_gap_seconds =
+        wire_event.idle_gap().seconds() + wire_event.idle_gap().nanos() / 1e9;
+    segment.new_workers_cold_started = wire_event.next_phase_cold_started();
+  }
+  return segments;
+}
+
+std::vector<PhaseTimelineSegment> BuildPhaseTimeline(
+    const nighthawk::client::CommandLineOptions& options,
+    const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
+    const std::vector<nighthawk::client::PhaseMetadata>& metadata,
+    absl::string_view current_phase_id) {
+  const std::vector<nighthawk::client::PhaseSpec> specs(options.phases().begin(),
+                                                        options.phases().end());
+  if (specs.empty()) {
+    return {};
+  }
+  // Post-run completeness: the Output's metadata carries the pool and claim
+  // cells; before it lands the streamed events are the source.
+  if (!metadata.empty()) {
+    return PhaseTimelineSegments(specs, metadata, current_phase_id);
+  }
+  return PhaseTimelineSegmentsFromEvents(specs, events, current_phase_id);
 }
 
 } // namespace Tui

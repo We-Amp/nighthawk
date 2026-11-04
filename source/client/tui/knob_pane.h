@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
 #include "ftxui/dom/elements.hpp"
 
 #include "api/client/options.pb.h"
@@ -82,6 +83,13 @@ ftxui::Element RenderNextPhasePreview(const nighthawk::client::PhaseSpec& staged
                                       const nighthawk::client::CommandLineOptions& run_options,
                                       uint32_t current_workers, uint32_t next_phase_index,
                                       int width, int height);
+
+// The same block from already-built preview lines (the shell composes them
+// once per frame via NextPhasePreviewKnobs): the discardable header, the
+// STAGED-tagged lines, and the worker-set annotation when non-empty. Empty
+// lines render an empty element.
+ftxui::Element RenderNextPhasePreviewBlock(const std::vector<KnobDisplay>& preview_knobs,
+                                           absl::string_view workers_annotation);
 
 } // namespace Tui
 } // namespace Client

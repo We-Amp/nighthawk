@@ -480,6 +480,113 @@ TEST(PhaseBoundaryTest, PhaseIdsFlowToSession) {
   EXPECT_EQ(header.started_unix_ns(), 7);
 }
 
+// ---------------------------------------------------------------------------
+// M2 wiring: the live timeline (streamed events) and the render-side source
+// selection.
+// ---------------------------------------------------------------------------
+
+using nighthawk::client::PhaseBoundaryEvent;
+using nighthawk::client::CommandLineOptions;
+
+PhaseBoundaryEvent makeBoundaryEvent(const std::string& ending, uint32_t ending_index,
+                                     const std::string& starting, bool cold) {
+  PhaseBoundaryEvent event;
+  event.set_phase_index(1);
+  event.set_phase_id(starting);
+  event.set_wall_time_unix_ns(1'000);
+  event.set_monotonic_ns(2'000);
+  event.set_ending_phase_index(ending_index);
+  event.set_ending_phase_id(ending);
+  event.mutable_drain_duration()->set_nanos(500'000'000);
+  event.mutable_idle_gap()->set_nanos(200'000'000);
+  event.set_worker_count(2);
+  event.set_next_phase_cold_started(cold);
+  return event;
+}
+
+// The live strip: boundary fields render from the streamed events; the pool
+// and claim cells stay unset until the Output lands (DQ-3: never a
+// fabricated cell).
+TEST(PhaseTimelineTest, EventsBuiltSegmentsRenderBoundaryWithoutClaimCells) {
+  std::vector<PhaseSpec> specs = twoPhaseSpecs();
+  std::vector<PhaseTimelineSegment> segments = PhaseTimelineSegmentsFromEvents(
+      specs, {makeBoundaryEvent("warm", 0, "spike", /*cold=*/true)}, /*current_phase_id=*/"spike");
+
+  ASSERT_EQ(segments.size(), 2u);
+  EXPECT_EQ(segments[0].phase_id, "warm");
+  EXPECT_DOUBLE_EQ(segments[0].drain_seconds, 0.5);
+  EXPECT_DOUBLE_EQ(segments[0].idle_gap_seconds, 0.2);
+  EXPECT_TRUE(segments[0].new_workers_cold_started);
+  // The specs declare 2 -> 4 workers: the 8.4 mark renders. No pool/claim
+  // cells (the engine computes them in the output pass).
+  EXPECT_TRUE(segments[0].worker_count_changed);
+  EXPECT_FALSE(segments[0].has_pool);
+  EXPECT_FALSE(segments[0].has_completion);
+  EXPECT_FALSE(segments[1].has_pool);
+
+  EXPECT_EQ(PhaseTimelineStrip(segments),
+            "[warm 2s | drain 0.5s gap 0.2s cmp! cold | *spike 2s*]");
+}
+
+// Source selection: the streamed events are the live source; the final
+// Output's metadata takes over post-run (the completeness source).
+TEST(PhaseTimelineTest, BuildPhaseTimelinePrefersMetadataWhenOutputArrived) {
+  CommandLineOptions options;
+  *options.add_phases() = makeSpec("warm", 2, "2");
+  *options.add_phases() = makeSpec("spike", 2, "4");
+
+  const std::vector<PhaseMetadata> metadata = twoPhaseMetadata();
+  const std::vector<PhaseTimelineSegment> from_metadata =
+      BuildPhaseTimeline(options, {makeBoundaryEvent("warm", 0, "spike", true)}, metadata,
+                         /*current_phase_id=*/"spike");
+  ASSERT_EQ(from_metadata.size(), 2u);
+  EXPECT_TRUE(from_metadata[0].has_pool);
+  EXPECT_TRUE(from_metadata[1].has_completion);
+
+  const std::vector<PhaseTimelineSegment> from_events =
+      BuildPhaseTimeline(options, {makeBoundaryEvent("warm", 0, "spike", true)}, {},
+                         /*current_phase_id=*/"spike");
+  ASSERT_EQ(from_events.size(), 2u);
+  EXPECT_FALSE(from_events[0].has_pool);
+  EXPECT_FALSE(from_events[1].has_completion);
+
+  // A legacy run (no phases configured) builds nothing and the bar keeps
+  // its placeholder row.
+  EXPECT_TRUE(BuildPhaseTimeline(CommandLineOptions{}, {}, {}, "").empty());
+}
+
+// The bar renders the strip in row 1 during phase runs (the placeholder
+// phase cell is replaced); legacy runs keep the placeholder row, and the
+// marker drops once real phase ids flow.
+TEST(PhaseTimelineTest, StatusBarRendersTimelineRowAndDropsPlaceholderWhenRealIdsFlow) {
+  CommandLineOptions options;
+  *options.add_phases() = makeSpec("warm", 2, "2");
+  *options.add_phases() = makeSpec("spike", 2, "4");
+
+  RunViewModel model;
+  model.run_state = "running";
+  model.last_snapshot.set_phase_id("spike");
+
+  const std::vector<PhaseTimelineSegment> timeline =
+      BuildPhaseTimeline(options, {makeBoundaryEvent("warm", 0, "spike", true)}, {}, "spike");
+  const ftxui::Element bar =
+      RenderStatusBar(model, InputMode::kNavigate, "s.nhsession", "http://x", 4, "", &timeline);
+  const std::vector<std::string> lines = screenLines(bar, 140, 3);
+  ASSERT_EQ(lines.size(), 3u);
+  EXPECT_NE(lines[1].find("drain 0.5s"), std::string::npos) << lines[1];
+  EXPECT_NE(lines[1].find("*spike 2s*"), std::string::npos) << lines[1];
+  EXPECT_EQ(lines[1].find("pre-phase-engine placeholder"), std::string::npos) << lines[1];
+
+  // Legacy row: no timeline; the placeholder marker rides the "main"
+  // placeholder id, and a real id without a timeline still drops it.
+  model.last_snapshot.set_phase_id("main");
+  const ftxui::Element legacy_bar = RenderStatusBar(model, InputMode::kNavigate, "s.nhsession",
+                                                    "http://x", 4, "", nullptr);
+  const std::vector<std::string> legacy = screenLines(legacy_bar, 140, 3);
+  ASSERT_EQ(legacy.size(), 3u);
+  EXPECT_NE(legacy[1].find("pre-phase-engine placeholder"), std::string::npos) << legacy[1];
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client

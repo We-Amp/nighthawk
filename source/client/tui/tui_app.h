@@ -179,6 +179,11 @@ public:
   // post-run completeness source for the strip's claim/pool cells.
   std::vector<nighthawk::client::PhaseBoundaryEvent> boundaryEvents() const;
 
+  // The final output's PhaseMetadata (empty until a run delivered its
+  // output) — the timeline's post-run completeness source (the streamed
+  // boundary records carry no pool/claim cells; DQ-3).
+  std::vector<nighthawk::client::PhaseMetadata> finalPhaseMetadata() const;
+
   // The open session's data file path (empty when none is open).
   std::string sessionPath() const;
 
@@ -402,6 +407,18 @@ struct ShellState {
   // Whether the current diff overlay was computed as the noise floor (drives
   // the d/N toggle logic).
   bool flame_diff_is_noise = false;
+  // --- M2 staged next-phase state machine (knobs tab, running runs only) ---
+  // The staged spec: EMPTY NAME = nothing staged (the discarded state). Every
+  // staged value lands here; the knob pane's preview renders from it and is
+  // discardable as a whole. Nothing here ever reaches the running engine in
+  // M2 — the phase vector is fixed at start; the preview exists so the
+  // staged-edit state machine is exercised ahead of M3's steering surface.
+  nighthawk::client::PhaseSpec staged_next_phase;
+  // The staged-edit draft (kEditingStagedPhase): the typed digits, plus which
+  // knob the draft edits (the staged-field cycle; 0 = concurrency,
+  // 1 = connections, 2 = max pending requests, 3 = max active requests).
+  std::string staged_draft;
+  int staged_field = 0;
 };
 
 // The shell's key map — the exact handler the interactive CatchEvent
