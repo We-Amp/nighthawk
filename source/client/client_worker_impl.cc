@@ -195,7 +195,13 @@ const Phase& ClientWorkerImpl::phase() const {
   // Legacy runs keep their eager "main" phase; a phase-driven run reports the
   // phase begun most recently (the run's final phase once the workers have
   // been joined).
-  return phase_ != nullptr ? *phase_ : *current_phase_;
+  if (phase_ != nullptr) {
+    return *phase_;
+  }
+  if (current_phase_ != nullptr) {
+    return *current_phase_;
+  }
+  throw NighthawkException("phase() called before any phase began on this worker");
 }
 
 std::future<PhaseDrainAck> ClientWorkerImpl::beginPhaseAsync(
@@ -211,11 +217,13 @@ std::future<PhaseDrainAck> ClientWorkerImpl::beginPhaseAsync(
 void ClientWorkerImpl::beginPhase(uint32_t phase_index,
                                   const nighthawk::client::PhaseSpec& phase_spec,
                                   bool final_phase) {
-  // Cancel a drain watch still running for the previous boundary (e.g. a
-  // censored drain whose hung request never completed).
-  if (drain_watch_timer_ != nullptr) {
-    drain_watch_timer_->disableTimer();
-    drain_watch_timer_.reset();
+  // Cancel the drain watch of the previous boundary (e.g. a censored drain
+  // whose hung request never completed). The old watch holds its own
+  // boundary's promise by value, so even a firing that slipped through
+  // could only complete that boundary's ack, never this phase's.
+  if (drain_watch_ != nullptr) {
+    drain_watch_->cancel();
+    drain_watch_.reset();
   }
   const Envoy::MonotonicTime phase_start = time_source_->monotonicTime();
   auto termination_predicate = termination_predicate_factory_.create(
@@ -246,8 +254,7 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
       // and work()'s event loop returns into the worker teardown.
       return;
     }
-    drain_watch_stop_ns_ = time_source_->monotonicTime().time_since_epoch().count();
-    startDrainWatch();
+    startDrainWatch(time_source_->monotonicTime().time_since_epoch().count());
   });
   ENVOY_LOG(debug, "worker {}: begin phase {} ('{}'), final: {}", worker_number_, phase_index,
             phase_spec.name(), final_phase);
@@ -255,25 +262,17 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
 
 }
 
-void ClientWorkerImpl::startDrainWatch() {
+void ClientWorkerImpl::startDrainWatch(const int64_t stop_monotonic_ns) {
   // The drain observable is the benchmark client's own in-flight tracking
-  // (the same accounting the client-side gates consult). No connection
-  // operations of any kind: this watch only waits for in-flight to reach
-  // zero, and the orchestrator's deadline bounds the wait (a hung request
-  // leaves the future unsent and is censored by the orchestrator).
-  drain_watch_timer_ = dispatcher_->createTimer([this]() -> void {
-    dispatcher_->updateApproximateMonotonicTime();
-    if (benchmark_client_->inFlightRequests() == 0) {
-      PhaseDrainAck ack;
-      ack.sequencer_stop_monotonic_ns = drain_watch_stop_ns_;
-      ack.drain_complete_monotonic_ns = time_source_->monotonicTime().time_since_epoch().count();
-      drain_promise_->set_value(ack);
-      drain_watch_timer_->disableTimer();
-    } else {
-      drain_watch_timer_->enableHRTimer(std::chrono::milliseconds(5));
-    }
-  });
-  drain_watch_timer_->enableHRTimer(std::chrono::milliseconds(1));
+  // (the same accounting the client-side gates consult). The promise is
+  // copied into the watch here, ON the worker dispatcher, so the watch owns
+  // this boundary's ack no matter when it fires (reading the member from a
+  // re-armed timer would race with the orchestrator thread swapping it for
+  // the next boundary's promise).
+  drain_watch_ = std::make_unique<BoundaryDrainWatch>(
+      *dispatcher_, [this]() { return benchmark_client_->inFlightRequests(); }, drain_promise_,
+      stop_monotonic_ns);
+  drain_watch_->start();
 }
 
 StatisticPtrMap ClientWorkerImpl::statistics() const {

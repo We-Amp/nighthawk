@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <functional>
+#include <future>
+#include <memory>
 #include <vector>
 
 #include "api/client/live.pb.h"
@@ -26,6 +28,62 @@
 
 namespace Nighthawk {
 namespace Client {
+
+// FORK-ONLY (We-Amp): one instance per phase boundary, owned by the worker.
+// Watches the benchmark client's in-flight count on the worker dispatcher and
+// completes THIS boundary's drain promise when it reaches zero. The promise is
+// captured by value at construction: a watch that still fires after the next
+// boundary began (a hung request completing during the gap, before the next
+// begin-phase task cancels it) can only satisfy its own boundary's ack, never
+// the next one's. Everything runs on the worker dispatcher; no connection
+// operations of any kind -- the orchestrator's deadline bounds the wait.
+class BoundaryDrainWatch {
+public:
+  BoundaryDrainWatch(Envoy::Event::Dispatcher& dispatcher,
+                     std::function<uint64_t()> in_flight,
+                     std::shared_ptr<std::promise<PhaseDrainAck>> promise,
+                     int64_t stop_monotonic_ns)
+      : dispatcher_(dispatcher), in_flight_(std::move(in_flight)),
+        promise_(std::move(promise)), stop_monotonic_ns_(stop_monotonic_ns) {}
+
+  void start() {
+    timer_ = dispatcher_.createTimer([this]() { check(); });
+    timer_->enableHRTimer(std::chrono::milliseconds(1));
+  }
+
+  // Called by the next begin-phase on the worker dispatcher; destroying the
+  // timer also cancels any pending firing of this watch.
+  void cancel() {
+    if (timer_ != nullptr) {
+      timer_->disableTimer();
+      timer_.reset();
+    }
+  }
+
+private:
+  void check() {
+    if (timer_ == nullptr) {
+      return;
+    }
+    if (in_flight_() == 0) {
+      PhaseDrainAck ack;
+      ack.sequencer_stop_monotonic_ns = stop_monotonic_ns_;
+      ack.drain_complete_monotonic_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count();
+      promise_->set_value(ack);
+      timer_->disableTimer();
+    } else {
+      timer_->enableHRTimer(std::chrono::milliseconds(5));
+    }
+  }
+
+  Envoy::Event::Dispatcher& dispatcher_;
+  const std::function<uint64_t()> in_flight_;
+  const std::shared_ptr<std::promise<PhaseDrainAck>> promise_;
+  const int64_t stop_monotonic_ns_;
+  Envoy::Event::TimerPtr timer_;
+};
 
 class ClientWorkerImpl : public WorkerImpl, virtual public ClientWorker {
 public:
@@ -96,7 +154,7 @@ private:
   // reaches zero. The dispatcher never blocks on the orchestrator.
   void beginPhase(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
                   bool final_phase);
-  void startDrainWatch();
+  void startDrainWatch(int64_t stop_monotonic_ns);
 
   Envoy::Api::Api& api_;
   std::unique_ptr<Envoy::TimeSource> time_source_;
@@ -128,9 +186,11 @@ private:
   std::vector<int64_t> phase_execution_durations_;
   std::promise<void> ready_promise_;
   std::shared_future<void> ready_future_;
+  // Created on the orchestrator thread in beginPhaseAsync (before the post,
+  // so the worker's later read is synchronized through the post queue) and
+  // handed to the BoundaryDrainWatch by value on the worker dispatcher.
   std::shared_ptr<std::promise<PhaseDrainAck>> drain_promise_;
-  Envoy::Event::TimerPtr drain_watch_timer_;
-  int64_t drain_watch_stop_ns_{0};
+  std::unique_ptr<BoundaryDrainWatch> drain_watch_;
   // Keeps the blocking dispatcher run alive while no phase work is scheduled
   // yet (a libevent loop with no registered events returns immediately).
   Envoy::Event::TimerPtr dispatcher_loop_timer_;
