@@ -341,6 +341,15 @@ TEST(KeyBarTest, EditingBarNamesTheDialogKeys) {
   EXPECT_NE(frame.lines[0].find("idle"), std::string::npos);
 }
 
+// M1 (M0b T5 seam): the flamegraph pane's frame-search editing mode extends
+// the input-mode enum and suspends refresh under the same rule as the
+// start-run dialog — the full truth table.
+TEST(InputModeTest, SearchInputModeSuspendsRefresh) {
+  EXPECT_FALSE(RefreshSuspended(InputMode::kNavigate));
+  EXPECT_TRUE(RefreshSuspended(InputMode::kEditingStartRun));
+  EXPECT_TRUE(RefreshSuspended(InputMode::kEditingSearch));
+}
+
 // The `?` help overlay lists every key and every status-bar field with a
 // one-line definition.
 TEST(HelpOverlayTest, HelpListsKeysAndStatusBarFields) {

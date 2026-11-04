@@ -67,6 +67,27 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): flamegraph renderer + interaction state machine tests.
+# Plain cc_test with headless ftxui::Screen renders, same quarantine
+# reasoning as tui_profile_windows_test.
+cc_test(
+    name = "tui_flamegraph_test",
+    srcs = ["tui_flamegraph_test.cc"],
+    data = ["fixtures/nh_sut_pprof.pb.gz"],
+    deps = [
+        "//api/pprof:profile_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@com_google_absl//absl/strings",
+        "@ftxui//:dom",
+        "@ftxui//:screen",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 cc_test(
     name = "tui_session_test",
     srcs = ["tui_session_test.cc"],

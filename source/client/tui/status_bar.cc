@@ -30,6 +30,8 @@ std::string modeName(InputMode mode) {
     return "navigate";
   case InputMode::kEditingStartRun:
     return "editing (start run)";
+  case InputMode::kEditingSearch:
+    return "editing (search)";
   }
   return "unknown";
 }

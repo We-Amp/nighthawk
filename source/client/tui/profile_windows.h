@@ -145,6 +145,20 @@ uint64_t CompletedWorkInMonotonicRange(const std::vector<CounterPoint>& complete
 // the pointers are stable for as long as the loaded store snapshot is held.
 struct DifferentialNodeDiff {
   const FoldedFrame* frame = nullptr;
+  // Positional address of this node (M1 task 5 interface addition): child
+  // indices from the tree root. This is how the renderer addresses the
+  // overlay onto a (possibly zoomed) FoldedTree — honest for same-named
+  // frames, where a function-name path would alias recursion and repeated
+  // stacks. When the node exists on the CURRENT side the path addresses the
+  // current tree (the renderer paints the after picture); for a node that
+  // exists only on the base side it addresses the base tree (it then never
+  // matches a rendered node, which is the truthful outcome). Note this can
+  // address a different tree than `frame` points into — `frame` stays
+  // base-preferred (its total_value is the T4 anchor), `child_path` is the
+  // render-addressing half. The string name path remains the BASE<->CURRENT
+  // match key (folding merges same-name-same-parent nodes, so a name path is
+  // unique inside one tree).
+  FramePath child_path;
   // Per-unit-of-work values (total_value / work_units).
   double base_per_work = 0.0;
   double cur_per_work = 0.0;
