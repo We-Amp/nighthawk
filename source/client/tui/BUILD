@@ -31,6 +31,7 @@ envoy_cc_library(
         "session_writer.cc",
         "start_run_dialog.cc",
         "status_bar.cc",
+        "sut_stats.cc",
         "tui_app.cc",
     ],
     hdrs = [
@@ -52,6 +53,7 @@ envoy_cc_library(
         "session_writer.h",
         "start_run_dialog.h",
         "status_bar.h",
+        "sut_stats.h",
         "tui_app.h",
     ],
     visibility = ["//visibility:public"],
