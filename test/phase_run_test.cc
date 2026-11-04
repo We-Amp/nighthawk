@@ -24,11 +24,13 @@
 
 #include "api/client/options.pb.h"
 
+#include "source/client/client_worker_impl.h"
 #include "source/client/options_impl.h"
 #include "source/client/output_collector_impl.h"
 #include "source/client/phase_orchestrator.h"
 #include "source/client/process_impl.h"
 
+#include "test/mocks/event/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/utility.h"
 
@@ -445,6 +447,58 @@ TEST(PhaseOrchestratorTest, IdleGapRecordedAgainstNextPhaseStart) {
   ASSERT_EQ(1, orchestrator.boundaryTimings().size());
   EXPECT_GE(orchestrator.boundaryTimings()[0].idle_gap_ns, 0);
   EXPECT_LT(orchestrator.boundaryTimings()[0].idle_gap_ns, std::chrono::nanoseconds(2s).count());
+}
+
+// The review's Important fix: a boundary's drain watch holds its promise by
+// value. Simulates the censored-then-next-phase sequence: boundary 1's
+// in-flight hangs, the orchestrator censors, boundary 2 begins, THEN the hung
+// request completes and boundary 1's stale watch fires once more -- it must
+// complete only boundary 1's ack and never pre-satisfy boundary 2's.
+TEST(BoundaryDrainWatchTest, StaleWatchCannotSatisfyNextBoundary) {
+  testing::NiceMock<Envoy::Event::MockDispatcher> dispatcher;
+  auto* timer1 = new testing::NiceMock<Envoy::Event::MockTimer>(); // owned by the watches
+  auto* timer2 = new testing::NiceMock<Envoy::Event::MockTimer>();
+  uint64_t in_flight = 1; // the hung request
+
+  auto promise1 = std::make_shared<std::promise<PhaseDrainAck>>();
+  std::future<PhaseDrainAck> future1 = promise1->get_future();
+  BoundaryDrainWatch watch1(dispatcher, [&in_flight]() { return in_flight; }, promise1,
+                            /*stop_monotonic_ns=*/1111);
+  Envoy::Event::TimerCb cb1;
+  Envoy::Event::TimerCb cb2;
+  EXPECT_CALL(dispatcher, createTimer_(_))
+      .WillOnce(Invoke([&](Envoy::Event::TimerCb cb) {
+        cb1 = std::move(cb);
+        return timer1;
+      }))
+      .WillOnce(Invoke([&](Envoy::Event::TimerCb cb) {
+        cb2 = std::move(cb);
+        return timer2;
+      }));
+  watch1.start();
+  cb1(); // in-flight still hung: re-arms itself
+
+  // The orchestrator censors boundary 1 at its deadline and starts boundary 2.
+  auto promise2 = std::make_shared<std::promise<PhaseDrainAck>>();
+  std::future<PhaseDrainAck> future2 = promise2->get_future();
+  BoundaryDrainWatch watch2(dispatcher, [&in_flight]() { return in_flight; }, promise2,
+                            /*stop_monotonic_ns=*/2222);
+  watch2.start();
+
+  // The hung request completes during the gap; boundary 1's stale watch fires
+  // once more before the next begin-phase cancels it.
+  in_flight = 0;
+  cb1();
+
+  ASSERT_EQ(future1.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
+  EXPECT_EQ(1111, future1.get().sequencer_stop_monotonic_ns);
+  EXPECT_EQ(future2.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout)
+      << "stale watch pre-satisfied the next boundary's ack";
+
+  // The live watch still completes its own boundary with its own anchor.
+  cb2();
+  ASSERT_EQ(future2.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
+  EXPECT_EQ(2222, future2.get().sequencer_stop_monotonic_ns);
 }
 
 TEST(PhaseOrchestratorTest, PartialAcksAreCensored) {

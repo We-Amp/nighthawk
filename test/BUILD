@@ -453,6 +453,7 @@ envoy_cc_test(
         "//source/client:nighthawk_client_lib",
         "//source/client:phase_orchestrator_lib",
         "//test/test_common:environment_lib",
+        "@envoy//test/mocks/event:event_mocks",
         "@envoy//test/test_common:utility_lib",
     ],
 )
