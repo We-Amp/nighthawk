@@ -22,6 +22,8 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
+#include <system_error>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -456,6 +458,11 @@ public:
   }
 
   std::string mount_root() const { return mount_root_; }
+  std::shared_ptr<grpc::ChannelInterface> ServiceChannel() const {
+    return grpc::CreateChannel(absl::StrCat("127.0.0.1:", grpc_port_),
+                               grpc::InsecureChannelCredentials());
+  }
+  std::string listener_uri() const { return listener_->uri(); }
   std::string staging_root() const { return staging_root_; }
   const std::string& canned_bytes() const { return canned_bytes_; }
   RunController& controller() { return *controller_; }
@@ -638,10 +645,79 @@ TEST_F(FlamePipelineTest, DifferentialAndNoiseFloorOverTwoPureWindows) {
     EXPECT_LT(std::fabs(node.delta_ratio), 10.0) << node.frame->function;
   }
 
-  // An impure pair can never come back comparable: mark the second window's
-  // side impure by differentials against the straddling case is impossible
-  // here — instead assert the refusal note path on a single window.
   ASSERT_TRUE(controller().finishSession(/*completed=*/false).ok());
+}
+
+// Review round 1, fix 2: a FAILED start must leave nothing armed — no run
+// stamp (a window pull against a run that never started must refuse), no
+// scrape thread (no orphan idle-time sut.* noise, and the next successful
+// start must scrape). The failure here is SessionWriter::open failing: the
+// session prefix IS an existing directory, so the writer cannot create its
+// file pair — the synchronous failure path that used to leak the scraper.
+TEST_F(FlamePipelineTest, FailedStartLeavesNothingArmedAndNextStartScrapes) {
+  StageCannedProfile(/*with_functions=*/true);
+  // The session prefix's PARENT directory does not exist yet: the writer
+  // cannot create its file pair, so the start fails on the synchronous
+  // failure path that used to leak the scraper (review round 1, fix 2).
+  // The parent is created between the attempts so the SAME controller's
+  // second start succeeds.
+  const std::string prefix = tempPath("tui-fix2-parent/session");
+  const std::string parent = tempPath("tui-fix2-parent");
+  std::error_code ec;
+  std::filesystem::remove_all(parent, ec);
+
+  auto channel = ServiceChannel();
+  RunController controller(channel, prefix);
+  controller.ConfigureProfiling(MakeConfig({"/nonexistent/nh-test-pprof-tool"}));
+
+  const StartRequest good = makeStartRequest(listener_uri(), /*rps=*/10,
+                                             /*duration_seconds=*/60);
+  const absl::Status first = controller.startRun(good);
+  EXPECT_FALSE(first.ok()) << first;
+  EXPECT_TRUE(controller.sessionPath().empty());
+  // Nothing armed: a window pull must refuse (no run stamp), not open a
+  // window against a run that never started.
+  EXPECT_TRUE(absl::IsFailedPrecondition(controller.StartProfileWindow())) << "run stamp armed";
+
+  // Clear the obstacle; the second start on the SAME controller must succeed
+  // and the scrape cadence must arm: sut.* delta series appear in the model.
+  std::filesystem::create_directories(parent, ec);
+  ASSERT_EQ(controller.startRun(good), absl::OkStatus());
+  bool have_snapshot = false;
+  for (int i = 0; i < 150 && !have_snapshot; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller.model();
+    have_snapshot = model != nullptr && !model->counters.empty();
+    if (!have_snapshot) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  ASSERT_TRUE(have_snapshot);
+  // The live-path marker (review round 1, fix 3): a running run reads
+  // "running", not "idle".
+  EXPECT_EQ(controller.model()->run_state, "running");
+
+  bool have_sut_series = false;
+  for (int i = 0; i < 100 && !have_sut_series; ++i) {
+    const std::shared_ptr<const RunViewModel> model = controller.model();
+    for (const auto& [name, points] : model->counters) {
+      if (absl::StartsWith(name, "sut.") && !points.empty()) {
+        have_sut_series = true;
+      }
+    }
+    if (!have_sut_series) {
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  EXPECT_TRUE(have_sut_series) << "scrape cadence did not arm after the failed first start";
+
+  // And now a window pull succeeds (the run stamp is armed).
+  EXPECT_EQ(controller.StartProfileWindow(), absl::OkStatus());
+  EXPECT_TRUE(controller.StopProfileWindowAndFold().ok());
+  for (int i = 0; i < 100 && controller.runInProgress(); ++i) {
+    std::this_thread::sleep_for(100ms);
+  }
+  ASSERT_TRUE(controller.finishSession(/*completed=*/false).ok());
+  std::filesystem::remove_all(parent, ec);
 }
 
 } // namespace

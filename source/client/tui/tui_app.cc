@@ -112,8 +112,13 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
     return outcome;
   }
 
-  // Tree: symbolize-then-fallback.
+  // Tree: symbolize-then-fallback. A symbolization failure that the fallback
+  // recovers from is carried in `symbolizer_note` and APPENDED to the final
+  // outcome note (review round 1 minor: the fallback must not silently
+  // overwrite why the machine route did not produce the tree).
   absl::StatusOr<FoldedTree> tree_or = absl::InternalError("profile not loaded");
+  std::string symbolizer_note;
+  bool used_fallback = false;
   if (!config.sut_binary_path.empty()) {
     ProfileSymbolizer symbolizer(config.pprof_tool_argv, config.pprof_binary_path);
     const std::string symbolized_path = absl::StrCat(fetched.local_path, ".symbolized.pb");
@@ -128,9 +133,11 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
       }
     } else if (!absl::IsNotFound(symbolized)) {
       // A tool that exists but failed is worth reporting verbatim; a missing
-      // tool falls through to the fallback silently (the graceful
-      // degradation path).
-      outcome.note = absl::StrCat("symbolization failed: ", symbolized.message());
+      // tool falls through to the fallback (the graceful degradation path,
+      // with the absence noted).
+      symbolizer_note = absl::IsNotFound(symbolized)
+                            ? "symbolizer tool absent"
+                            : absl::StrCat("symbolization failed: ", symbolized.message());
     }
   }
   if (!tree_or.ok()) {
@@ -138,21 +145,32 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
     // unsymbolized-degradation shape — locations without functions fold to
     // "0x<addr>" frames). A legacy gperftools profile cannot; the outcome
     // note says so.
+    used_fallback = true;
     auto profile_or = LoadProfile(fetched.local_path);
     if (profile_or.ok()) {
       tree_or = FoldProfile(*profile_or);
-    } else if (outcome.note.empty()) {
-      outcome.note = absl::StrCat(
-          "profile unusable: no working symbolizer and the staged profile is not a "
-          "pprof proto (legacy gperftools format needs the machine route): ",
-          profile_or.status().message());
+    } else if (symbolizer_note.empty()) {
+      symbolizer_note = "no working symbolizer";
+    } else {
+      absl::StrAppend(&symbolizer_note, "; raw-proto fallback also failed");
+    }
+    if (!tree_or.ok() && !profile_or.ok()) {
+      symbolizer_note = absl::StrCat(
+          symbolizer_note, (symbolizer_note.empty() ? "" : "; "),
+          "profile unusable: the staged profile is not a pprof proto (legacy gperftools "
+          "format needs the machine route)");
     }
   }
   if (!tree_or.ok()) {
-    if (outcome.note.empty()) {
-      outcome.note = absl::StrCat("profile fold failed: ", tree_or.status().message());
-    }
+    outcome.note = symbolizer_note.empty()
+                       ? absl::StrCat("profile fold failed: ", tree_or.status().message())
+                       : absl::StrCat(symbolizer_note, " (", tree_or.status().message(), ")");
     return outcome;
+  }
+  if (used_fallback) {
+    absl::StrAppend(&symbolizer_note,
+                    symbolizer_note.empty() ? "" : "; ",
+                    "window folded from the raw staged proto");
   }
 
   // Window interval selection + the §8.5 cross-check (plan task 4's TODO,
@@ -228,6 +246,9 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
       outcome.has_window = true;
       outcome.window = *std::move(aligned);
       outcome.note = absl::StrCat("window pulled: pure (work units ", work_units, ")");
+      if (!symbolizer_note.empty()) {
+        absl::StrAppend(&outcome.note, " | ", symbolizer_note);
+      }
       return outcome;
     }
     // Align can still reject a "contained" pair only on the degenerate
@@ -250,6 +271,9 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
   outcome.note = absl::StrCat(
       "window EXCLUDED-AND-MARKED (purity ", absl::StrFormat("%.3f", purity),
       " < 1.0): never comparable — ", "window straddles the run interval");
+  if (!symbolizer_note.empty()) {
+    absl::StrAppend(&outcome.note, " | ", symbolizer_note);
+  }
   return outcome;
 }
 
@@ -615,7 +639,7 @@ void RunController::set_snapshot_notification(std::function<void()> callback) {
 
 void RunController::ConfigureProfiling(ProfilePipelineConfig config) {
   // Configure-once, before use (pool jobs capture config by value at submit;
-  // nothing here is hot-swappable — a second call is refused honestly).
+  // nothing here is hot-swappable — a second call is a no-op).
   std::lock_guard<std::mutex> lock(mutex_);
   if (profiling_configured_) {
     return;
@@ -646,7 +670,8 @@ absl::Status RunController::StartProfileWindow() {
     }
     if (!has_run_stamp_) {
       return absl::FailedPreconditionError(
-          "no run to align against: pull profile windows during (or after) a run");
+          "no run to align against: open profile windows during a run - only "
+          "windows pulled inside a run can be pure");
     }
   }
   if (window_open_.exchange(true)) {
@@ -979,9 +1004,12 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     // the model before the run launches, so row 0 never reads "(no target)"
     // once the state leaves idle.
     model_.target_uri = request.options().uri().value();
-    // M1 run stamps + anchor reset + worker count (the PreA1RunInterval
-    // producer's inputs; spec §8.5 metadata).
-    has_run_stamp_ = true;
+    // M1 run-state reset + worker count (the PreA1RunInterval producer's
+    // inputs; spec §8.5 metadata). NOTE (review round 1): the run stamp and
+    // the scrape cadence are NOT armed here — both arm only after feed_.start()
+    // succeeds below, so a failed start (unwritable session, dead stream)
+    // leaves no phantom run: no window could ever open against it, and no
+    // orphan scrape thread leaks idle-time sut.* noise.
     run_start_unix_ns_ = nowUnixNs();
     run_end_unix_ns_ = 0;
     run_finished_ = false;
@@ -993,11 +1021,6 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
         (!concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0)
             ? parsed
             : 1;
-    // The scrape cadence runs while the run is live (plan task 7 wiring).
-    if (profiling_configured_ && !scraping_.exchange(true)) {
-      RunController* self = this;
-      scraper_ = std::thread([self]() { self->ScrapeLoop(); });
-    }
   }
   store_.store(model_);
 
@@ -1044,6 +1067,28 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     // once.
     (void)writer->close(run_end);
     return started;
+  }
+
+  // The run is demonstrably in flight: NOW arm the M1 live-run state (review
+  // round 1 — both were gated on this point so a failed start leaves no
+  // phantom run and no orphan scrape thread).
+  //  - the run stamp (window pulls align against it),
+  //  - the SUT stats scrape cadence (plan task 7 wiring; runs while the run
+  //    is live),
+  //  - run_state "running" (the live-path marker the status bar renders;
+  //    a superfast run whose on_finished already landed keeps its final
+  //    state instead).
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!finished_) {
+      model_.run_state = "running";
+      store_.store(model_);
+    }
+    has_run_stamp_ = true;
+    if (profiling_configured_ && !scraping_.exchange(true)) {
+      RunController* self = this;
+      scraper_ = std::thread([self]() { self->ScrapeLoop(); });
+    }
   }
   return absl::OkStatus();
 }
@@ -1241,11 +1286,16 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     overlay.duration_input = duration_input;
     // The flame pane (tab 1) composes from the controller's immutable stores
     // + the shell's view state — the same BuildFlamePane the tests use. The
-    // overlay (and its owning snapshot, held inside the DiffOverlay) stays
-    // alive through the render.
+    // window snapshot is held in a LOCAL (fix, review round 1): tree points
+    // INTO the snapshot's vector, so the shared_ptr must outlive the render
+    // — a temporary would free it mid-frame if a pool job swaps the store
+    // between this expression and RenderLayout's read. The overlay (and its
+    // owning snapshot, held inside the DiffOverlay) stays alive through the
+    // render the same way.
+    const std::shared_ptr<const std::vector<ProfileWindow>> windows = controller.loadWindows();
     const std::optional<DiffOverlay> overlay_optional =
         state.flame_view.diff_mode ? controller.loadDiffOverlay() : std::nullopt;
-    FlamePaneState flame = BuildFlamePane(controller.loadWindows(), state.flame_view,
+    FlamePaneState flame = BuildFlamePane(windows, state.flame_view,
                                           controller.flameNote(),
                                           overlay_optional.has_value() ? &*overlay_optional
                                                                        : nullptr);

@@ -338,9 +338,12 @@ private:
 // Composes the flame pane's render input (layout.h's FlamePaneState) the same
 // way the interactive shell does — shared with the tests so a dropped field
 // is a visible test failure. The current window is the snapshot's most
-// recent; the overlay is attached only when `view.diff_mode` is set (the
-// caller keeps the DiffOverlay — and its owning snapshot — alive across the
-// render, per flamegraph.h's lifetime rule).
+// recent. LIFETIME (review round 1 fix): `windows` and the DiffOverlay's
+// owning snapshot must be held alive by the CALLER across the whole render —
+// tree and diff frame pointers point INTO them, so a temporary shared_ptr
+// dies at end-of-expression while RenderLayout still reads the pane. The
+// overlay is attached only when `view.diff_mode` is set (per flamegraph.h's
+// lifetime rule).
 FlamePaneState BuildFlamePane(std::shared_ptr<const std::vector<ProfileWindow>> windows,
                               const FlamegraphViewState& view, absl::string_view note,
                               const DiffOverlay* overlay);
