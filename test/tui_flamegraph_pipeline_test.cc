@@ -404,15 +404,27 @@ public:
   // (the anchor capture signal). `retriever_delay_ms` arms the TEST-ONLY
   // retrieval delay (see ProfilePipelineConfig).
   void StartRunAndWaitForSnapshot(int retriever_delay_ms = 0) {
+    StartRunWithRequestAndWaitForSnapshot(
+        makeStartRequest(listener_->uri(), /*rps=*/10, /*duration_seconds=*/60),
+        retriever_delay_ms);
+  }
+
+  // The same harness over a caller-built request (the M2 phase-run variant).
+  void StartRunWithRequestAndWaitForSnapshot(const StartRequest& request,
+                                             int retriever_delay_ms = 0) {
+    ProfilePipelineConfig config = MakeConfig({"/nonexistent/nh-test-pprof-tool"});
+    config.test_retriever_delay_ms = retriever_delay_ms;
+    StartRunWithConfigAndWaitForSnapshot(config, request);
+  }
+
+  // The same harness over a caller-built config (the M2 test-injection seam).
+  void StartRunWithConfigAndWaitForSnapshot(const ProfilePipelineConfig& config,
+                                            const StartRequest& request) {
     auto channel = grpc::CreateChannel(absl::StrCat("127.0.0.1:", grpc_port_),
                                        grpc::InsecureChannelCredentials());
     controller_ = std::make_unique<RunController>(channel, tempPath("tui-flame-pipeline"));
-    ProfilePipelineConfig config = MakeConfig({"/nonexistent/nh-test-pprof-tool"});
-    config.test_retriever_delay_ms = retriever_delay_ms;
     controller_->ConfigureProfiling(config);
-    ASSERT_EQ(controller_->startRun(makeStartRequest(listener_->uri(), /*rps=*/10,
-                                                     /*duration_seconds=*/60)),
-              absl::OkStatus());
+    ASSERT_EQ(controller_->startRun(request), absl::OkStatus());
     bool have_snapshot = false;
     for (int i = 0; i < 150 && !have_snapshot; ++i) {
       const std::shared_ptr<const RunViewModel> model = controller_->model();
@@ -560,6 +572,108 @@ TEST_F(FlamePipelineTest, FetchFoldAlignPipelineProducesPureWindow) {
   EXPECT_EQ(records[0].raw_profile(), canned_bytes());
   EXPECT_EQ(records[0].profile_type(), "cpu");
   EXPECT_EQ(records[0].phase_id(), "main");
+}
+
+// M2 fix-round wiring test (the AlignSplit unit cannot see this): a window
+// straddling a phase boundary SPLITS, and the EXCLUDED part lands — in the
+// store AND the session — alongside its pure sibling. The too-short part
+// must never vanish just because a pure part exists.
+//
+// Deterministic via the TEST-ONLY boundary-injection seam (the M1
+// test_retriever_delay_ms pattern): the run is a stable legacy 60s run; the
+// injected boundary sits at t0+4s, the window opens at t0+3.5s and closes at
+// t0+8s — part 1 (warm, ~0.5s) is below the meaningful-minimum rule
+// (excluded), part 2 (spike, ~4s) is pure — the common one-pure-one-
+// too-short case. All stamps are the test host's wall clock, so the join is
+// same-domain by construction.
+TEST_F(FlamePipelineTest, WindowStraddlingPhaseBoundarySplitsAndExcludedPartLands) {
+  StageCannedProfile(/*with_functions=*/true);
+  const int64_t t0 = nowUnixNs();
+
+  ProfilePipelineConfig config = MakeConfig({"/nonexistent/nh-test-pprof-tool"});
+  nighthawk::client::PhaseBoundaryEvent boundary;
+  boundary.set_phase_index(1);
+  boundary.set_phase_id("spike");
+  boundary.set_wall_time_unix_ns(t0 + 4'000'000'000ll);
+  boundary.set_monotonic_ns(0);
+  boundary.set_ending_phase_index(0);
+  boundary.set_ending_phase_id("warm");
+  boundary.mutable_drain_duration()->set_nanos(200'000'000);
+  boundary.mutable_idle_gap()->set_nanos(100'000'000);
+  boundary.set_worker_count(2);
+  boundary.set_next_phase_cold_started(true);
+  config.test_boundary_events.push_back(std::move(boundary));
+  StartRunWithConfigAndWaitForSnapshot(config, makeStartRequest(listener_uri(), /*rps=*/10,
+                                                                /*duration_seconds=*/60));
+
+  // Open the window at t0+3.5s (the run starts within ~1s of t0 in this
+  // fixture): part 1 [open, boundary) is ~0.5s, part 2 [boundary, close) is
+  // ~4s. The harness stamps the window from its own clock, so the split is
+  // decided by the injected stamps, not by emit timing.
+  const int64_t open_target = t0 + 3'500'000'000ll;
+  while (nowUnixNs() < open_target) {
+    std::this_thread::sleep_for(50ms);
+  }
+  ASSERT_EQ(controller().StartProfileWindow(), absl::OkStatus());
+  const int64_t close_target = t0 + 8'000'000'000ll;
+  while (nowUnixNs() < close_target) {
+    std::this_thread::sleep_for(50ms);
+  }
+  ASSERT_EQ(controller().StopProfileWindowAndFold(), absl::OkStatus());
+  for (int i = 0; i < 200; ++i) {
+    const auto windows = controller().loadWindows();
+    if (windows != nullptr && windows->size() >= 2) {
+      break;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+
+  // The store carries BOTH parts: one pure (phase p1... the injected
+  // successor "spike") and one excluded-and-marked (phase "warm", purity
+  // 0.0 — never comparable).
+  const auto windows = controller().loadWindows();
+  ASSERT_NE(windows, nullptr);
+  ASSERT_EQ(windows->size(), 2u);
+  size_t pure = 0;
+  size_t excluded = 0;
+  for (const ProfileWindow& window : *windows) {
+    if (window.purity_fraction == 1.0) {
+      ++pure;
+      EXPECT_EQ(window.phase_id, "spike");
+    } else {
+      ++excluded;
+      EXPECT_DOUBLE_EQ(window.purity_fraction, 0.0);
+      EXPECT_EQ(window.phase_id, "warm");
+    }
+  }
+  EXPECT_EQ(pure, 1u);
+  EXPECT_EQ(excluded, 1u);
+
+  // Tear down, then the session carries BOTH parts too.
+  const std::string session_path = controller().sessionPath();
+  controller().stopRun();
+  for (int i = 0; i < 100 && controller().runInProgress(); ++i) {
+    std::this_thread::sleep_for(100ms);
+  }
+  ASSERT_FALSE(controller().runInProgress());
+  ASSERT_TRUE(controller().finishSession(/*completed=*/false).ok());
+
+  const std::vector<ProfileWindowRecord> records = ReadSessionProfileWindows(session_path);
+  ASSERT_EQ(records.size(), 2u);
+  size_t session_pure = 0;
+  size_t session_excluded = 0;
+  for (const auto& record : records) {
+    if (record.purity_fraction() == 1.0) {
+      ++session_pure;
+      EXPECT_EQ(record.phase_id(), "spike");
+    } else {
+      ++session_excluded;
+      EXPECT_DOUBLE_EQ(record.purity_fraction(), 0.0);
+      EXPECT_EQ(record.phase_id(), "warm");
+    }
+  }
+  EXPECT_EQ(session_pure, 1u);
+  EXPECT_EQ(session_excluded, 1u);
 }
 
 // A window that STRADDLES the run interval end is excluded-and-marked —

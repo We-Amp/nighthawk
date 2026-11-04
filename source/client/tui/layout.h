@@ -31,10 +31,10 @@ namespace Tui {
 //   - a declared minimum terminal size below which the TUI renders one clear
 //     message instead of wrapping garbage,
 //   - while the start-run dialog owns the keyboard, a bordered dialog overlay
-//     (~rows 8-20, cols 25-75) with labeled fields, a reverse-video caret on
-//     the active field, inline errors on the offending field's own row, and
-//     the error summary on the border; `?` opens a help overlay over the same
-//     mechanism.
+//     (~rows 8-20, cols 25-75) with labeled fields (uri / rps /
+//     duration (s) / phases), a reverse-video caret on the active field,
+//     inline errors on the offending field's own row, and the error summary
+//     on the border; `?` opens a help overlay over the same mechanism.
 // All renderers are pure Snapshot/Model → Element functions so the
 // Screen-based tests stay deterministic.
 
@@ -61,6 +61,9 @@ struct OverlayState {
   std::string uri_field;
   std::string rps_field;
   std::string duration_field;
+  // The M2 phase-vector entry's draft (comma-separated
+  // name:rps:duration[:concurrency[:connections]] entries).
+  std::string phases_field;
   // 0=uri, 1=rps, 2=duration (StartRunDialogModel::DialogField numbering);
   // the active field's value renders with a reverse-video caret.
   int active_field = 0;
@@ -80,6 +83,7 @@ struct OverlayState {
   ftxui::Component uri_input;
   ftxui::Component rps_input;
   ftxui::Component duration_input;
+  ftxui::Component phases_input;
 };
 
 // The M1 flame pane's render input (composed by TuiApp's BuildFlamePane): the
@@ -121,7 +125,8 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                             absl::string_view profiler_state = "",
                             const std::vector<PhaseTimelineSegment>* timeline = nullptr,
                             const std::vector<KnobDisplay>* staged_preview = nullptr,
-                            const std::string* staged_workers_annotation = nullptr);
+                            const std::string* staged_workers_annotation = nullptr,
+                            const std::vector<uint64_t>* boundary_stamps = nullptr);
 
 // The charts tab (tab 0): on a completed run a completion-summary block
 // first (backlog item 7: totals, error ratio, final percentiles, the saved

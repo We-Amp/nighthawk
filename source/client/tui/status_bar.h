@@ -51,7 +51,8 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
                                absl::string_view session_path, absl::string_view uri = "",
                                int duration_seconds = 0,
                                absl::string_view profiler_state = "",
-                               const std::vector<PhaseTimelineSegment>* timeline = nullptr);
+                               const std::vector<PhaseTimelineSegment>* timeline = nullptr,
+                               int bar_width = 0);
 
 // ---------------------------------------------------------------------------
 // M2: the phase timeline (spec §4 layout contract). One entry per phase
@@ -78,6 +79,10 @@ struct PhaseTimelineSegment {
   // The boundary that ended this phase (absent for the final phase):
   double drain_seconds = 0.0;
   double idle_gap_seconds = 0.0;
+  // 8.6 counted-not-hidden: the drain was censored (strip renders the cens
+  // mark; the gap is a deadline-anchored lower bound). Known only from the
+  // streamed events — PhaseMetadata carries no censor flag.
+  bool drain_censored = false;
   // §8.4: the worker set changed at this boundary — the differential pair
   // across it is marked non-comparable.
   bool worker_count_changed = false;

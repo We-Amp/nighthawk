@@ -127,8 +127,6 @@ SplitAlignment WindowPhaseAlignment::AlignSplit(
     const std::vector<CounterPoint>& completed_series, int64_t anchor_offset_ns) {
   if (end_unix_ns <= start_unix_ns) {
     // Mirror Align's degenerate guard; the caller excludes-and-marks.
-    SplitAlignment invalid;
-    (void)invalid;
     return SplitAlignment{};
   }
   SplitAlignment result;

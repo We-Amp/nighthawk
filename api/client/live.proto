@@ -108,4 +108,9 @@ message PhaseBoundaryEvent {
   // successor-attributed flag (see PhaseBoundaryRecord.new_workers_cold_started
   // in api/client/session.proto for the explicit attribution rule).
   bool next_phase_cold_started = 10;
+  // 8.6 counted-not-hidden: the boundary's drain was censored (the bounded
+  // wait gave up at the deadline; drain_duration carries the full budget and
+  // idle_gap is measured from the censoring deadline — an honest lower
+  // bound).
+  bool drain_censored = 11;
 }

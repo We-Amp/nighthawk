@@ -45,9 +45,16 @@ struct BandAnnotations {
 // order puts p99 last so the topmost percentile owns shared cells; a spike
 // annotation overwrites the excursion's own cell with "!" and adds the
 // numeric tail (`p99 41.7ms ^4.0x`). Empty input renders `empty_message`.
+//
+// `boundary_stamps_ns` (M2): the phase boundaries the timeline knows (the
+// streamed events' monotonic stamps). Each visible boundary renders a RESET
+// MARKER — a full-height "|" column at its time-anchored position: the
+// percentile band restarts there (a fresh slab; counters remain continuous),
+// so the column's pre-boundary glyphs yield to the reset line.
 ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, int width,
                                     int height, const BandAnnotations& annotations = {},
-                                    absl::string_view empty_message = "waiting for first flush");
+                                    absl::string_view empty_message = "waiting for first flush",
+                                    const std::vector<uint64_t>& boundary_stamps_ns = {});
 
 // A labelled sparkline for one counter series: the header row reads
 // "<label> count" with the right-margin readout pair (`now X  max Y`, the

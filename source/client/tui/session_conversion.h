@@ -53,6 +53,10 @@ nighthawk::client::SessionHeader ToSessionHeader(const nighthawk::client::StartR
 // flag describes its entry boundary, not this one). The plain arguments
 // (rather than the engine's PhaseEvent struct) keep the TUI quarantine
 // intact — the orchestrator header pulls Envoy-side sources.
+//
+// TEST-ONLY SEAM (m3): production intake is the PhaseBoundaryEvent overload
+// below; this overload exists so the round-trip and conversion pins can
+// build field-exact records from the merged PhaseMetadata.
 nighthawk::client::PhaseBoundaryRecord
 ToPhaseBoundaryRecord(uint32_t phase_index, absl::string_view phase_id,
                       absl::string_view next_phase_id, int64_t wall_time_unix_ns,

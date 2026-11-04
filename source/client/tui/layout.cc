@@ -130,8 +130,11 @@ ftxui::Element dialogFieldRow(int field, const StartRunDialogModel& dialog,
   case StartRunDialogModel::kRps:
     label = "rps:";
     break;
-  default:
+  case StartRunDialogModel::kDuration:
     label = "duration (s):";
+    break;
+  default:
+    label = "phases:";
     break;
   }
 
@@ -145,9 +148,13 @@ ftxui::Element dialogFieldRow(int field, const StartRunDialogModel& dialog,
   case StartRunDialogModel::kRps:
     value = overlay.rps_input ? overlay.rps_input->Render() : ftxui::text(overlay.rps_field);
     break;
-  default:
+  case StartRunDialogModel::kDuration:
     value = overlay.duration_input ? overlay.duration_input->Render()
                                    : ftxui::text(overlay.duration_field);
+    break;
+  default:
+    value = overlay.phases_input ? overlay.phases_input->Render()
+                                 : ftxui::text(overlay.phases_field);
     break;
   }
   if (field == overlay.active_field) {
@@ -261,7 +268,8 @@ std::vector<std::string> CompletionSummaryLines(const RunViewModel& model,
 }
 
 ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height,
-                                absl::string_view session_path, uint64_t pool_pending_cap) {
+                                absl::string_view session_path, uint64_t pool_pending_cap,
+                                const std::vector<uint64_t>* boundary_stamps) {
   // State-aware empty state: an idle shell has never had a run, so the
   // honest message names the user-initiated next action; only a live run
   // before its first flush may claim "waiting for first flush".
@@ -287,8 +295,11 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
   annotations.spike = model.spike_frames_remaining > 0;
   annotations.spike_ratio = model.spike_ratio;
   annotations.rescaled = model.latency_rescaled;
+  static const std::vector<uint64_t> kNoBoundaries;
+  const std::vector<uint64_t>& boundaries =
+      boundary_stamps != nullptr ? *boundary_stamps : kNoBoundaries;
   rows.push_back(RenderPercentileBand(model.latency_band, width, band_height, annotations,
-                                      empty_message));
+                                      empty_message, boundaries));
 
   // The compact health line (backlog item 10): the client-side failure
   // counters as per-flush rates, zeros included — a reset or timeout is THE
@@ -457,7 +468,7 @@ ftxui::Element RenderStartRunDialog(const StartRunDialogModel& dialog,
   std::string title = "start run";
   if (overlay.show_errors) {
     int errors = 0;
-    for (int field = 0; field < 3; ++field) {
+    for (int field = 0; field < 4; ++field) {
       if (!StartRunDialogModel::FieldError(dialog, field).empty()) {
         ++errors;
       }
@@ -474,6 +485,10 @@ ftxui::Element RenderStartRunDialog(const StartRunDialogModel& dialog,
   lines.push_back(dialogFieldRow(StartRunDialogModel::kUri, dialog, overlay));
   lines.push_back(dialogFieldRow(StartRunDialogModel::kRps, dialog, overlay));
   lines.push_back(dialogFieldRow(StartRunDialogModel::kDuration, dialog, overlay));
+  // The M2 phase-vector entry: one field, comma-separated entries
+  // (name:rps:duration[:concurrency[:connections]]); a phase run replaces
+  // the duration field (mutual exclusion by construction).
+  lines.push_back(dialogFieldRow(StartRunDialogModel::kPhases, dialog, overlay));
   // A controller rejection (e.g. a session already open) reads as a distinct
   // line inside the box, wrapped to the border width, until esc or a
   // successful start clears it.
@@ -496,7 +511,8 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                             absl::string_view profiler_state,
                             const std::vector<PhaseTimelineSegment>* timeline,
                             const std::vector<KnobDisplay>* staged_preview,
-                            const std::string* staged_workers_annotation) {
+                            const std::string* staged_workers_annotation,
+                            const std::vector<uint64_t>* boundary_stamps) {
   // The min-size gate wraps everything: below the declared minimum, render
   // the message and nothing else — no partial status bar, no wrapped charts.
   if (width < kMinTerminalWidth || height < kMinTerminalHeight) {
@@ -511,7 +527,8 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
     pane = RenderChartsPane(model, width, height - 5, session_path,
                             knob_options.has_max_pending_requests()
                                 ? static_cast<uint64_t>(knob_options.max_pending_requests().value())
-                                : 0);
+                                : 0,
+                            boundary_stamps);
     break;
   case 1: {
     // Tab 1 is the flamegraph pane (M1): the current window's tree through
@@ -578,7 +595,7 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
   // reads from the same row in every frame and every mode.
   ftxui::Element frame = ftxui::vbox({
       RenderStatusBar(model, mode, session_path, dialog.uri(),
-                      knob_options.duration().seconds(), profiler_state, timeline),
+                      knob_options.duration().seconds(), profiler_state, timeline, width),
       RenderTabStrip(active_tab),
       pane,
       ftxui::filler(),

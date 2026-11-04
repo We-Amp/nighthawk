@@ -87,6 +87,15 @@ inline PhaseInterval PreA1RunInterval(int64_t run_start_unix_ns, int64_t run_end
 // by phase id (an unparseable/absent concurrency leaves 0 — such intervals
 // still align but carry the unknown count, which marks differentials
 // non-comparable per 8.4 rather than guessing). Pure.
+//
+// CLOCK DOMAIN (m6 caveat): every stamp here is the ENGINE's wall clock, and
+// the intervals join only same-domain stamps (engine wall to engine wall), so
+// the split math is internally consistent on any venue. The TUI host's
+// mac-wall run stamps bound the OUTER interval; on the local venue the two
+// clocks are one. On a remote rig the mac<->SUT skew rides the recorded
+// clock_offset_uncertainty_ns of the resulting windows (the same 8.5 caveat
+// the fetch-orchestration interval carries) — the local-first venue is
+// exact; rig windows are honest about their uncertainty, never silently so.
 std::vector<PhaseInterval> PhaseIntervalsFromBoundaries(
     int64_t run_start_unix_ns, int64_t run_end_unix_ns,
     const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,

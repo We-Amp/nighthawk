@@ -70,16 +70,21 @@ void PhaseOrchestrator::emit(uint32_t phase_index) {
     // FORK-ONLY (T7 wiring): only the next-phase-start emit completes a
     // boundary — by then the drain was collected (collectDrainAcks pushed
     // the timing) and the idle gap was recorded against it (immediately
-    // above, in markNextPhaseStarted). The drain-complete emit's boundary is
-    // not yet idle-timed, and the final-complete emit is the run's own end.
+    // above, in markNextPhaseStarted). A FULLY CENSORED boundary completes
+    // too — 8.6 counted-not-hidden: it streams with the capped drain
+    // duration and its censoring deadline-anchored gap; the reviewer's rule
+    // is that the one case that must never vanish is the censored boundary.
+    // The drain-complete emit's boundary is not yet idle-timed, and the
+    // final-complete emit is the run's own end.
     if (state_ == BoundaryState::kNextPhaseStarted && phase_index > 0 && !timings_.empty() &&
-        timings_.back().idle_gap_ns >= 0) {
+        timings_.back().phase_index == phase_index - 1) {
       const PhaseBoundaryTiming& timing = timings_.back();
       event.boundary_complete = true;
       event.ending_phase_index = timing.phase_index;
       event.ending_phase_id = timing.phase_id;
       event.drain_duration_ns = timing.drain_duration_ns;
       event.idle_gap_ns = timing.idle_gap_ns;
+      event.boundary_censored = timing.drain_censored;
     }
     event_sink_(event);
   }
@@ -122,6 +127,15 @@ bool PhaseOrchestrator::collectDrainAcks(std::vector<std::future<PhaseDrainAck>>
   if (latest_drain_complete_ns >= earliest_stop_ns) {
     timing.drain_duration_ns = latest_drain_complete_ns - earliest_stop_ns;
     last_drain_complete_monotonic_ns_ = latest_drain_complete_ns;
+  } else {
+    // Fully censored (no ack landed, or none carried a usable pair): the
+    // bounded wait gave up at the deadline. 8.6 counted-not-hidden, never
+    // zero-silent: the recorded drain duration is the full budget, and the
+    // censoring deadline anchors the idle-gap measurement.
+    timing.drain_duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(budget)
+                                   .count();
+    timing.censored_deadline_monotonic_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count();
   }
   timings_.push_back(std::move(timing));
   state_ = BoundaryState::kDrainComplete;
@@ -131,8 +145,16 @@ bool PhaseOrchestrator::collectDrainAcks(std::vector<std::future<PhaseDrainAck>>
 
 void PhaseOrchestrator::markNextPhaseStarted(uint32_t phase_index) {
   ASSERT(phase_index < phases_.size(), "phase index out of range");
-  if (!timings_.empty() && last_drain_complete_monotonic_ns_ >= 0) {
-    timings_.back().idle_gap_ns = steadyNowNs() - last_drain_complete_monotonic_ns_;
+  if (!timings_.empty()) {
+    if (last_drain_complete_monotonic_ns_ >= 0) {
+      timings_.back().idle_gap_ns = steadyNowNs() - last_drain_complete_monotonic_ns_;
+    } else if (timings_.back().censored_deadline_monotonic_ns >= 0) {
+      // No completion instant exists (fully censored): the gap is measured
+      // from the censoring deadline — an honest lower bound, recorded as
+      // metadata like every other boundary number.
+      timings_.back().idle_gap_ns =
+          steadyNowNs() - timings_.back().censored_deadline_monotonic_ns;
+    }
     last_drain_complete_monotonic_ns_ = -1;
   }
   state_ = BoundaryState::kNextPhaseStarted;

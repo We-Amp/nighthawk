@@ -80,6 +80,12 @@ struct ProfilePipelineConfig {
   // the pool job so a test can land the run's end inside the retrieval
   // window (the straddle-belt case). Production keeps 0.
   int test_retriever_delay_ms = 0;
+  // TEST-ONLY seam (M2 fix round, same pattern): REPLACES the run's captured
+  // boundary events for the split alignment, so a wiring test can place the
+  // boundary deterministically (fixed offsets from its own t0) instead of
+  // racing a live phase run's emit timing. Production keeps it empty — the
+  // real intake is the streamed events.
+  std::vector<nighthawk::client::PhaseBoundaryEvent> test_boundary_events;
 };
 
 // The completed-work series for the §8.4 per-unit-of-work denominator: the
@@ -392,6 +398,10 @@ struct ShellState {
   std::string uri_field;
   std::string rps_field;
   std::string duration_field;
+  // The M2 phase-vector entry's draft (comma-separated
+  // name:rps:duration[:concurrency[:connections]] entries); a non-empty
+  // draft makes the built request a phase run.
+  std::string phases_field;
   // The `?` help overlay (navigate mode).
   bool help_open = false;
   // True after a rejected enter whose failure was field validation: the

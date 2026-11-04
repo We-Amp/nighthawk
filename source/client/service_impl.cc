@@ -66,9 +66,13 @@ void ServiceImpl::handleExecutionRequest(
   // collector, and the shared stream-write mutex serializes both. A failed
   // write means the stream is gone (client cancelled); stop delivering.
   if (options->liveStreamingEnabled()) {
+    // m8: the collector's write contract — a failed Write means the stream
+    // is gone (client cancelled); stop producing boundary responses.
+    std::atomic<bool> phase_event_stream_gone{false};
     static_cast<ProcessImpl&>(*process).setPhaseEventCallback(
-        [this, stream](const Nighthawk::Client::PhaseEvent& event) {
-          if (!event.boundary_complete) {
+        [this, stream, &phase_event_stream_gone](const Nighthawk::Client::PhaseEvent& event) {
+          if (!event.boundary_complete ||
+              phase_event_stream_gone.load(std::memory_order_relaxed)) {
             return;
           }
           nighthawk::client::ExecutionResponse response;
@@ -87,8 +91,11 @@ void ServiceImpl::handleExecutionRequest(
           }
           boundary->set_worker_count(event.worker_count);
           boundary->set_next_phase_cold_started(event.next_phase_cold_started);
+          boundary->set_drain_censored(event.boundary_censored);
           absl::MutexLock lock(&stream_write_mutex_);
-          stream->Write(response);
+          if (!stream->Write(response)) {
+            phase_event_stream_gone.store(true, std::memory_order_relaxed);
+          }
         });
   }
 

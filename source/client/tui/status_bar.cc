@@ -62,7 +62,8 @@ std::optional<uint32_t> declaredWorkers(const nighthawk::client::PhaseSpec& spec
 ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
                                absl::string_view session_path, absl::string_view uri,
                                int duration_seconds, absl::string_view profiler_state,
-                               const std::vector<PhaseTimelineSegment>* timeline) {
+                               const std::vector<PhaseTimelineSegment>* timeline,
+                               int bar_width) {
   const std::string state =
       model.run_state.empty() ? "idle" : model.run_state;
   const bool left_idle = state != "idle";
@@ -120,19 +121,21 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
   const std::string phase = model.last_snapshot.phase_id();
   const std::string epoch = model.last_snapshot.epoch_id();
   const bool phase_id_real = !phase.empty() && phase != "main";
-  std::string row1;
-  if (timeline != nullptr && !timeline->empty()) {
-    row1 = absl::StrCat(PhaseTimelineStrip(*timeline), " | epoch: ",
-                        epoch.empty() ? "(none)" : epoch,
-                        epoch.empty() ? "" : " [placeholder]", " | flush ",
-                        kStatusBarFlushIntervalSeconds, "s");
-  } else {
-    row1 = absl::StrCat("phase: ", phase.empty() ? "(none)" : phase,
-                        phase_id_real ? "" : " [pre-phase-engine placeholder]",
-                        " | epoch: ", epoch.empty() ? "(none)" : epoch,
-                        epoch.empty() ? "" : " [placeholder]", " | flush ",
-                        kStatusBarFlushIntervalSeconds, "s");
-  }
+  const std::string epoch_cell = absl::StrCat(
+      " | epoch: ", epoch.empty() ? "(none)" : epoch,
+      epoch.empty() ? "" : " [placeholder]", " | flush ", kStatusBarFlushIntervalSeconds, "s");
+  // m1: the strip clips to the bar width minus the tail via
+  // RenderPhaseTimeline's truncation — the bar's no-overflow contract.
+  // bar_width <= 0 means "unclipped" (callers without a width): pass a
+  // bound too large for any real strip rather than 0 (which renders empty).
+  const int strip_budget =
+      bar_width > 0 ? std::max(20, bar_width - static_cast<int>(epoch_cell.size())) : 4096;
+  ftxui::Element row1_element =
+      timeline != nullptr && !timeline->empty()
+          ? ftxui::hbox({RenderPhaseTimeline(*timeline, strip_budget), ftxui::text(epoch_cell)})
+          : ftxui::text(absl::StrCat("phase: ", phase.empty() ? "(none)" : phase,
+                                     phase_id_real ? "" : " [pre-phase-engine placeholder]",
+                                     epoch_cell));
 
   // Row 2: session path + input mode + the M1 SUT-stats and profiler cells.
   // The mode cell renders inverse-video while an input mode owns the
@@ -159,7 +162,7 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
 
   return ftxui::vbox({
       ftxui::text(row0),
-      ftxui::text(row1),
+      std::move(row1_element),
       ftxui::hbox(std::move(row2)),
   });
 }
@@ -258,12 +261,11 @@ std::string PhaseTimelineStrip(const std::vector<PhaseTimelineSegment>& segments
       }
     }
     // The boundary that ended this phase (never on the final phase), as a
-    // visible gap segment.
+    // visible gap segment. The drain renders EXPLICITLY — including 0.0s —
+    // never zero-silent (8.6: recorded, never hidden).
     if (i + 1 < segments.size()) {
       absl::StrAppend(&strip, " |");
-      if (segment.drain_seconds > 0) {
-        absl::StrAppend(&strip, absl::StrFormat(" drain %.1fs", segment.drain_seconds));
-      }
+      absl::StrAppend(&strip, absl::StrFormat(" drain %.1fs", segment.drain_seconds));
       if (segment.idle_gap_seconds > 0) {
         absl::StrAppend(&strip, absl::StrFormat(" gap %.1fs", segment.idle_gap_seconds));
       }
@@ -281,6 +283,9 @@ std::string PhaseTimelineStrip(const std::vector<PhaseTimelineSegment>& segments
       }
       if (segment.new_workers_cold_started) {
         absl::StrAppend(&strip, " cold");
+      }
+      if (segment.drain_censored) {
+        absl::StrAppend(&strip, " cens");
       }
     }
   }
@@ -337,7 +342,10 @@ std::vector<PhaseTimelineSegment> PhaseTimelineSegmentsFromEvents(
     segment.drain_seconds =
         wire_event.drain_duration().seconds() + wire_event.drain_duration().nanos() / 1e9;
     segment.idle_gap_seconds =
-        wire_event.idle_gap().seconds() + wire_event.idle_gap().nanos() / 1e9;
+        wire_event.has_idle_gap()
+            ? wire_event.idle_gap().seconds() + wire_event.idle_gap().nanos() / 1e9
+            : 0.0;
+    segment.drain_censored = wire_event.drain_censored();
     segment.new_workers_cold_started = wire_event.next_phase_cold_started();
   }
   return segments;

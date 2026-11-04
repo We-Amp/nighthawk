@@ -491,6 +491,40 @@ TEST(ChartsTest, CounterLineSingleRowGridStaysInBounds) {
   }
 }
 
+// M2: the band reset marker — at each visible phase boundary the band
+// restarts (a fresh slab), so the boundary's time-anchored column renders a
+// full-height "|" (the pre-boundary glyphs of that column yield to the reset
+// line; counters remain continuous — this is a slab boundary, not a gap).
+TEST(ChartsTest, BandResetMarkerRendersAtBoundary) {
+  // Ten 1s points at t=0..9s; the boundary lands at t=5s.
+  std::vector<PercentilePoint> points = percentilePoints(10);
+  const std::vector<uint64_t> boundaries = {5'000'000'000ull};
+  std::vector<std::string> lines =
+      screenLines(RenderPercentileBand(points, 100, 6, {}, "waiting", boundaries), 100, 6);
+  ASSERT_GE(lines.size(), 2u);
+
+  // The boundary's time-anchored column: newest t=9s at column 99, one
+  // column per second -> t=5s at column 95.
+  const size_t boundary_column = 95;
+  size_t marked_rows = 0;
+  for (size_t row = 1; row < lines.size(); ++row) {
+    if (lines[row].size() > boundary_column && lines[row][boundary_column] == '|') {
+      ++marked_rows;
+    }
+  }
+  EXPECT_GT(marked_rows, 0u) << "no reset marker at the boundary column";
+
+  // Without boundaries, no marker renders anywhere in the band.
+  std::vector<std::string> plain = screenLines(RenderPercentileBand(points, 100, 6), 100, 6);
+  bool any_marker = false;
+  for (size_t row = 1; row < plain.size(); ++row) {
+    if (plain[row].find('|') != std::string::npos) {
+      any_marker = true;
+    }
+  }
+  EXPECT_FALSE(any_marker);
+}
+
 TEST(ChartsTest, PercentileBandSingleRowGridStaysInBounds) {
   // Same regression for the band: height 2 → band_rows = 1; every p50/p90/p99
   // below the window max must stay inside the single row.

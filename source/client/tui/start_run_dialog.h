@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+
 #include "api/client/options.pb.h"
 #include "api/client/service.pb.h"
 
@@ -30,6 +33,21 @@ public:
   void set_phases(std::vector<nighthawk::client::PhaseSpec> phases);
   const std::vector<nighthawk::client::PhaseSpec>& phases() const { return phases_; }
 
+  // The dialog's phase entry field (m-fix: the production affordance): one
+  // line of comma-separated phase entries, each
+  //   name:rps:duration_seconds[:concurrency[:connections]]
+  // e.g. `warm:100:5:2,spike:400:5:4:64`. Non-empty means the built request
+  // is a phase run carrying the parsed vector; valid() reuses the pure
+  // phase-vector validation on the parsed result.
+  void set_phases_field(std::string text);
+  const std::string& phases_field() const { return phases_field_; }
+
+  // The field's parser: comma/newline-separated entries as above, in phase
+  // order. InvalidArgumentError naming the offending entry when any entry is
+  // malformed. Pure.
+  static absl::StatusOr<std::vector<nighthawk::client::PhaseSpec>>
+  ParsePhasesField(absl::string_view text);
+
   const std::string& uri() const { return uri_; }
   uint32_t rps() const { return rps_; }
   uint32_t duration_seconds() const { return duration_seconds_; }
@@ -48,15 +66,15 @@ public:
   // the vector instead of the top-level duration.
   nighthawk::client::StartRequest build_request() const;
 
-  // The dialog's three fields, in render order (the dialog overlay's field
+  // The dialog's four fields, in render order (the dialog overlay's field
   // rows and the shell's active-field tracking share this numbering).
-  enum DialogField { kUri = 0, kRps = 1, kDuration = 2 };
+  enum DialogField { kUri = 0, kRps = 1, kDuration = 2, kPhases = 3 };
 
   // The inline error text for one field ("rps: must be > 0"), or "" when the
   // field is fine. Pure; the dialog overlay renders these on the offending
-  // field's own row after a rejected submit. For a phase run, a failing
-  // phase vector surfaces on the duration row's slot (the field the vector
-  // replaces) with the reused validation's message.
+  // field's own row after a rejected submit. A malformed phases field or a
+  // vector failing the reused validation surfaces on the phases field's own
+  // row with the parser's / the reused validation's message.
   static std::string FieldError(const StartRunDialogModel& dialog, int field);
 
 private:
@@ -64,6 +82,7 @@ private:
   uint32_t rps_ = 0;
   uint32_t duration_seconds_ = 0;
   std::vector<nighthawk::client::PhaseSpec> phases_;
+  std::string phases_field_;
 };
 
 } // namespace Tui

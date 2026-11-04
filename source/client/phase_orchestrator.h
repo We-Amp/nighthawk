@@ -46,9 +46,14 @@ struct PhaseEvent {
   uint32_t ending_phase_index = 0;
   std::string ending_phase_id;
   // The boundary's recorded timings; -1 when unknown (boundary_complete
-  // false).
+  // false, or the idle gap of a fully censored drain — no completion
+  // instant exists to measure from; the gap is then measured from the
+  // censoring deadline and the boundary carries boundary_censored).
   int64_t drain_duration_ns = -1;
   int64_t idle_gap_ns = -1;
+  // 8.6 counted-not-hidden: the boundary's drain was censored (the bounded
+  // wait gave up; the recorded drain duration is the full budget).
+  bool boundary_censored = false;
   // The ending phase's active workers and the successor-attributed cold
   // flag (enriched by ProcessImpl from the worker-subset plan before the
   // callback fires; 0/false when boundary_complete is false).
@@ -73,9 +78,16 @@ struct PhaseBoundaryTiming {
   std::string phase_id;
   int64_t drain_duration_ns{0};
   // Last drain completion -> next phase's first scheduled work; -1 when the
-  // phase has no successor (final boundary of the run).
+  // phase has no successor (final boundary of the run) OR when a fully
+  // censored drain left no completion instant to measure from (the gap is
+  // then computed from the censoring deadline instead).
   int64_t idle_gap_ns{-1};
   bool drain_censored{false};
+  // The censoring deadline instant (steady monotonic ns) of a censored
+  // drain: the bounded wait gave up here, so the recorded drain duration is
+  // the full budget (capped, never zero-silent) and the idle gap is measured
+  // from this instant when no completion instant exists. -1 when uncensored.
+  int64_t censored_deadline_monotonic_ns{-1};
 };
 
 // FORK-ONLY (We-Amp): per-phase worker-subset bookkeeping (M2 Task 6). One

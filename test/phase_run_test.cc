@@ -944,6 +944,39 @@ TEST(PhaseOrchestratorTest, DrainWaitBoundedByTimeout) {
   EXPECT_TRUE(orchestrator.boundaryTimings()[0].drain_censored);
 }
 
+// 8.6 counted-not-hidden (fix round): a FULLY CENSORED boundary still
+// completes and streams at the next phase start — the one case that must
+// never vanish. The recorded drain is the full budget (capped, never
+// zero-silent) and the idle gap is measured from the censoring deadline.
+TEST(PhaseOrchestratorTest, CensoredBoundaryStillEmitsAtNextPhaseStart) {
+  std::vector<PhaseEvent> events;
+  PhaseOrchestrator orchestrator(
+      twoPhaseSpecs(), [&events](const PhaseEvent& event) { events.push_back(event); });
+  std::promise<PhaseDrainAck> never_satisfied;
+  std::vector<std::future<PhaseDrainAck>> acks;
+  acks.push_back(never_satisfied.get_future());
+
+  ASSERT_FALSE(orchestrator.collectDrainAcks(acks, std::chrono::milliseconds(100), 0));
+  // The drain-complete emit carries no boundary.
+  ASSERT_EQ(1, events.size());
+  EXPECT_FALSE(events[0].boundary_complete);
+
+  orchestrator.markNextPhaseStarted(1);
+  ASSERT_EQ(2, events.size());
+  EXPECT_TRUE(events[1].boundary_complete);
+  EXPECT_EQ(events[1].ending_phase_index, 0u);
+  EXPECT_EQ(events[1].ending_phase_id, "phase0");
+  EXPECT_EQ(events[1].phase_index, 1u);
+  EXPECT_EQ(events[1].phase_id, "phase1");
+  // The capped drain: the full budget, never zero.
+  EXPECT_EQ(events[1].drain_duration_ns,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(100ms).count());
+  // The gap is the deadline-anchored lower bound (small but recorded).
+  EXPECT_GE(events[1].idle_gap_ns, 0);
+  EXPECT_LT(events[1].idle_gap_ns, std::chrono::nanoseconds(2s).count());
+  EXPECT_TRUE(events[1].boundary_censored);
+}
+
 TEST(PhaseOrchestratorTest, IdleGapRecordedAgainstNextPhaseStart) {
   std::vector<PhaseEvent> events;
   PhaseOrchestrator orchestrator(

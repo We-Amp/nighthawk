@@ -57,21 +57,40 @@ constexpr auto kScrapeCadence = std::chrono::seconds(kStatusBarFlushIntervalSeco
 constexpr int64_t kDateGranularityNs = 1'000'000'000;
 
 // The live run's worker count, for the staged preview's worker-set
-// annotation: the last declared phase's workers when the run carries a phase
-// vector, else the run-level concurrency; 1 when nothing is declared.
-uint32_t CurrentRunWorkerCount(const nighthawk::client::CommandLineOptions& options) {
+// annotation (m2): the CURRENTLY-ACTIVE phase's declared workers (matched by
+// the live snapshot's phase id), else the run-level concurrency; 1 when
+// nothing is declared.
+uint32_t CurrentRunWorkerCount(const nighthawk::client::CommandLineOptions& options,
+                               absl::string_view current_phase_id) {
   std::string concurrency;
-  if (!options.phases().empty()) {
-    if (options.phases().rbegin()->has_concurrency()) {
-      concurrency = options.phases().rbegin()->concurrency().value();
+  for (const nighthawk::client::PhaseSpec& phase : options.phases()) {
+    if (phase.name() == current_phase_id) {
+      if (phase.has_concurrency()) {
+        concurrency = phase.concurrency().value();
+      }
+      break;
     }
-  } else if (options.has_concurrency()) {
+  }
+  if (concurrency.empty() && options.has_concurrency()) {
     concurrency = options.concurrency().value();
   }
   int parsed = 0;
   return !concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0
              ? static_cast<uint32_t>(parsed)
              : 1;
+}
+
+// The currently-active phase's index (matched by the live snapshot's phase
+// id; 0 when unknown) — the staged preview's annotation addresses the
+// hypothetical next phase as current + 1.
+uint32_t ActivePhaseIndex(const nighthawk::client::CommandLineOptions& options,
+                          absl::string_view current_phase_id) {
+  for (int i = 0; i < options.phases().size(); ++i) {
+    if (options.phases(i).name() == current_phase_id) {
+      return static_cast<uint32_t>(i);
+    }
+  }
+  return 0;
 }
 
 int64_t nowUnixNs() {
@@ -213,16 +232,33 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
   // anchor.monotonic).
   const int64_t anchor_offset = input.anchor.wall_time_unix_ns - input.anchor.monotonic_ns;
 
-  if (!input.boundary_events.empty()) {
+  if (!input.boundary_events.empty() || !input.phase_specs.empty()) {
     // M2 split-at-boundary alignment: engine intervals joined on the
     // streamed (wall, monotonic) pairs (DQ-3). A window straddling a
-    // boundary splits into per-phase parts; too-short or drain-incomplete
-    // parts are excluded-and-marked with the reason.
+    // boundary splits into per-phase parts. Before the run's FIRST boundary
+    // lands, a phase run still gets its phase-0 interval from the specs
+    // (bounded by observed time only — never a fabricated future end).
     const int64_t interval_end =
         input.run_finished ? input.run_end_unix_ns
                            : std::max(input.run_start_unix_ns + 1, fetched.requested_end_unix_ns);
-    const std::vector<PhaseInterval> intervals = PhaseIntervalsFromBoundaries(
+    std::vector<PhaseInterval> intervals = PhaseIntervalsFromBoundaries(
         input.run_start_unix_ns, interval_end, input.boundary_events, input.phase_specs);
+    if (intervals.empty() && !input.phase_specs.empty()) {
+      // Pre-first-boundary phase run: one interval for the live phase-0,
+      // ending at the observed bound.
+      PhaseInterval first;
+      first.phase_id = input.phase_specs.front().name();
+      first.start_unix_ns = input.run_start_unix_ns;
+      first.end_unix_ns = interval_end;
+      first.drain_complete = true;
+      int parsed = 0;
+      if (input.phase_specs.front().has_concurrency() &&
+          absl::SimpleAtoi(input.phase_specs.front().concurrency().value(), &parsed) &&
+          parsed > 0) {
+        first.worker_count = static_cast<uint64_t>(parsed);
+      }
+      intervals.push_back(std::move(first));
+    }
     if (intervals.empty()) {
       outcome.note = "window rejected: no phase intervals from the boundary events";
       return outcome;
@@ -230,22 +266,27 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
     SplitAlignment split = WindowPhaseAlignment::AlignSplit(
         *std::move(tree_or), intervals, window_start, window_end, fetched.profile_type,
         uncertainty, input.completed_series, anchor_offset);
+    // The excluded-and-marked parts ALWAYS land (store + session, purity 0.0,
+    // the rule-naming reason) — the fix-round rule: a marked part must never
+    // vanish just because a pure sibling exists; only the note changes shape.
     outcome.windows = std::move(split.pure);
-    const size_t split_count = outcome.windows.size();
+    for (ProfileWindow& excluded : split.excluded) {
+      outcome.windows.push_back(std::move(excluded));
+    }
     std::string note;
-    if (split_count > 0) {
-      note = absl::StrCat("window split at the boundary: ", split_count, " pure part(s)");
+    if (!split.pure.empty()) {
+      note = absl::StrCat("window split at the boundary: ", split.pure.size(), " pure part(s)");
       for (const std::string& reason : split.reasons) {
         absl::StrAppend(&note, " | ", reason);
       }
-    } else if (!split.excluded.empty()) {
+    } else if (!split.reasons.empty()) {
       note = "window EXCLUDED-AND-MARKED: " + split.reasons.front();
       for (size_t i = 1; i < split.reasons.size(); ++i) {
         absl::StrAppend(&note, " | ", split.reasons[i]);
       }
-      outcome.windows = std::move(split.excluded);
     } else {
       note = "window rejected: no part overlaps the run's phase intervals";
+      outcome.windows.clear();
     }
     if (!symbolizer_note.empty()) {
       absl::StrAppend(&note, " | ", symbolizer_note);
@@ -349,6 +390,7 @@ void FillOverlayState(const ShellState& state, OverlayState* overlay) {
   overlay->uri_field = state.uri_field;
   overlay->rps_field = state.rps_field;
   overlay->duration_field = state.duration_field;
+  overlay->phases_field = state.phases_field;
   overlay->show_errors = state.show_errors;
   overlay->help_open = state.help_open;
   // The controller-rejection line rides along: dropping this copy would make
@@ -447,6 +489,7 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
       state.uri_field.clear();
       state.rps_field.clear();
       state.duration_field.clear();
+      state.phases_field.clear();
       state.show_errors = false;
       state.start_rejected.clear();
       state.mode = InputMode::kNavigate;
@@ -461,13 +504,19 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
       uint32_t rps = 0;
       uint32_t duration_seconds = 0;
       // Unparseable (or empty) fields stay 0, which the dialog rejects.
-      const bool parsed = absl::SimpleAtoi(state.rps_field, &rps) &&
-                          absl::SimpleAtoi(state.duration_field, &duration_seconds);
+      // A phase run (non-empty phases field) replaces the duration: it is
+      // then not required and not written (mutual exclusion by
+      // construction).
+      const bool rps_parsed = absl::SimpleAtoi(state.rps_field, &rps);
+      const bool duration_required = absl::StripAsciiWhitespace(state.phases_field).empty();
+      const bool duration_parsed =
+          !duration_required || absl::SimpleAtoi(state.duration_field, &duration_seconds);
       state.dialog.set_rps(rps);
       state.dialog.set_duration_seconds(duration_seconds);
+      state.dialog.set_phases_field(state.phases_field);
       // Field-validation failure first: inline errors on the offending field
       // rows plus the error-count border title.
-      if (!parsed || !state.dialog.valid()) {
+      if (!rps_parsed || !duration_parsed || !state.dialog.valid()) {
         // A failed enter is never silent and never closes the box: the
         // inline errors render on the offending field rows until the form
         // validates or esc cancels.
@@ -479,6 +528,7 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
         state.uri_field.clear();
         state.rps_field.clear();
         state.duration_field.clear();
+        state.phases_field.clear();
         state.show_errors = false;
         state.start_rejected.clear();
         state.mode = InputMode::kNavigate;
@@ -625,6 +675,7 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     state.uri_field.clear();
     state.rps_field.clear();
     state.duration_field.clear();
+    state.phases_field.clear();
     state.show_errors = false;
     state.start_rejected.clear();
     state.mode = InputMode::kEditingStartRun;
@@ -932,8 +983,12 @@ absl::Status RunController::StopProfileWindowAndFold() {
     input->worker_count = worker_count_;
     input->completed_series = MergeCompletedSeries(model_.counters);
     // M2 split alignment inputs: the run's streamed boundaries and the phase
-    // specs (empty events keep the M1 producer).
-    input->boundary_events = boundary_events_;
+    // specs (empty events keep the M1 producer). The TEST-ONLY seam replaces
+    // the streamed boundaries so a wiring test can place the boundary
+    // deterministically.
+    input->boundary_events = profile_config_.test_boundary_events.empty()
+                                 ? boundary_events_
+                                 : profile_config_.test_boundary_events;
     input->phase_specs = {knob_options_.phases().begin(), knob_options_.phases().end()};
     // RunFeed clears its running flag BEFORE on_finished fires (run_feed.cc's
     // teardown order), so "feed idle but stamp not yet recorded" means the
@@ -1533,6 +1588,8 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   Component uri_input = Input(&state.uri_field, "target uri");
   Component rps_input = Input(&state.rps_field, "requests per second");
   Component duration_input = Input(&state.duration_field, "duration in seconds");
+  Component phases_input =
+      Input(&state.phases_field, "phases: name:rps:secs[:workers[:conns]], ...");
 
   // Fullscreen (the alternate-screen buffer) keeps the live TUI from messing
   // up the terminal's scrollback.
@@ -1548,7 +1605,8 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     }
   });
 
-  Component editor = ftxui::Container::Vertical({uri_input, rps_input, duration_input});
+  Component editor =
+      ftxui::Container::Vertical({uri_input, rps_input, duration_input, phases_input});
   Component view = Renderer(editor, [&]() {
     static const RunViewModel kIdleModel;
     std::shared_ptr<const RunViewModel> model = controller.model();
@@ -1560,12 +1618,14 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     // shell-only extras.
     OverlayState overlay;
     FillOverlayState(state, &overlay);
-    overlay.active_field = uri_input->Focused() ? StartRunDialogModel::kUri
-                          : rps_input->Focused() ? StartRunDialogModel::kRps
-                                                 : StartRunDialogModel::kDuration;
+    overlay.active_field = uri_input->Focused()      ? StartRunDialogModel::kUri
+                           : rps_input->Focused()    ? StartRunDialogModel::kRps
+                           : duration_input->Focused() ? StartRunDialogModel::kDuration
+                                                       : StartRunDialogModel::kPhases;
     overlay.uri_input = uri_input;
     overlay.rps_input = rps_input;
     overlay.duration_input = duration_input;
+    overlay.phases_input = phases_input;
     // The flame pane (tab 1) composes from the controller's immutable stores
     // + the shell's view state — the same BuildFlamePane the tests use. The
     // window snapshot is held in a LOCAL (fix, review round 1): tree points
@@ -1586,10 +1646,19 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     // keeps its placeholder row). Built fresh per frame from the
     // controller's immutable snapshots.
     const nighthawk::client::CommandLineOptions knob_options = controller.knobOptions();
+    const std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events =
+        controller.boundaryEvents();
+    const std::string current_phase_id = view_model.last_snapshot.phase_id();
     const std::vector<PhaseTimelineSegment> timeline =
-        BuildPhaseTimeline(knob_options, controller.boundaryEvents(),
-                           controller.finalPhaseMetadata(),
-                           view_model.last_snapshot.phase_id());
+        BuildPhaseTimeline(knob_options, boundary_events, controller.finalPhaseMetadata(),
+                           current_phase_id);
+    // The charts' band reset markers ride the same events (the boundaries'
+    // monotonic stamps).
+    std::vector<uint64_t> boundary_stamps;
+    boundary_stamps.reserve(boundary_events.size());
+    for (const nighthawk::client::PhaseBoundaryEvent& event : boundary_events) {
+      boundary_stamps.push_back(event.monotonic_ns());
+    }
     // The staged next-phase preview (M2): nothing staged renders nothing.
     const std::vector<KnobDisplay> staged_preview =
         state.staged_next_phase.name().empty()
@@ -1601,16 +1670,19 @@ int runInteractive(const std::string& address, const std::string& session_prefix
       if (state.staged_next_phase.has_concurrency() &&
           absl::SimpleAtoi(state.staged_next_phase.concurrency().value(), &parsed) &&
           parsed > 0) {
-        staged_annotation = WorkerSetAnnotation(CurrentRunWorkerCount(knob_options),
-                                                static_cast<uint32_t>(parsed),
-                                                static_cast<uint32_t>(knob_options.phases_size()));
+        // m2: the baseline is the CURRENTLY-ACTIVE phase's count; the
+        // hypothetical staged phase addresses as active index + 1.
+        staged_annotation = WorkerSetAnnotation(
+            CurrentRunWorkerCount(knob_options, current_phase_id),
+            static_cast<uint32_t>(parsed), ActivePhaseIndex(knob_options, current_phase_id) + 1);
       }
     }
     return RenderLayout(screen.dimx(), screen.dimy(), state.active_tab, state.mode, view_model,
                         state.dialog, controller.sessionPath(), knob_options, &overlay, &flame,
                         controller.profileWindowState(), &timeline,
                         staged_preview.empty() ? nullptr : &staged_preview,
-                        staged_preview.empty() ? nullptr : &staged_annotation);
+                        staged_preview.empty() ? nullptr : &staged_annotation,
+                        &boundary_stamps);
   });
 
   Component app = CatchEvent(view, [&](Event event) {

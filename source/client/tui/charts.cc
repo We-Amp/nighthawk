@@ -179,7 +179,8 @@ ftxui::Element rowsAsElement(const std::vector<std::string>& rows) {
 
 ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, int width,
                                     int height, const BandAnnotations& annotations,
-                                    absl::string_view empty_message) {
+                                    absl::string_view empty_message,
+                                    const std::vector<uint64_t>& boundary_stamps_ns) {
   if (points.empty()) {
     return ftxui::text(std::string(empty_message.empty() ? kDefaultPlaceholder : empty_message));
   }
@@ -273,6 +274,20 @@ ftxui::Element RenderPercentileBand(const std::vector<PercentilePoint>& points, 
     // The excursion salience glyph at the excursion's own cell (the window's
     // p99 max), where the lone envelope dot would be missed.
     grid[rowFor(max_p99, max_p99, band_rows)][max_column] = '!';
+  }
+  // The M2 band reset markers: at each visible phase boundary the band
+  // restarts (a fresh slab), so the boundary's time-anchored column renders
+  // a full-height "|" — the pre-boundary glyphs of that column yield to the
+  // reset line (counters remain continuous; this is a slab boundary, not a
+  // data gap).
+  for (const uint64_t boundary_ns : boundary_stamps_ns) {
+    const int column = columnFor(boundary_ns, newest_ns, interval_ns, width);
+    if (column < 0) {
+      continue;
+    }
+    for (std::string& line : grid) {
+      line[static_cast<size_t>(column)] = '|';
+    }
   }
   if (!grid_label.empty()) {
     const int grid_row = rowFor(grid_ns, max_p99, band_rows);

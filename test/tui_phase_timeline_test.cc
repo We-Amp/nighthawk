@@ -462,6 +462,27 @@ TEST(PhaseBoundaryTest, EventConversionJoinsEndingPhaseAndDefaultsClaims) {
   EXPECT_EQ(record.gate_exceeded(), 0);
 }
 
+// 8.6 counted-not-hidden: a censored boundary streams with the flag set, and
+// the record carries it (the strip renders the cens mark).
+TEST(PhaseBoundaryTest, CensoredBoundaryCarriesTheFlagThroughTheRecord) {
+  nighthawk::client::PhaseBoundaryEvent event;
+  event.set_phase_index(1);
+  event.set_phase_id("spike");
+  event.set_wall_time_unix_ns(3'000);
+  event.set_monotonic_ns(4'000);
+  event.set_ending_phase_index(0);
+  event.set_ending_phase_id("warm");
+  event.mutable_drain_duration()->set_seconds(1); // the capped full budget
+  event.mutable_idle_gap()->set_nanos(100'000);
+  event.set_worker_count(2);
+  event.set_drain_censored(true);
+
+  PhaseBoundaryRecord record = ToPhaseBoundaryRecord(event);
+  EXPECT_TRUE(record.drain_censored());
+  EXPECT_EQ(record.drain_duration().seconds(), 1);
+  EXPECT_EQ(record.idle_gap().nanos(), 100'000);
+}
+
 // Real phase ids flow into the persisted metric series (the placeholder
 // marker is dropped when real ids flow); the header conversion is unchanged.
 TEST(PhaseBoundaryTest, PhaseIdsFlowToSession) {

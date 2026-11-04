@@ -45,6 +45,9 @@ ToPhaseBoundaryRecord(uint32_t phase_index, absl::string_view phase_id,
   // Field 9 describes the transition INTO the successor (see the proto
   // comment's attribution rule) — the caller passes the successor's flag.
   record.set_new_workers_cold_started(next_phase_cold_started);
+  // m3 note: this overload is a TEST-ONLY seam now (field-exact record
+  // construction for the round-trip and conversion pins); the production
+  // intake is the PhaseBoundaryEvent overload below.
   // Pool aggregates: the per-worker sums of the ending phase's entries.
   uint64_t created = 0;
   uint64_t active = 0;
@@ -74,6 +77,7 @@ ToPhaseBoundaryRecord(const nighthawk::client::PhaseBoundaryEvent& event) {
   *record.mutable_idle_gap() = event.idle_gap();
   record.set_worker_count(event.worker_count());
   record.set_new_workers_cold_started(event.next_phase_cold_started());
+  record.set_drain_censored(event.drain_censored());
   // Pool-health and claim fields stay default: the engine computes them in
   // the output pass; the final Output's PhaseMetadata is the post-run
   // completeness source (DQ-3: metadata, never a synthetic snapshot).

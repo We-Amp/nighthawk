@@ -170,6 +170,11 @@ message PhaseBoundaryRecord {
   // hidden; the ratio is computed in the output, not the consumer).
   double completion_ratio = 12;
   uint64 gate_exceeded = 13;
+  // 8.6 counted-not-hidden: the boundary's drain was censored (the bounded
+  // wait gave up at the deadline; drain_duration carries the full budget and
+  // idle_gap is measured from the censoring deadline — an honest lower
+  // bound).
+  bool drain_censored = 14;
 }
 
 // One frame of a session file.
