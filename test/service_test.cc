@@ -21,6 +21,7 @@
 #include "test/test_common/utility.h"
 
 #include "api/client/service.pb.h"
+#include "api/rate_limiter/linear_ramping_rate_limiter.pb.h"
 
 #include "source/client/service_impl.h"
 
@@ -377,9 +378,7 @@ TEST_P(ServiceTest, InvalidRps) {
 // update arm with no active run tears the stream down with a clear message.
 TEST_P(ServiceTest, UpdateWithoutRunInFlightTearsDown) {
   request_ = nighthawk::client::ExecutionRequest();
-  request_.mutable_update_request()->add_deltas()
-      ->mutable_requests_per_second()
-      ->set_value(5);
+  request_.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(5);
   auto r = stub_->ExecutionStream(&context_);
   r->Write(request_, {});
   r->WritesDone();
@@ -433,9 +432,8 @@ TEST_P(ServiceTest, UpdateArmDoesNotTearDownStream) {
   auto r = startLiveRun(listener, 4, 10);
   std::this_thread::sleep_for(1s);
   nighthawk::client::ExecutionRequest update_request;
-  update_request.mutable_update_request()->add_deltas()
-      ->mutable_requests_per_second()
-      ->set_value(5);
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      5);
   ASSERT_TRUE(r->Write(update_request, {}));
   bool saw_ack = false;
   bool saw_output = false;
@@ -541,6 +539,106 @@ TEST_P(ServiceTest, EmptyDeltasRejected) {
   EXPECT_TRUE(r->Finish().ok());
 }
 
+// Whitelist validation against the ENGINE-built run shape, end to end (M3
+// Task 2). On a linear-ramping-plugin run: a ramp time exceeding the run's
+// remaining duration is rejected with the bound reason, and a ramp delta
+// that fits passes validation and is forwarded to the apply path (whose
+// stub's "not yet supported" reason is distinguishable from any whitelist
+// rejection). A validator never consulted would have produced the stub
+// reason for BOTH deltas. The stream and run survive every rejection.
+TEST_P(ServiceTest, RampDeltaValidatedAgainstRunShape) {
+  TestHttpListener listener;
+  // A 3s ramp-plugin run (the plugin's own 2s ramp time fits the duration,
+  // the factory's construction-time backstop).
+  ExecutionRequest start_request;
+  auto* options = start_request.mutable_start_request()->mutable_options();
+  options->mutable_uri()->set_value(listener.uri());
+  options->mutable_duration()->set_seconds(3);
+  options->mutable_requests_per_second()->set_value(10);
+  options->mutable_stats_flush_interval()->set_value(1);
+  options->mutable_concurrency()->set_value("1");
+  options->mutable_live_streaming();
+  auto* plugin = options->mutable_rate_limiter_plugin_config();
+  plugin->set_name("nighthawk.linear-ramping-rate-limiter-plugin");
+  nighthawk::rate_limiter::LinearRampingRateLimiterConfig ramp_config;
+  ramp_config.mutable_ramp_time()->set_seconds(2);
+  if (!plugin->mutable_typed_config()->PackFrom(ramp_config)) {
+    ASSERT_TRUE(false) << "failed to pack the ramping plugin config";
+  }
+  auto r = stub_->ExecutionStream(&context_);
+  ASSERT_TRUE(r->Write(start_request, {}));
+  std::this_thread::sleep_for(300ms);
+
+  nighthawk::client::ExecutionRequest too_long;
+  too_long.mutable_update_request()->add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(
+      100); // The run's remaining duration is far smaller.
+  ASSERT_TRUE(r->Write(too_long, {}));
+
+  nighthawk::client::ExecutionRequest fits;
+  auto* ramp = fits.mutable_update_request()->add_deltas()->mutable_ramp();
+  ramp->mutable_ramp_time()->set_seconds(1); // Fits the remaining duration.
+  ramp->mutable_target_rps()->set_value(10);
+  ASSERT_TRUE(r->Write(fits, {}));
+
+  bool saw_bound_rejection = false;
+  bool saw_forwarded_to_stub = false;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      const std::string& reason = response_.update_result().rejection_reason();
+      EXPECT_FALSE(response_.update_result().applied());
+      if (reason.find("ramp_time") != std::string::npos &&
+          reason.find("remaining") != std::string::npos) {
+        saw_bound_rejection = true;
+      }
+      if (reason.find("not yet supported") != std::string::npos) {
+        saw_forwarded_to_stub = true;
+      }
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_bound_rejection);
+  EXPECT_TRUE(saw_forwarded_to_stub);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// A rejected update mutates nothing: an out-of-whitelist delta (an unset
+// knob arm) is rejected with a structured whitelist reason before any engine
+// contact, and the run completes normally afterwards.
+TEST_P(ServiceTest, RejectedUpdateMutatesNothing) {
+  TestHttpListener listener;
+  auto r = startLiveRun(listener, 3, 10);
+  std::this_thread::sleep_for(300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas(); // No arm set.
+  ASSERT_TRUE(r->Write(update_request, {}));
+  bool saw_whitelist_rejection = false;
+  bool saw_output = false;
+  size_t snapshots_after_rejection = 0;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      EXPECT_FALSE(response_.update_result().applied());
+      EXPECT_THAT(response_.update_result().rejection_reason(), HasSubstr("no knob field is set"));
+      saw_whitelist_rejection = true;
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    } else if (saw_whitelist_rejection) {
+      ASSERT_TRUE(response_.has_live_snapshot());
+      snapshots_after_rejection++;
+    }
+  }
+  EXPECT_TRUE(saw_whitelist_rejection);
+  EXPECT_GT(snapshots_after_rejection, 0);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
 // Cancelling the client's gRPC context must promptly stop an in-flight
 // benchmark: the service must release its single-run lock so that a follow-up
 // run is served normally, instead of being declined while the abandoned run
@@ -629,9 +727,8 @@ TEST_P(ServiceTest, CancellationRequestNotStalledBehindAckWait) {
   // Send an update; from here its ack wait is in flight (the test applier
   // blocks until released or its deadline).
   nighthawk::client::ExecutionRequest update_request;
-  update_request.mutable_update_request()->add_deltas()
-      ->mutable_requests_per_second()
-      ->set_value(5);
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      5);
   ASSERT_TRUE(r->Write(update_request, {}));
   std::this_thread::sleep_for(200ms);
   ASSERT_NE(applier_ptr, nullptr);
@@ -684,9 +781,8 @@ TEST_P(ServiceTest, ArmDispatchAfterRunFailureIsHonestRejection) {
   // settled post-failure state.)
   std::this_thread::sleep_for(300ms);
   nighthawk::client::ExecutionRequest update_request;
-  update_request.mutable_update_request()->add_deltas()
-      ->mutable_requests_per_second()
-      ->set_value(5);
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      5);
   ASSERT_TRUE(r->Write(update_request, {}));
   // The arm never acks: the run is gone. The stream is torn down with an
   // honest failure status (either "run failed ..." while the unwind is still
@@ -718,16 +814,14 @@ TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterRunEnd) {
   auto r = startLiveRun(listener, 2, 10);
   std::this_thread::sleep_for(300ms);
   nighthawk::client::ExecutionRequest update_request;
-  update_request.mutable_update_request()->add_deltas()
-      ->mutable_requests_per_second()
-      ->set_value(5);
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      5);
   ASSERT_TRUE(r->Write(update_request, {}));
   ASSERT_NE(applier_ptr, nullptr);
 
   bool saw_output = false;
   while (r->Read(&response_)) {
-    EXPECT_FALSE(response_.has_update_result())
-        << "update ack written after the run ended";
+    EXPECT_FALSE(response_.has_update_result()) << "update ack written after the run ended";
     if (response_.has_output()) {
       saw_output = true;
       break;
@@ -765,9 +859,8 @@ TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterCancellationAccepted) 
   auto r = startLiveRun(listener, 60, 10);
   std::this_thread::sleep_for(500ms);
   nighthawk::client::ExecutionRequest update_request;
-  update_request.mutable_update_request()->add_deltas()
-      ->mutable_requests_per_second()
-      ->set_value(5);
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      5);
   ASSERT_TRUE(r->Write(update_request, {}));
   ASSERT_NE(applier_ptr, nullptr);
   nighthawk::client::ExecutionRequest cancel_request;

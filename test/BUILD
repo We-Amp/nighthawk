@@ -573,6 +573,7 @@ envoy_cc_test(
     name = "service_test",
     srcs = ["service_test.cc"],
     deps = [
+        "//api/rate_limiter:rate_limiter_plugin_cc_proto",
         "//source/client:nighthawk_service_lib",
         "//test/test_common:environment_lib",
         "@envoy//test/test_common:network_utility_lib",

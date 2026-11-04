@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "nighthawk/common/statistic.h"
 
 #include "source/client/live_partial_aggregator.h"
+#include "source/client/live_update_validator.h"
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "source/common/access_log/access_log_manager_impl.h"
@@ -122,6 +124,14 @@ public:
    */
   std::string currentPhaseId() const;
 
+  /**
+   * FORK-ONLY (We-Amp): the in-flight run's declared shape for live-update
+   * whitelist validation (M3 Task 2). Mutex-guarded; safe to call
+   * concurrently with a running benchmark (the update orchestrator calls it
+   * on the stream reader thread).
+   */
+  InFlightRunShape liveUpdateRunShape() const;
+
   // FORK-ONLY (We-Amp): multi-phase support (M2 A1). The callback fires on
   // the run-calling thread at each phase boundary the orchestrator marks;
   // the TUI's phase timeline and window alignment (M2 Task 7) consume these
@@ -209,7 +219,9 @@ private:
   // per-worker drain futures with a shared deadline of --timeout.
   void runPhases();
   void emitPhaseEvent(const PhaseEvent& event);
-  void setCurrentPhaseId(absl::string_view phase_id);
+  // FORK-ONLY (We-Amp): also records the phase's duration and start instant,
+  // for liveUpdateRunShape()'s remaining-duration bound (M3 Task 2).
+  void setCurrentPhaseId(absl::string_view phase_id, std::chrono::nanoseconds phase_duration_ns);
   // FORK-ONLY (We-Amp): the raise-only runtime breaker override arm (M2
   // Task 5, per the M2 Task 1 gate verdict). Runs on the run-calling thread
   // (the main thread: loadNewSnapshot asserts it) and must complete before
@@ -231,6 +243,12 @@ private:
   std::vector<std::shared_future<void>> worker_ready_futures_;
   mutable std::mutex current_phase_id_mutex_;
   std::string current_phase_id_{"main"};
+  // FORK-ONLY (We-Amp): current-phase duration and start instant, and the
+  // run's start instant, for liveUpdateRunShape()'s remaining-duration bound
+  // (M3 Task 2). Monotonic ns on time_system_'s clock.
+  int64_t current_phase_duration_ns_{0};
+  int64_t current_phase_start_monotonic_ns_{0};
+  int64_t run_start_monotonic_ns_{0};
   std::mutex live_partials_mutex_;
   std::vector<nighthawk::client::WorkerLiveSnapshotPartial> live_partials_;
   // FORK-ONLY (We-Amp): running fold of the drained partials. Honors the

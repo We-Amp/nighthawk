@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -16,7 +17,9 @@
 #include "api/client/service.pb.h"
 
 #include "source/client/live_update_orchestrator.h"
+#include "source/client/live_update_validator.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using namespace std::chrono_literals;
@@ -27,6 +30,7 @@ namespace {
 
 using nighthawk::client::UpdateRequest;
 using nighthawk::client::UpdateResult;
+using testing::HasSubstr;
 
 // Records every ack the orchestrator writes.
 class AckRecorder {
@@ -113,12 +117,13 @@ UpdateRequest MakeDeltasUpdate() {
   return request;
 }
 
-std::unique_ptr<LiveUpdateOrchestrator> MakeOrchestrator(
-    LiveUpdateOrchestrator::Applier* applier, AckRecorder* recorder,
-    const std::string& execution_id = "") {
+std::unique_ptr<LiveUpdateOrchestrator>
+MakeOrchestrator(LiveUpdateOrchestrator::Applier* applier, AckRecorder* recorder,
+                 const std::string& execution_id = "",
+                 LiveUpdateOrchestrator::RunShapeFn run_shape_fn = nullptr) {
   return std::make_unique<LiveUpdateOrchestrator>(
       applier, recorder->writer(), []() {}, []() { return std::string("current-phase"); },
-      execution_id, absl::Seconds(1));
+      execution_id, absl::Seconds(1), std::move(run_shape_fn));
 }
 
 // An applied update's ack carries the orchestrator-stamped epoch id and the
@@ -278,10 +283,262 @@ TEST(LiveUpdateOrchestratorTest, UpdateAfterRunEndResolvesWithoutWrite) {
 // without engine effects (there are none to have).
 TEST(LiveUpdateOrchestratorTest, DefaultApplierRejectsWithReason) {
   auto applier = MakeDefaultUpdateApplier();
-  UpdateResult result = applier->ApplyDeltas(MakeDeltasUpdate(), "epoch-1",
-                                             DefaultEngineInstant(), absl::InfiniteFuture());
+  UpdateResult result = applier->ApplyDeltas(MakeDeltasUpdate(), "epoch-1", DefaultEngineInstant(),
+                                             absl::InfiniteFuture());
   EXPECT_FALSE(result.applied());
   EXPECT_FALSE(result.rejection_reason().empty());
+}
+
+// --- Whitelist validator (pure, M3 Task 2) ---
+
+// Run shapes used across the validator tests.
+InFlightRunShape LegacyRunShape() {
+  // No phase vector, no ramp plugin, unbounded remaining time (--no-duration
+  // semantics: the ramp-time bound does not apply).
+  return InFlightRunShape{};
+}
+
+InFlightRunShape LegacyBoundedRunShape(std::chrono::nanoseconds remaining) {
+  InFlightRunShape shape = LegacyRunShape();
+  shape.remaining_duration = remaining;
+  return shape;
+}
+
+InFlightRunShape RampPluginRunShape(std::optional<std::chrono::nanoseconds> remaining) {
+  InFlightRunShape shape = LegacyRunShape();
+  shape.ramp_plugin_configured = true;
+  shape.remaining_duration = remaining;
+  return shape;
+}
+
+InFlightRunShape PhaseRunShape(std::chrono::nanoseconds remaining) {
+  InFlightRunShape shape = LegacyRunShape();
+  shape.has_phase_vector = true;
+  shape.ramp_plugin_configured = true; // A phase-vector run carrying the ramp plugin.
+  shape.current_phase_id = "phase-1";
+  shape.remaining_duration = remaining;
+  return shape;
+}
+
+// Every whitelisted shape of update passes: a plain rps delta on a
+// non-plugin run; a ramp delta with both fields on an unbounded ramp-plugin
+// run; a ramp delta with only one field set (absent fields keep their
+// current value); a ramp time that fits the current phase's remaining
+// duration. Note there is no valid rps+ramp mix while C1's interim rule
+// holds: rps deltas only pass on NON-plugin runs and ramp deltas only on
+// plugin runs (pinned by RpsOnRampPluginRunIsRampShapeValidation).
+TEST(LiveUpdateValidatorTest, ValidRpsAndRampDeltasPass) {
+  UpdateRequest rps_only;
+  rps_only.add_deltas()->mutable_requests_per_second()->set_value(5);
+  EXPECT_TRUE(ValidateUpdateDeltas(rps_only, LegacyRunShape()).ok());
+  EXPECT_TRUE(ValidateUpdateDeltas(rps_only, LegacyBoundedRunShape(30s)).ok());
+
+  UpdateRequest ramp_both;
+  auto* ramp = ramp_both.add_deltas()->mutable_ramp();
+  ramp->mutable_ramp_time()->set_seconds(5);
+  ramp->mutable_target_rps()->set_value(10);
+  EXPECT_TRUE(ValidateUpdateDeltas(ramp_both, RampPluginRunShape(std::nullopt)).ok());
+  EXPECT_TRUE(ValidateUpdateDeltas(ramp_both, RampPluginRunShape(30s)).ok());
+  EXPECT_TRUE(ValidateUpdateDeltas(ramp_both, PhaseRunShape(30s)).ok());
+
+  UpdateRequest ramp_partial;
+  ramp_partial.add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(5);
+  EXPECT_TRUE(ValidateUpdateDeltas(ramp_partial, RampPluginRunShape(30s)).ok());
+  UpdateRequest target_only;
+  target_only.add_deltas()->mutable_ramp()->mutable_target_rps()->set_value(10);
+  EXPECT_TRUE(ValidateUpdateDeltas(target_only, RampPluginRunShape(30s)).ok());
+}
+
+// A delta with no oneof arm set is rejected: unknown/absent arms fail
+// validation, never default. The reason names the whitelist -- knobs outside
+// it (queue bounds, connections, protocol, TLS, uri) have NO live arm at all
+// (DQ-1), so the unset-arm case is the only way a non-whitelisted "delta"
+// can present itself on the wire.
+TEST(LiveUpdateValidatorTest, OutOfWhitelistRejectedWithReason) {
+  UpdateRequest request;
+  request.add_deltas(); // KnobDelta with no arm set.
+  const absl::Status status = ValidateUpdateDeltas(request, LegacyRunShape());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("no knob field is set"));
+  EXPECT_THAT(status.message(), HasSubstr("live-knob whitelist"));
+}
+
+// A ramp delta on a run without the ramp plugin is rejected with a reason
+// pointing at the plugin requirement; rps-only updates still pass on that
+// run.
+TEST(LiveUpdateValidatorTest, RampWithoutPluginRejected) {
+  UpdateRequest ramp_only;
+  ramp_only.add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(5);
+  const absl::Status status = ValidateUpdateDeltas(ramp_only, LegacyBoundedRunShape(30s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("ramp"));
+  EXPECT_THAT(status.message(), HasSubstr("plugin"));
+
+  UpdateRequest rps_only;
+  rps_only.add_deltas()->mutable_requests_per_second()->set_value(5);
+  EXPECT_TRUE(ValidateUpdateDeltas(rps_only, LegacyBoundedRunShape(30s)).ok());
+}
+
+// The ramp invariants: a non-positive ramp time, a zero rps (both the plain
+// and the ramp target form), and a ramp time exceeding the remaining bound
+// are each rejected with the specific reason.
+TEST(LiveUpdateValidatorTest, RampInvariantsValidated) {
+  UpdateRequest zero_ramp;
+  zero_ramp.add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(0);
+  absl::Status status = ValidateUpdateDeltas(zero_ramp, RampPluginRunShape(30s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("ramp_time"));
+  EXPECT_THAT(status.message(), HasSubstr("positive"));
+
+  UpdateRequest negative_ramp;
+  auto* ramp = negative_ramp.add_deltas()->mutable_ramp();
+  ramp->mutable_ramp_time()->set_seconds(0);
+  ramp->mutable_ramp_time()->set_nanos(-1);
+  status = ValidateUpdateDeltas(negative_ramp, RampPluginRunShape(30s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("positive"));
+
+  UpdateRequest zero_target;
+  zero_target.add_deltas()->mutable_ramp()->mutable_target_rps()->set_value(0);
+  status = ValidateUpdateDeltas(zero_target, RampPluginRunShape(30s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("target_rps"));
+  EXPECT_THAT(status.message(), HasSubstr(">= 1"));
+
+  UpdateRequest long_ramp;
+  long_ramp.add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(11);
+  status = ValidateUpdateDeltas(long_ramp, PhaseRunShape(10s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("ramp_time"));
+  EXPECT_THAT(status.message(), HasSubstr("current phase"));
+
+  // On a legacy bounded run the ramp delta is rejected for the PLUGIN reason
+  // first (no ramp plugin configured); the ramp-time bound reason only ever
+  // appears on ramp-plugin runs (RampWithoutPluginRejected pins the plugin
+  // rejection too).
+  status = ValidateUpdateDeltas(long_ramp, RampPluginRunShape(10s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("ramp_time"));
+  EXPECT_THAT(status.message(), HasSubstr("run"));
+
+  // A ramp time exactly equal to the remaining duration is allowed (<=, not
+  // <).
+  UpdateRequest equal_ramp;
+  equal_ramp.add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(10);
+  EXPECT_TRUE(ValidateUpdateDeltas(equal_ramp, PhaseRunShape(10s)).ok());
+}
+
+// A plain rps value of zero is rejected with the >= 1 reason.
+TEST(LiveUpdateValidatorTest, ZeroRpsRejected) {
+  UpdateRequest request;
+  request.add_deltas()->mutable_requests_per_second()->set_value(0);
+  const absl::Status status = ValidateUpdateDeltas(request, LegacyRunShape());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("requests_per_second"));
+  EXPECT_THAT(status.message(), HasSubstr(">= 1"));
+}
+
+// C1: an rps delta on a ramp-plugin run is a ramp-shape change (it sets the
+// ramp's target frequency), so it routes through the ramp-shape validation
+// path: a zero value fails the ramp invariant, and a valid value is rejected
+// with the pending ramp re-anchoring reason until re-anchoring lands.
+TEST(LiveUpdateValidatorTest, RpsOnRampPluginRunIsRampShapeValidation) {
+  UpdateRequest zero_rps;
+  zero_rps.add_deltas()->mutable_requests_per_second()->set_value(0);
+  const absl::Status invariant = ValidateUpdateDeltas(zero_rps, RampPluginRunShape(30s));
+  EXPECT_EQ(invariant.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(invariant.message(), HasSubstr("requests_per_second"));
+  EXPECT_THAT(invariant.message(), HasSubstr(">= 1"));
+
+  UpdateRequest valid_rps;
+  valid_rps.add_deltas()->mutable_requests_per_second()->set_value(5);
+  const absl::Status status = ValidateUpdateDeltas(valid_rps, RampPluginRunShape(30s));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("requests_per_second"));
+  EXPECT_THAT(status.message(), HasSubstr("pending ramp re-anchoring"));
+}
+
+// Duplicates for the same knob in one request are rejected (ambiguous
+// order), for both knobs; distinct knobs in one request are fine (pinned by
+// ValidRpsAndRampDeltasPass).
+TEST(LiveUpdateValidatorTest, DuplicateKnobDeltasRejected) {
+  UpdateRequest double_rps;
+  double_rps.add_deltas()->mutable_requests_per_second()->set_value(5);
+  double_rps.add_deltas()->mutable_requests_per_second()->set_value(6);
+  const absl::Status rps_status = ValidateUpdateDeltas(double_rps, LegacyRunShape());
+  EXPECT_EQ(rps_status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(rps_status.message(), HasSubstr("requests_per_second"));
+
+  UpdateRequest double_ramp;
+  double_ramp.add_deltas()->mutable_ramp()->mutable_ramp_time()->set_seconds(5);
+  double_ramp.add_deltas()->mutable_ramp()->mutable_target_rps()->set_value(10);
+  const absl::Status ramp_status = ValidateUpdateDeltas(double_ramp, RampPluginRunShape(30s));
+  EXPECT_EQ(ramp_status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(ramp_status.message(), HasSubstr("ramp"));
+}
+
+// --- Orchestrator wiring of the validator ---
+
+// A whitelist rejection resolves synchronously with a structured ack naming
+// the offending field, and never reaches the applier: at this milestone the
+// applier is the only engine-mutation entry point, so a rejected update
+// mutates nothing.
+TEST(LiveUpdateOrchestratorTest, WhitelistRejectionsResolveSynchronouslyWithoutApplier) {
+  FakeApplier applier([] {
+    UpdateResult result;
+    result.set_applied(true);
+    return result;
+  }());
+  AckRecorder recorder;
+  auto orchestrator = MakeOrchestrator(&applier, &recorder, "", []() {
+    // A ramp-plugin run: the run shape comes from the engine, never from
+    // the request.
+    return RampPluginRunShape(30s);
+  });
+
+  UpdateRequest unset_arm;
+  unset_arm.add_deltas();
+  orchestrator->HandleUpdate(unset_arm);
+
+  UpdateRequest rps_delta;
+  rps_delta.add_deltas()->mutable_requests_per_second()->set_value(5);
+  orchestrator->HandleUpdate(rps_delta); // pending ramp re-anchoring on a ramp-plugin run.
+
+  orchestrator->OnRunEnded();
+  orchestrator->JoinPendingAcks();
+
+  EXPECT_EQ(applier.calls(), 0);
+  ASSERT_EQ(recorder.size(), 2);
+  const auto acks = recorder.acks();
+  EXPECT_FALSE(acks[0].applied());
+  EXPECT_NE(acks[0].rejection_reason().find("no knob field is set"), std::string::npos);
+  EXPECT_FALSE(acks[1].applied());
+  EXPECT_NE(acks[1].rejection_reason().find("pending ramp re-anchoring"), std::string::npos);
+}
+
+// A valid delta is forwarded to the applier (the Task-3+ engine apply seam):
+// with a non-plugin run shape, a plain rps delta passes validation and
+// reaches it.
+TEST(LiveUpdateOrchestratorTest, ValidRpsDeltaIsForwardedToApplier) {
+  FakeApplier applier([] {
+    UpdateResult result;
+    result.set_applied(true);
+    return result;
+  }());
+  AckRecorder recorder;
+  auto orchestrator = MakeOrchestrator(&applier, &recorder, "", []() { return LegacyRunShape(); });
+
+  orchestrator->HandleUpdate(MakeDeltasUpdate());
+  const auto ack_deadline = std::chrono::steady_clock::now() + 2s;
+  while (recorder.size() == 0 && std::chrono::steady_clock::now() < ack_deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  orchestrator->OnRunEnded();
+  orchestrator->JoinPendingAcks();
+
+  EXPECT_EQ(applier.calls(), 1);
+  ASSERT_EQ(recorder.size(), 1);
+  EXPECT_TRUE(recorder.acks()[0].applied());
 }
 
 } // namespace

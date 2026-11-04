@@ -34,6 +34,8 @@
 
 #include "api/client/service.pb.h"
 
+#include "source/client/live_update_validator.h"
+
 namespace Nighthawk {
 namespace Client {
 
@@ -49,10 +51,10 @@ EngineInstant DefaultEngineInstant();
 
 class LiveUpdateOrchestrator {
 public:
-  // The engine-apply step. The default Task-1 applier rejects every delta
-  // (MakeDefaultUpdateApplier); Task 2 wires the whitelist validator in front
-  // of it and Tasks 3/6 replace it with the real capability fan-out + ack
-  // aggregation.
+  // The engine-apply step. The default applier (MakeDefaultUpdateApplier)
+  // rejects every delta that reaches it; the Task-2 whitelist validator runs
+  // in front of it, and Tasks 3/6 replace the applier with the real
+  // capability fan-out + ack aggregation.
   class Applier {
   public:
     virtual ~Applier() = default;
@@ -61,9 +63,8 @@ public:
     // `deadline`: on expiry it resolves the update as a rejection instead of
     // blocking past it — JoinPendingAcks waits at most this long.
     virtual nighthawk::client::UpdateResult
-    ApplyDeltas(const nighthawk::client::UpdateRequest& request,
-                const std::string& epoch_id, const EngineInstant& bend_instant,
-                absl::Time deadline) = 0;
+    ApplyDeltas(const nighthawk::client::UpdateRequest& request, const std::string& epoch_id,
+                const EngineInstant& bend_instant, absl::Time deadline) = 0;
   };
 
   // Writes one UpdateResult ack onto the execution stream. Returns false when
@@ -75,20 +76,26 @@ public:
   using CancelFn = std::function<void()>;
   // The in-flight run's current phase id.
   using PhaseIdFn = std::function<std::string()>;
+  // The in-flight run's declared shape, as the whitelist validator sees it
+  // (built by the engine, never from the request).
+  using RunShapeFn = std::function<InFlightRunShape()>;
 
   LiveUpdateOrchestrator(Applier* applier, AckWriter ack_writer, CancelFn cancel_fn,
                          PhaseIdFn phase_id_fn, std::string run_execution_id,
-                         absl::Duration ack_wait_bound = absl::Seconds(5));
+                         absl::Duration ack_wait_bound = absl::Seconds(5),
+                         RunShapeFn run_shape_fn = nullptr);
   ~LiveUpdateOrchestrator();
 
   LiveUpdateOrchestrator(const LiveUpdateOrchestrator&) = delete;
   LiveUpdateOrchestrator& operator=(const LiveUpdateOrchestrator&) = delete;
 
   // Stream reader thread, update arm. Validates targeting (execution id /
-  // phase id match, non-empty deltas); a targeting rejection resolves
-  // synchronously with an ack written before return. Otherwise the update
-  // goes pending: the deltas are handed to the applier on a short-lived
-  // thread which writes the ack. Returns promptly either way.
+  // phase id match, non-empty deltas) and then the knob whitelist (M3 Task
+  // 2, judged against the engine's declared run shape); a targeting or
+  // whitelist rejection resolves synchronously with an ack written before
+  // return, and never reaches the applier. Otherwise the update goes
+  // pending: the deltas are handed to the applier on a short-lived thread
+  // which writes the ack. Returns promptly either way.
   void HandleUpdate(const nighthawk::client::UpdateRequest& request);
 
   // Stream reader thread, cancellation arm. Returns nullopt when the
@@ -97,8 +104,7 @@ public:
   // accepted cancellation's mark and the gate flip are ordered without a
   // window. A non-nullopt return is the structured targeting rejection to
   // ack instead (the stream stays up).
-  std::optional<nighthawk::client::UpdateResult>
-  CheckCancellation(const std::string& execution_id);
+  std::optional<nighthawk::client::UpdateResult> CheckCancellation(const std::string& execution_id);
 
   // Marks the cancellation accepted (pending updates now resolve without a
   // stream write) and cancels the run. Returns promptly. Call only after a
@@ -130,6 +136,7 @@ private:
   AckWriter ack_writer_;
   CancelFn cancel_fn_;
   PhaseIdFn phase_id_fn_;
+  RunShapeFn run_shape_fn_;
   const std::string run_execution_id_;
   const absl::Duration ack_wait_bound_;
 
@@ -144,8 +151,10 @@ private:
   std::vector<std::thread> ack_threads_ ABSL_GUARDED_BY(mutex_);
 };
 
-// The Task-1 default applier: rejects every delta with a clear reason, never
-// touching the engine. Task 2's whitelist validator takes over this decision.
+// The default applier: rejects every delta that reaches it with a clear
+// reason, never touching the engine. Only deltas that passed the Task-2
+// whitelist validation arrive here; Tasks 3+ replace this stub with the real
+// capability apply path.
 std::unique_ptr<LiveUpdateOrchestrator::Applier> MakeDefaultUpdateApplier();
 
 } // namespace Client

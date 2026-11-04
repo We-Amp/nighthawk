@@ -108,7 +108,11 @@ void ServiceImpl::handleExecutionRequest(
       },
       [process_impl_ptr]() { process_impl_ptr->requestExecutionCancellation(); },
       [process_impl_ptr]() { return process_impl_ptr->currentPhaseId(); },
-      options->executionId().value_or(""));
+      options->executionId().value_or(""),
+      absl::Seconds(5),
+      // M3 Task 2: the whitelist validator judges against the ENGINE's
+      // declared run shape, read live off the in-flight process.
+      [process_impl_ptr]() { return process_impl_ptr->liveUpdateRunShape(); });
   {
     absl::MutexLock lock(&in_flight_mutex_);
     in_flight_orchestrator_ = &orchestrator;

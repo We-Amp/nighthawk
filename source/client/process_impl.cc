@@ -860,9 +860,47 @@ void ProcessImpl::recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapsho
   }
 }
 
-void ProcessImpl::setCurrentPhaseId(absl::string_view phase_id) {
+void ProcessImpl::setCurrentPhaseId(absl::string_view phase_id,
+                                    std::chrono::nanoseconds phase_duration_ns) {
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             time_system_.monotonicTime().time_since_epoch())
+                             .count();
   std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
   current_phase_id_ = std::string(phase_id);
+  current_phase_start_monotonic_ns_ = now_ns;
+  current_phase_duration_ns_ = phase_duration_ns.count();
+}
+
+InFlightRunShape ProcessImpl::liveUpdateRunShape() const {
+  InFlightRunShape shape;
+  shape.has_phase_vector = options_.hasPhaseVector();
+  // The ramp plugin is the linear-ramping rate limiter: only its runs can
+  // bend ramps, and per C1 a live rps change on one is ramp
+  // re-parameterization (both enforced by the whitelist validator).
+  static constexpr absl::string_view kRampingPluginName =
+      "nighthawk.linear-ramping-rate-limiter-plugin";
+  const auto& plugin = options_.rateLimiterPluginConfig();
+  shape.ramp_plugin_configured = plugin.has_value() && plugin->name() == kRampingPluginName;
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             time_system_.monotonicTime().time_since_epoch())
+                             .count();
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  shape.current_phase_id = current_phase_id_;
+  if (shape.has_phase_vector) {
+    // The CURRENT phase's remaining duration; clamped at zero (a phase past
+    // its nominal end but not yet past the boundary offers no room).
+    const int64_t remaining =
+        current_phase_duration_ns_ - (now_ns - current_phase_start_monotonic_ns_);
+    shape.remaining_duration = std::chrono::nanoseconds(std::max<int64_t>(remaining, 0));
+  } else if (!options_.noDuration() && run_start_monotonic_ns_ > 0) {
+    // Legacy/single-phase run: the remaining RUN duration, the same bound
+    // the ramp limiter factory enforces at construction.
+    const int64_t remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(options_.duration()).count() -
+        (now_ns - run_start_monotonic_ns_);
+    shape.remaining_duration = std::chrono::nanoseconds(std::max<int64_t>(remaining, 0));
+  }
+  return shape;
 }
 
 std::string ProcessImpl::currentPhaseId() const {
@@ -971,7 +1009,8 @@ void ProcessImpl::runPhases() {
     effective_phase.mutable_max_pending_requests()->set_value(limits.max_pending_requests);
     effective_phase.mutable_max_active_requests()->set_value(limits.max_active_requests);
     applyPhaseBreakerOverrides(limits);
-    setCurrentPhaseId(phase.name());
+    setCurrentPhaseId(phase.name(), std::chrono::seconds(phase.duration().seconds()) +
+                                        std::chrono::nanoseconds(phase.duration().nanos()));
     orchestrator.markNextPhaseStarted(phase_index);
     const bool final_phase = orchestrator.isFinalPhase(phase_index);
     // M2 Task 6: activate this phase's subset (the worker prefix) and retire
@@ -1469,6 +1508,14 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
         flush_worker_->start();
       }
 
+      // FORK-ONLY (We-Amp): the run's start instant, for live-update
+      // validation's remaining-run bound on legacy runs (M3 Task 2).
+      {
+        std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+        run_start_monotonic_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      time_system_.monotonicTime().time_since_epoch())
+                                      .count();
+      }
       for (auto& w : workers_) {
         w->start();
       }

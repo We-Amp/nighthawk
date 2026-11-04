@@ -20,16 +20,17 @@ EngineInstant DefaultEngineInstant() {
 
 namespace {
 
-// The Task-1 default applier: every delta is rejected with a clear reason and
-// the engine is never touched. Task 2's whitelist validator replaces this
-// decision with the real live-knob rules ({rps, ramp shape}).
+// The default applier: every delta that reaches it (i.e. that already passed
+// the Task-2 whitelist validation) is rejected with a clear reason and the
+// engine is never touched. Tasks 3+ replace this stub with the real
+// capability apply path.
 class RejectingUpdateApplier : public LiveUpdateOrchestrator::Applier,
                                public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
-  nighthawk::client::UpdateResult
-  ApplyDeltas(const nighthawk::client::UpdateRequest& /*request*/,
-              const std::string& /*epoch_id*/, const EngineInstant& /*bend_instant*/,
-              absl::Time /*deadline*/) override {
+  nighthawk::client::UpdateResult ApplyDeltas(const nighthawk::client::UpdateRequest& /*request*/,
+                                              const std::string& /*epoch_id*/,
+                                              const EngineInstant& /*bend_instant*/,
+                                              absl::Time /*deadline*/) override {
     ENVOY_LOG(debug, "Live update rejected: no applier is wired yet");
     nighthawk::client::UpdateResult result;
     result.set_applied(false);
@@ -47,10 +48,11 @@ std::unique_ptr<LiveUpdateOrchestrator::Applier> MakeDefaultUpdateApplier() {
 LiveUpdateOrchestrator::LiveUpdateOrchestrator(Applier* applier, AckWriter ack_writer,
                                                CancelFn cancel_fn, PhaseIdFn phase_id_fn,
                                                std::string run_execution_id,
-                                               absl::Duration ack_wait_bound)
+                                               absl::Duration ack_wait_bound,
+                                               RunShapeFn run_shape_fn)
     : applier_(applier), ack_writer_(std::move(ack_writer)), cancel_fn_(std::move(cancel_fn)),
-      phase_id_fn_(std::move(phase_id_fn)), run_execution_id_(std::move(run_execution_id)),
-      ack_wait_bound_(ack_wait_bound) {}
+      phase_id_fn_(std::move(phase_id_fn)), run_shape_fn_(std::move(run_shape_fn)),
+      run_execution_id_(std::move(run_execution_id)), ack_wait_bound_(ack_wait_bound) {}
 
 LiveUpdateOrchestrator::~LiveUpdateOrchestrator() {
   OnRunEnded();
@@ -75,9 +77,9 @@ void LiveUpdateOrchestrator::HandleUpdate(const nighthawk::client::UpdateRequest
   if (!request.execution_id().empty() && request.execution_id() != run_execution_id_) {
     nighthawk::client::UpdateResult result;
     result.set_applied(false);
-    result.set_rejection_reason(absl::StrCat(
-        "execution_id \"", request.execution_id(),
-        "\" does not match the in-flight run \"", run_execution_id_, "\""));
+    result.set_rejection_reason(absl::StrCat("execution_id \"", request.execution_id(),
+                                             "\" does not match the in-flight run \"",
+                                             run_execution_id_, "\""));
     WriteAckSync(result);
     return;
   }
@@ -97,6 +99,21 @@ void LiveUpdateOrchestrator::HandleUpdate(const nighthawk::client::UpdateRequest
     nighthawk::client::UpdateResult result;
     result.set_applied(false);
     result.set_rejection_reason("update carries no deltas; at least one knob delta is required");
+    WriteAckSync(result);
+    return;
+  }
+
+  // Whitelist validation (M3 Task 2): every delta must be a live knob ({rps,
+  // ramp shape}) and satisfy its invariants, judged against the ENGINE's
+  // declared run shape. A rejection resolves synchronously with a structured
+  // ack naming the offending field and never reaches the applier or the
+  // engine. Cheap and pure -- it belongs on the reader thread.
+  const absl::Status delta_status =
+      ValidateUpdateDeltas(request, run_shape_fn_ ? run_shape_fn_() : InFlightRunShape{});
+  if (!delta_status.ok()) {
+    nighthawk::client::UpdateResult result;
+    result.set_applied(false);
+    result.set_rejection_reason(std::string(delta_status.message()));
     WriteAckSync(result);
     return;
   }
@@ -127,8 +144,8 @@ void LiveUpdateOrchestrator::HandleUpdate(const nighthawk::client::UpdateRequest
 void LiveUpdateOrchestrator::AckThreadMain(nighthawk::client::UpdateRequest request,
                                            uint64_t epoch_number, std::string epoch_id,
                                            EngineInstant bend_instant, absl::Time deadline) {
-  nighthawk::client::UpdateResult result = applier_->ApplyDeltas(request, epoch_id, bend_instant,
-                                                                 deadline);
+  nighthawk::client::UpdateResult result =
+      applier_->ApplyDeltas(request, epoch_id, bend_instant, deadline);
   if (result.applied()) {
     // The ack's epoch identity is orchestrator-owned (Task 6's aggregation
     // keeps this): an applier that leaves the fields empty gets the candidate
@@ -160,9 +177,9 @@ LiveUpdateOrchestrator::CheckCancellation(const std::string& execution_id) {
   if (!execution_id.empty() && execution_id != run_execution_id_) {
     nighthawk::client::UpdateResult result;
     result.set_applied(false);
-    result.set_rejection_reason(absl::StrCat(
-        "cancellation execution_id \"", execution_id,
-        "\" does not match the in-flight run \"", run_execution_id_, "\""));
+    result.set_rejection_reason(absl::StrCat("cancellation execution_id \"", execution_id,
+                                             "\" does not match the in-flight run \"",
+                                             run_execution_id_, "\""));
     return result;
   }
   return std::nullopt;

@@ -130,6 +130,7 @@ envoy_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":live_partial_aggregator_lib",
+        ":live_update_validator_lib",
         ":options_impl_lib",
         ":output_collector_impl_lib",
         ":phase_orchestrator_lib",
@@ -235,6 +236,23 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "live_update_validator_lib",
+    srcs = [
+        "live_update_validator.cc",
+    ],
+    hdrs = [
+        "live_update_validator.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+envoy_cc_library(
     name = "nighthawk_service_lib",
     srcs = [
         "live_update_orchestrator.cc",
@@ -248,6 +266,7 @@ envoy_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":live_update_validator_lib",
         ":nighthawk_client_lib",
         "//api/client:grpc_service_lib",
         "//api/request_source:grpc_request_source_service_lib",
