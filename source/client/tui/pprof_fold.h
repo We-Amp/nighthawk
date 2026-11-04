@@ -21,6 +21,15 @@ namespace Nighthawk {
 namespace Client {
 namespace Tui {
 
+// Child-index path from the tree root to a frame: path[i] is the child index
+// at depth i. THE addressing key of the flamegraph pane (M1 task 5) —
+// navigation cursor, zoom target, search hits, and the differential
+// overlay's node addressing all speak FramePath. Child indices (not
+// function-name paths) keep the addressing honest for same-named frames:
+// recursion and repeated stacks alias under name paths, never under
+// positions in the (total-sorted) tree.
+using FramePath = std::vector<int>;
+
 // One row of the folded flamegraph tree.
 struct FoldedFrame {
   // Symbolized function name; unsymbolized locations degrade to "0x<addr>"

@@ -21,22 +21,34 @@ absl::Status FailedPrecondition(absl::string_view message) {
 }
 
 // Frame-path index of one side's tree: full root-to-frame function-name path
-// -> frame. The separator is a control character that cannot appear in a
-// sane symbol name, so path equality == flamegraph position equality.
+// -> frame + its child-index address (FramePath). The string path is the
+// base<->current match key (a separator control character that cannot appear
+// in a sane symbol name; unique per node because folding merges same-name
+// same-parent nodes); the child-index path is what the renderer addresses
+// the overlay with (DifferentialNodeDiff::child_path).
 constexpr char kPathSeparator = '\x1f';
 
-using FrameIndex = absl::flat_hash_map<std::string, const FoldedFrame*>;
+struct IndexedFrame {
+  const FoldedFrame* frame;
+  FramePath child_path;
+};
 
-void IndexFrames(const std::vector<FoldedFrame>& frames, std::string* prefix, FrameIndex* out) {
-  for (const FoldedFrame& frame : frames) {
+using FrameIndex = absl::flat_hash_map<std::string, IndexedFrame>;
+
+void IndexFrames(const std::vector<FoldedFrame>& frames, std::string* prefix, FramePath* indices,
+                 FrameIndex* out) {
+  for (size_t i = 0; i < frames.size(); ++i) {
     const size_t base_len = prefix->size();
+    const size_t base_depth = indices->size();
     if (!prefix->empty()) {
       prefix->push_back(kPathSeparator);
     }
-    prefix->append(frame.function);
-    (*out)[*prefix] = &frame;
-    IndexFrames(frame.children, prefix, out);
+    prefix->append(frames[i].function);
+    indices->push_back(static_cast<int>(i));
+    (*out)[*prefix] = {&frames[i], *indices};
+    IndexFrames(frames[i].children, prefix, indices, out);
     prefix->resize(base_len);
+    indices->resize(base_depth);
   }
 }
 
@@ -150,8 +162,10 @@ absl::StatusOr<DifferentialResult> ComputeDifferential(const ProfileWindow& base
   FrameIndex cur_index;
   std::string path_a;
   std::string path_b;
-  IndexFrames(base.tree.root, &path_a, &base_index);
-  IndexFrames(current.tree.root, &path_b, &cur_index);
+  FramePath indices_a;
+  FramePath indices_b;
+  IndexFrames(base.tree.root, &path_a, &indices_a, &base_index);
+  IndexFrames(current.tree.root, &path_b, &indices_b, &cur_index);
 
   // Union of paths present on either side, deterministically ordered by the
   // final sort.
@@ -183,15 +197,20 @@ absl::StatusOr<DifferentialResult> ComputeDifferential(const ProfileWindow& base
     auto base_it = base_index.find(*path);
     auto cur_it = cur_index.find(*path);
     if (base_it != base_index.end()) {
-      diff.frame = base_it->second;
-      diff.base_per_work =
-          static_cast<double>(base_it->second->total_value) / static_cast<double>(base.work_units);
+      diff.frame = base_it->second.frame;
+      diff.child_path = base_it->second.child_path;
+      diff.base_per_work = static_cast<double>(base_it->second.frame->total_value) /
+                           static_cast<double>(base.work_units);
     }
     if (cur_it != cur_index.end()) {
       if (diff.frame == nullptr) {
-        diff.frame = cur_it->second;
+        diff.frame = cur_it->second.frame;
       }
-      diff.cur_per_work = static_cast<double>(cur_it->second->total_value) /
+      // The address follows the CURRENT side when the node renders there
+      // (the renderer paints the after picture); base-only nodes keep the
+      // base address (see DifferentialNodeDiff::child_path).
+      diff.child_path = cur_it->second.child_path;
+      diff.cur_per_work = static_cast<double>(cur_it->second.frame->total_value) /
                           static_cast<double>(current.work_units);
     }
     diff.delta_ratio =

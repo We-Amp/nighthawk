@@ -242,6 +242,88 @@ TEST(DifferentialTest, DiffNormalizesPerUnitOfWork) {
   const DifferentialNodeDiff* cold = FindDiff(*localized, "cold");
   ASSERT_NE(cold, nullptr);
   EXPECT_DOUBLE_EQ(cold->delta_ratio, 0.0);
+
+  // The positional address (task 5 interface addition): child indices from
+  // the tree root — main {0}, hot {0,0}, cold {0,1}. This is what the
+  // renderer's overlay addressing uses.
+  EXPECT_EQ(localized->diffs[0].child_path, FramePath({0, 0}));
+  EXPECT_EQ(FindDiff(*localized, "main")->child_path, FramePath({0}));
+  EXPECT_EQ(cold->child_path, FramePath({0, 1}));
+}
+
+// The child-index path keeps addressing honest for same-named frames: a
+// recursive stack a <- a gives two diffs both carrying function "a", uniquely
+// addressed {0} and {0,0} (a name-only address would alias them).
+TEST(DifferentialTest, ChildPathAddressesSameNamedFrames) {
+  FoldedTree base_tree = MakeTree({MakeFrame("a", 10, {MakeFrame("a", 20)})});
+  FoldedTree cur_tree = MakeTree({MakeFrame("a", 30, {MakeFrame("a", 0)})});
+  ProfileWindow base = WindowWith(base_tree, 100);
+  ProfileWindow current = WindowWith(cur_tree, 100);
+  auto result = ComputeDifferential(base, current);
+  ASSERT_TRUE(result.ok()) << result.status();
+  ASSERT_EQ(result->diffs.size(), 2u);
+  bool saw_outer = false;
+  bool saw_inner = false;
+  for (const DifferentialNodeDiff& diff : result->diffs) {
+    EXPECT_EQ(diff.frame->function, "a");
+    if (diff.child_path == FramePath({0})) {
+      saw_outer = true;
+      // Per-work values are TOTALS (self + subtree): outer a totals 30 on
+      // both sides; only the self share moved up.
+      EXPECT_DOUBLE_EQ(diff.base_per_work, 0.3);
+      EXPECT_DOUBLE_EQ(diff.cur_per_work, 0.3);
+    }
+    if (diff.child_path == FramePath({0, 0})) {
+      saw_inner = true;
+      EXPECT_DOUBLE_EQ(diff.base_per_work, 0.2);
+      EXPECT_DOUBLE_EQ(diff.cur_per_work, 0.0);
+    }
+  }
+  EXPECT_TRUE(saw_outer);
+  EXPECT_TRUE(saw_inner);
+}
+
+// When a node sits at different child positions on the two sides (a sibling
+// overtook it), the address follows the CURRENT side: the renderer overlays
+// onto the after picture, and a base-side address would collide with a
+// different node's position there.
+TEST(DifferentialTest, ChildPathFollowsCurrentSideWhenNodeMoves) {
+  FoldedTree base_tree = MakeTree({MakeFrame("main", 0, {MakeFrame("hot", 60),  //
+                                                         MakeFrame("cold", 40)})});
+  // The cold subtree overtook hot: positions flipped between the sides.
+  FoldedTree cur_tree = MakeTree({MakeFrame("main", 0, {MakeFrame("cold", 50),  //
+                                                        MakeFrame("hot", 10)})});
+  ProfileWindow base = WindowWith(base_tree, 100);
+  ProfileWindow current = WindowWith(cur_tree, 100);
+  auto result = ComputeDifferential(base, current);
+  ASSERT_TRUE(result.ok()) << result.status();
+  ASSERT_EQ(result->diffs.size(), 3u);
+  const DifferentialNodeDiff* hot = FindDiff(*result, "hot");
+  const DifferentialNodeDiff* cold = FindDiff(*result, "cold");
+  ASSERT_NE(hot, nullptr);
+  ASSERT_NE(cold, nullptr);
+  EXPECT_EQ(hot->child_path, FramePath({0, 1}));   // hot's CURRENT position
+  EXPECT_EQ(cold->child_path, FramePath({0, 0}));  // cold's CURRENT position
+}
+
+// --- T4 review follow-up: the two previously untested guard branches. -----
+
+// cpu vs alloc is a semantic error, not a comparability case: rejected.
+TEST(DifferentialTest, DiffRejectsProfileTypeMismatch) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 100)});
+  ProfileWindow base = WindowWith(tree, 100);
+  ProfileWindow current = WindowWith(tree, 100);
+  current.profile_type = "alloc";
+  ExpectStatus(ComputeDifferential(base, current), absl::StatusCode::kFailedPrecondition);
+}
+
+// A zero work-units side has no per-request denominator: rejected.
+TEST(DifferentialTest, DiffRejectsZeroWorkUnits) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 100)});
+  ProfileWindow base = WindowWith(tree, 100);
+  ProfileWindow zero = WindowWith(tree, 0);
+  ExpectStatus(ComputeDifferential(base, zero), absl::StatusCode::kFailedPrecondition);
+  ExpectStatus(ComputeDifferential(zero, base), absl::StatusCode::kFailedPrecondition);
 }
 
 // --- Review Focus 3, call-site half: impure pairs are REJECTED (8.3-strict).

@@ -11,6 +11,10 @@ namespace Tui {
 enum class InputMode {
   kNavigate,
   kEditingStartRun,
+  // M1 (M0b T5 seam): the flamegraph pane's frame-search entry. Same rule as
+  // the start-run dialog: while the query is being typed, pane refresh is
+  // suspended so live redraw never fights the editor.
+  kEditingSearch,
 };
 
 // True while an input mode owns the keyboard and the pane refresh cadence is
@@ -18,7 +22,9 @@ enum class InputMode {
 // the panes catch up on the state edited under the suspension — never a
 // refresh storm, never a stale first frame. The posting side is wired in
 // Task 6's dialog close; Task 7 exercises it by hand.
-inline bool RefreshSuspended(InputMode mode) { return mode == InputMode::kEditingStartRun; }
+inline bool RefreshSuspended(InputMode mode) {
+  return mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch;
+}
 
 } // namespace Tui
 } // namespace Client

@@ -17,6 +17,7 @@ envoy_cc_library(
     srcs = [
         "admin_client.cc",
         "charts.cc",
+        "flamegraph.cc",
         "knob_pane.cc",
         "layout.cc",
         "pprof_fold.cc",
@@ -37,6 +38,7 @@ envoy_cc_library(
     hdrs = [
         "admin_client.h",
         "charts.h",
+        "flamegraph.h",
         "input_mode.h",
         "knob_pane.h",
         "layout.h",
