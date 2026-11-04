@@ -28,10 +28,21 @@ namespace Client {
 //   joined with a post-boundary slab, and a worker whose latest partial is
 //   still from the previous phase contributes no statistics to the snapshot
 //   until its first partial of the current phase arrives.
+// - latest_phase_id_ advances MONOTONICALLY along the run's phase order
+//   (setPhaseOrder): a lagging partial -- notably a removed worker's
+//   first-ever fold partial (M2 Task 6), which carries its old stamp -- can
+//   never drag the label backward and freeze the percentiles (M2 review
+//   fix). Without an order set, any new stamp advances (legacy behavior).
 // Counters are cumulative from run start, so their per-worker latests fold
 // safely across stamps and the counter sums stay monotonic.
 class LivePartialAggregator {
 public:
+  // Sets the run's phase ids in order; latest_phase_id_ then advances only
+  // to a LATER entry. Call before the first partial (ProcessImpl does, for
+  // multi-phase runs; empty order keeps the legacy advance-on-new-stamp
+  // behavior).
+  void setPhaseOrder(std::vector<std::string> phase_order);
+
   // Folds one immutable partial, computed and stamped on its worker
   // dispatcher, into the running state.
   void addPartial(nighthawk::client::WorkerLiveSnapshotPartial partial);
@@ -41,10 +52,16 @@ public:
   nighthawk::client::LiveSnapshot snapshot(const std::string& epoch_id);
 
 private:
+  // Position of phase_id in phase_order_; -1 when unknown (or no order set).
+  int stampRank(const std::string& phase_id) const;
+  // Whether a worker advancing to phase_id may advance latest_phase_id_.
+  bool advancesLatest(const std::string& phase_id) const;
+
   struct WorkerState {
     std::string phase_id;
     std::map<std::string, nighthawk::client::StatisticSnapshot> statistics;
   };
+  std::vector<std::string> phase_order_;
   std::map<uint32_t, absl::flat_hash_map<std::string, uint64_t>> worker_counter_values_;
   std::map<uint32_t, WorkerState> worker_states_;
   // The newest stamp any worker has advanced to; "main" before the first

@@ -774,7 +774,9 @@ TEST_F(PhaseRunTest, LiveAggregationIgnoresIdleWorkers) {
 // ruling: the legacy bootstrap-time inter-worker stagger does not apply at
 // phase boundaries). Both workers of a [1, 2] vector run the final phase, so
 // their per-worker result groups carry that phase's first rate-limiter
-// acquisition time; the two must be near-simultaneous.
+// acquisition time; the two must be near-simultaneous. The bound is tens of
+// milliseconds -- at this run's rps the legacy stagger it guards against
+// would be ~10ms, so a wider bound could not fail.
 TEST_F(PhaseRunTest, SubsetStartIsSameInstant) {
   RunOutcome outcome = runPhases(makeSubsetPhaseOptions(listener().uri(), {1, 2}));
   ASSERT_TRUE(outcome.success);
@@ -789,8 +791,48 @@ TEST_F(PhaseRunTest, SubsetStartIsSameInstant) {
   const int64_t t1 = Envoy::Protobuf::util::TimeUtil::TimestampToNanoseconds(
       worker_1->execution_start());
   const int64_t spread_ns = t1 > t0 ? t1 - t0 : t0 - t1;
-  EXPECT_LT(spread_ns, std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count())
+  EXPECT_LT(spread_ns, std::chrono::duration_cast<std::chrono::nanoseconds>(50ms).count())
       << "new worker's phase start not same-instant with the survivor's";
+}
+
+// A worker retired before it ever began a phase (never-begun, outside phase
+// 0's prefix) has its live snapshot timer stopped; when a later phase
+// re-activates it, the timer resumes and its partials flow again -- its
+// contribution reaches the live aggregation, stamped with its first phase.
+// Without the resume, the final live total would sit near the survivor-only
+// level (~half the run's completions here) instead of the full amount.
+TEST_F(PhaseRunTest, RejoinedWorkerResumesLivePartials) {
+  nighthawk::client::CommandLineOptions cmd = makeSubsetPhaseOptions(listener().uri(), {1, 2});
+  cmd.mutable_live_streaming();
+  cmd.mutable_stats_flush_interval()->set_value(1);
+  RunOutcome outcome = runPhases(cmd, /*sample_live_snapshots=*/true);
+  ASSERT_TRUE(outcome.success);
+
+  const nighthawk::client::Result* worker_0 = findResult(outcome.output, "worker_0");
+  const nighthawk::client::Result* worker_1 = findResult(outcome.output, "worker_1");
+  ASSERT_NE(worker_0, nullptr);
+  ASSERT_NE(worker_1, nullptr);
+  const uint64_t output_total =
+      counterValue(*worker_0, "benchmark.http_2xx") + counterValue(*worker_1, "benchmark.http_2xx");
+  // worker_0 ran both phases (~300 completions), worker_1 only phase 1
+  // (~100): the cumulative total covers the whole run.
+  EXPECT_GT(output_total, 0u);
+
+  uint64_t last_live_total = 0;
+  {
+    std::lock_guard<std::mutex> lock(outcome_mutex);
+    for (const nighthawk::client::LiveSnapshot& snapshot : outcome.live_snapshots) {
+      auto it = snapshot.counters().find("benchmark.http_2xx");
+      if (it != snapshot.counters().end()) {
+        last_live_total = it->second;
+      }
+    }
+  }
+  // The rejoined worker's phase-1 traffic reaches the live aggregation:
+  // the final total covers the survivor's two phases plus the joiner's one
+  // (>= 3/4 of the cumulative total; a missing resume caps it near 2/3).
+  EXPECT_GE(last_live_total, output_total * 3 / 4)
+      << "rejoined worker's live partials did not resume after re-activation";
 }
 
 // --- PhaseOrchestrator unit tests: the boundary state machine, without a run. ---

@@ -240,7 +240,9 @@ void ClientWorkerImpl::goIdle(bool exit_dispatcher) {
   }
   // The fold (M2 Task 6): one final live partial carrying this worker's
   // frozen cumulative values, then silence -- no post-fold partials, so the
-  // live aggregation cannot double-count the worker after its removal.
+  // live aggregation cannot double-count the worker after its removal. (A
+  // later beginPhase restarts the timer: a rejoined worker emits again,
+  // stamped with its new phase.)
   emitLiveSnapshotPartial();
   if (live_snapshot_timer_ != nullptr) {
     live_snapshot_timer_->disableTimer();
@@ -273,6 +275,12 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   if (drain_watch_ != nullptr) {
     drain_watch_->cancel();
     drain_watch_.reset();
+  }
+  // A worker rejoining after goIdle had its live snapshot timer stopped (the
+  // fold's "no post-fold partials" rule): resume it so this phase's partials
+  // flow again. Workers that never idled own the timer work() created.
+  if (live_snapshot_timer_ == nullptr) {
+    setupLiveSnapshotTimer();
   }
   // FORK-ONLY (We-Amp): per-phase in-flight gates (M2 Task 5). The posted
   // spec carries the phase's effective values (declared per-phase values,

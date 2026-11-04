@@ -148,6 +148,34 @@ TEST(LivePartialAggregatorTest, CountsAreMonotonicWithinAPhase) {
   EXPECT_LT(a.monotonic_ns(), b.monotonic_ns());
 }
 
+// M2 Task 6 review fix: a REMOVED worker's first-ever fold partial carries
+// its OLD stamp. Arriving AFTER a survivor's new-phase partial, it must not
+// drag latest_phase_id_ backward -- the label would freeze the snapshot's
+// percentiles for the rest of the run. The label advances only
+// monotonically along the phase order; the removed worker stays excluded
+// from the statistics fold (its stamp lags), and its cumulative counters
+// still count.
+TEST(LivePartialAggregatorTest, FoldPartialCannotDragLatestBackward) {
+  LivePartialAggregator aggregator;
+  aggregator.setPhaseOrder({"p1", "p2"});
+  // The survivor crossed the boundary and flushed in p2.
+  aggregator.addPartial(makePartial(1, "p2", {makeSnapshot("s", 5, 100, 100, 100)},
+                                    {{"benchmark.http_2xx", 500}}));
+  // The removed worker's fold partial (its first and last) arrives after,
+  // stamped with the phase it was removed in.
+  aggregator.addPartial(makePartial(0, "p1", {makeSnapshot("s", 100, 10, 20, 30)},
+                                    {{"benchmark.http_2xx", 300}}));
+
+  const nighthawk::client::LiveSnapshot snapshot = aggregator.snapshot("");
+  EXPECT_EQ("p2", snapshot.phase_id()) << "fold partial dragged the phase label backward";
+  // Statistics fold only from the p2-stamped worker.
+  const nighthawk::client::StatisticSnapshot* stat = findStatistic(snapshot, "s");
+  ASSERT_NE(stat, nullptr);
+  EXPECT_EQ(5, stat->count());
+  // Counters are unaffected: cumulative over all workers regardless of stamp.
+  EXPECT_EQ(800, snapshot.counters().at("benchmark.http_2xx"));
+}
+
 } // namespace
 } // namespace Client
 } // namespace Nighthawk

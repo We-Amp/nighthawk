@@ -5,17 +5,48 @@
 namespace Nighthawk {
 namespace Client {
 
+void LivePartialAggregator::setPhaseOrder(std::vector<std::string> phase_order) {
+  phase_order_ = std::move(phase_order);
+}
+
+int LivePartialAggregator::stampRank(const std::string& phase_id) const {
+  for (size_t i = 0; i < phase_order_.size(); ++i) {
+    if (phase_order_[i] == phase_id) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+bool LivePartialAggregator::advancesLatest(const std::string& phase_id) const {
+  if (phase_order_.empty()) {
+    // Legacy behavior without an order (single-phase runs): any new stamp
+    // advances.
+    return true;
+  }
+  const int rank = stampRank(phase_id);
+  const int latest_rank = stampRank(latest_phase_id_);
+  // Only a strictly later phase advances the label; an unknown stamp never
+  // does (it cannot be ordered, so it must not be trusted with the label).
+  return rank >= 0 && rank > latest_rank;
+}
+
 void LivePartialAggregator::addPartial(nighthawk::client::WorkerLiveSnapshotPartial partial) {
   auto& worker_state = worker_states_[partial.worker_id()];
   if (worker_state.phase_id != partial.phase_id()) {
     // The worker advanced to a new slab: its old slab's statistics are done,
     // replace them wholesale so no pre-boundary statistic ever survives into
-    // the post-boundary fold. Workers never go back to an earlier phase, so
-    // this is forward progress; latest advances with it (a straggler partial
-    // of an unchanged stamp cannot drag the snapshot back).
+    // the post-boundary fold. The label advances only MONOTONICALLY along
+    // the phase order: a lagging partial -- notably a removed worker's
+    // first-ever fold partial (M2 Task 6), carrying its old stamp -- must
+    // not drag latest backward (it would freeze the percentiles for the
+    // rest of the run; the worker stays excluded from the statistics fold
+    // via its own stamp either way, and counters are unaffected).
     worker_state.phase_id = partial.phase_id();
     worker_state.statistics.clear();
-    latest_phase_id_ = partial.phase_id();
+    if (advancesLatest(partial.phase_id())) {
+      latest_phase_id_ = partial.phase_id();
+    }
   }
   auto& counter_values = worker_counter_values_[partial.worker_id()];
   for (const auto& [name, value] : partial.counters()) {

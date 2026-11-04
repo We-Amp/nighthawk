@@ -926,6 +926,15 @@ void ProcessImpl::runPhases() {
   // phases activate the declared PREFIX of that fleet and retire the rest.
   phase_worker_subsets_ = computeWorkerSubsets(options_.phases(), workers_.size());
   worker_begun_phases_.assign(workers_.size(), {});
+  // The live aggregator advances its snapshot label only monotonically along
+  // the phase order, so a removed worker's fold partial (old stamp) cannot
+  // drag the label backward (M2 review fix).
+  std::vector<std::string> phase_order;
+  phase_order.reserve(options_.phases().size());
+  for (const nighthawk::client::PhaseSpec& phase : options_.phases()) {
+    phase_order.push_back(phase.name());
+  }
+  live_aggregator_.setPhaseOrder(std::move(phase_order));
   // Every worker must have finished thread-local initialization and entered
   // its dispatcher loop before the first begin-phase post (the warmup's
   // nested dispatcher run must not pick it up). These futures always
@@ -959,6 +968,12 @@ void ProcessImpl::runPhases() {
     const uint32_t active_workers = subset.worker_count;
     const uint32_t prior_active =
         phase_index == 0 ? 0 : phase_worker_subsets_[phase_index - 1].worker_count;
+    // Highest active count posted so far: workers beyond it have never begun
+    // a phase.
+    uint32_t activated_high_water = 0;
+    for (uint32_t i = 0; i < phase_index; ++i) {
+      activated_high_water = std::max(activated_high_water, phase_worker_subsets_[i].worker_count);
+    }
     if (final_phase) {
       // Every worker outside the final subset sits out the rest of the run:
       // fold its final live partial and let it exit, so the run's join (which
@@ -966,11 +981,19 @@ void ProcessImpl::runPhases() {
       for (uint32_t w = active_workers; w < workers_.size(); ++w) {
         workers_[w]->goIdleAsync(/*exit_dispatcher=*/true);
       }
-    } else if (active_workers < prior_active) {
-      // Removed workers: their slabs stay folded into the phase that just
-      // ended; they idle (no sequencer, no requests) on their live
-      // dispatchers, ready for a later phase to re-activate them.
+    } else {
+      // Retire every worker outside this phase's subset. [active,
+      // prior_active) ran a previous phase (removed at this boundary);
+      // anything beyond the activation high-water mark has never begun a
+      // phase -- retire it too, so its live snapshot timer does not emit
+      // zero partials for the whole run (M2 review fix). Both groups idle on
+      // their live dispatchers with no sequencer and no requests, ready for
+      // a later phase to re-activate them.
+      const uint32_t never_begun_from = std::max(active_workers, activated_high_water);
       for (uint32_t w = active_workers; w < prior_active; ++w) {
+        workers_[w]->goIdleAsync(/*exit_dispatcher=*/false);
+      }
+      for (uint32_t w = never_begun_from; w < workers_.size(); ++w) {
         workers_[w]->goIdleAsync(/*exit_dispatcher=*/false);
       }
     }
@@ -994,6 +1017,7 @@ void ProcessImpl::runPhases() {
       worker_begun_phases_[w].push_back(phase_index);
       drain_acks.push_back(workers_[w]->beginPhaseAsync(phase_index, effective_phase, final_phase));
     }
+    activated_high_water = std::max(activated_high_water, active_workers);
     if (final_phase) {
       // The final phase keeps today's exact behavior: its sequencer stops
       // with the legacy exit-at-stop, and the workers are joined like any
