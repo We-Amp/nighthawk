@@ -1052,6 +1052,36 @@ ProcessImpl::mergeWorkerStatistics(const std::vector<ClientWorkerPtr>& workers) 
   return merged_statistics;
 }
 
+// FORK-ONLY (We-Amp): run-total statistics for a multi-phase run (M2 Task 4).
+// The global Result of a phase run must carry every sample cumulatively, but
+// the workers' live sets were retired into slabs by the end-of-run finalize
+// (the last phase's set was reinstalled empty). Fold every benchmark-client
+// slab plus every phase's sequencer statistics into one id-keyed map: the
+// run total is exactly the combine of all phase slabs (count conservation,
+// see the PhaseStatisticSlab fold in the per-phase result groups below).
+std::vector<StatisticPtr> ProcessImpl::mergePhaseTotalsStatistics() const {
+  std::map<std::string, StatisticPtr> totals;
+  for (const auto& worker : workers_) {
+    for (const PhaseStatisticSlab& slab : worker->benchmarkPhaseSlabs()) {
+      for (const auto& [id, statistic] : slab.statistics) {
+        combineStatisticIntoMap(totals, id, *statistic);
+      }
+    }
+    const std::vector<StatisticPtrMap>& phase_statistics = worker->phaseStatistics();
+    for (uint32_t phase_index = 0; phase_index < phase_statistics.size(); ++phase_index) {
+      for (const auto& [id, statistic] : phase_statistics[phase_index]) {
+        combineStatisticIntoMap(totals, id, *statistic);
+      }
+    }
+  }
+  std::vector<StatisticPtr> merged;
+  for (auto& [id, statistic] : totals) {
+    statistic->setId(id);
+    merged.push_back(std::move(statistic));
+  }
+  return merged;
+}
+
 void ProcessImpl::addTracingCluster(envoy::config::bootstrap::v3::Bootstrap& bootstrap,
                                     const Uri& uri) const {
   auto* cluster = bootstrap.mutable_static_resources()->add_clusters();
@@ -1434,9 +1464,15 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
       compileGlobalUserDefinedPluginOutputs(user_defined_outputs_by_plugin,
                                             user_defined_output_factories_);
   if (workers_.size() > 0) {
-    collector.addResult("global", mergeWorkerStatistics(workers_), counters,
-                        total_execution_duration / workers_.size(), first_acquisition_time,
-                        global_user_defined_outputs);
+    // FORK-ONLY (We-Amp): in a phase run the global Result folds the
+    // retained per-phase slabs (the workers' live sets were retired empty by
+    // the end-of-run finalize; the legacy fold would carry zero
+    // benchmark-client samples). The legacy run keeps today's fold.
+    collector.addResult("global",
+                        options_.hasPhaseVector() ? mergePhaseTotalsStatistics()
+                                                  : mergeWorkerStatistics(workers_),
+                        counters, total_execution_duration / workers_.size(),
+                        first_acquisition_time, global_user_defined_outputs);
   }
   if (options_.hasPhaseVector()) {
     // FORK-ONLY (We-Amp): the per-phase output dimension (M2 Task 4, spec
@@ -1496,10 +1532,30 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
       // The boundary timing recorded when this phase ENDED (absent for the
       // run's final phase, which ends at the run teardown).
       const PhaseBoundaryTiming* boundary = nullptr;
+      const PhaseBoundaryTiming* prior_boundary = nullptr;
       for (const PhaseBoundaryTiming& timing : boundary_timings_) {
         if (timing.phase_index == phase_index) {
           boundary = &timing;
-          break;
+        } else if (phase_index > 0 && timing.phase_index == phase_index - 1) {
+          prior_boundary = &timing;
+        }
+      }
+      // Stragglers inherited from the predecessor boundary: at a censored
+      // boundary the requests still in flight when the deadline fired
+      // complete after the successor's swap and land in this phase's raw
+      // completed delta. The predecessor slab records the in-flight count at
+      // its retire (zero at uncensored boundaries); when that boundary was
+      // censored, that count is exactly the straggler set the predecessor
+      // already counted in its reset_or_timed_out, so exclude it here.
+      uint64_t inherited_stragglers = 0;
+      if (prior_boundary != nullptr && prior_boundary->drain_censored) {
+        const std::string& predecessor_phase = options_.phases()[phase_index - 1].name();
+        for (const auto& worker : workers_) {
+          for (const PhaseStatisticSlab& slab : worker->benchmarkPhaseSlabs()) {
+            if (slab.phase_id == predecessor_phase) {
+              inherited_stragglers += slab.requests_in_flight_at_retire;
+            }
+          }
         }
       }
       nighthawk::client::PhaseMetadata metadata =
@@ -1507,7 +1563,8 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
                              stream_resets,
                              phase_index < phase_gate_exceeded_.size()
                                  ? phase_gate_exceeded_[phase_index]
-                                 : 0);
+                                 : 0,
+                             inherited_stragglers);
       for (uint32_t worker_number = 0; worker_number < workers_.size(); ++worker_number) {
         *metadata.add_pool_health() = readWorkerPoolHealth(store_root_, worker_number);
       }

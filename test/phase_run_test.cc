@@ -834,6 +834,31 @@ TEST_F(PhaseRunTest, PerPhaseResultsCarryPhaseId) {
     }
   }
 
+  // The global Result conserves samples across phases: its benchmark-client
+  // counts equal the sum over the phase groups (the run-total fold reads the
+  // retained slabs, not the post-finalize live sets).
+  const nighthawk::client::Result* global_result = nullptr;
+  for (const nighthawk::client::Result& result : outcome.output.results()) {
+    if (result.name() == "global") {
+      global_result = &result;
+    }
+  }
+  ASSERT_NE(global_result, nullptr);
+  const nighthawk::client::Statistic* global_lat =
+      findStatistic(*global_result, "benchmark_http_client.latency_2xx");
+  ASSERT_NE(global_lat, nullptr) << "global result carries no benchmark-client samples";
+  uint64_t phase_sum = 0;
+  for (const char* phase_id : {"phase0", "phase1"}) {
+    const nighthawk::client::Statistic* phase_lat =
+        findStatistic(*findPhaseResult(outcome.output, phase_id),
+                      "benchmark_http_client.latency_2xx");
+    ASSERT_NE(phase_lat, nullptr);
+    phase_sum += phase_lat->count();
+  }
+  EXPECT_GT(phase_sum, 0);
+  EXPECT_EQ(phase_sum, global_lat->count())
+      << "global sample count does not conserve across the phase slabs";
+
   ASSERT_EQ(2, outcome.output.phase_metadata_size());
   for (int i = 0; i < outcome.output.phase_metadata_size(); ++i) {
     const nighthawk::client::PhaseMetadata& metadata = outcome.output.phase_metadata(i);
@@ -844,6 +869,10 @@ TEST_F(PhaseRunTest, PerPhaseResultsCarryPhaseId) {
     EXPECT_FALSE(metadata.new_workers_cold_started());
     ASSERT_EQ(1, metadata.pool_health_size());
     EXPECT_EQ(0u, metadata.pool_health(0).worker_id());
+    // Strictly > 0: the run connected at least once, so a renamed or missing
+    // engine pool counter (stat-name drift) fails loudly instead of silently
+    // reading as a warm transfer.
+    EXPECT_GT(metadata.pool_health(0).connections_created(), 0u);
     EXPECT_GE(metadata.pool_health(0).connections_created(),
               metadata.pool_health(0).connections_active());
     // Claim discipline, uncensored run: everything initiated completed.
@@ -919,7 +948,8 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
   censored.drain_censored = true;
   const nighthawk::client::PhaseMetadata censored_metadata =
       BuildPhaseMetadata(0, spec, &censored, /*worker_count=*/1, /*initiated=*/100,
-                         /*completed=*/97, /*stream_resets=*/1, /*gate_exceeded=*/3);
+                         /*completed=*/97, /*stream_resets=*/1, /*gate_exceeded=*/3,
+                         /*inherited_stragglers=*/0);
   EXPECT_EQ(4u, censored_metadata.reset_or_timed_out()); // 1 reset + 3 hung in flight
   EXPECT_EQ(100u, censored_metadata.initiated());
   EXPECT_EQ(97u, censored_metadata.completed());
@@ -940,18 +970,71 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
   clean.idle_gap_ns = 2000;
   clean.drain_censored = false;
   const nighthawk::client::PhaseMetadata clean_metadata =
-      BuildPhaseMetadata(0, spec, &clean, 1, 100, 100, 1, /*gate_exceeded=*/2);
+      BuildPhaseMetadata(0, spec, &clean, 1, 100, 100, 1, /*gate_exceeded=*/2,
+                         /*inherited_stragglers=*/0);
   EXPECT_EQ(1u, clean_metadata.reset_or_timed_out());
   EXPECT_EQ(2u, clean_metadata.gate_exceeded());
   EXPECT_DOUBLE_EQ(1.0, clean_metadata.completion_ratio());
 
   // The run's final phase has no boundary timing at all.
   const nighthawk::client::PhaseMetadata final_metadata =
-      BuildPhaseMetadata(1, spec, /*boundary=*/nullptr, 1, 50, 50, 0, /*gate_exceeded=*/0);
+      BuildPhaseMetadata(1, spec, /*boundary=*/nullptr, 1, 50, 50, 0, /*gate_exceeded=*/0,
+                         /*inherited_stragglers=*/0);
   EXPECT_EQ(0, final_metadata.drain_duration().seconds());
   EXPECT_EQ(0, final_metadata.drain_duration().nanos());
   EXPECT_EQ(0, final_metadata.idle_gap().seconds());
   EXPECT_DOUBLE_EQ(1.0, final_metadata.completion_ratio());
+}
+
+// Straggler semantics at a censored boundary (spec 8.2, chosen reading): the
+// predecessor counts the hung in-flight set in its reset_or_timed_out -- even
+// when the stragglers complete later -- and the successor excludes that same
+// set from its completed count, so nothing is counted twice and no ratio
+// reads above 1.
+TEST(BuildPhaseMetadataTest, StragglerCompletionsAreExcludedFromTheSuccessor) {
+  nighthawk::client::PhaseSpec spec;
+  spec.set_name("phase1");
+  // The successor phase's own boundary is clean; its raw completed delta is
+  // inflated by the 3 stragglers the censored phase0 boundary left in flight
+  // (10 completions observed, only 8 requests initiated by this phase).
+  PhaseBoundaryTiming clean;
+  clean.phase_index = 1;
+  clean.phase_id = "phase1";
+  clean.drain_duration_ns = 1000;
+  clean.idle_gap_ns = 2000;
+  clean.drain_censored = false;
+  const nighthawk::client::PhaseMetadata successor = BuildPhaseMetadata(
+      1, spec, &clean, 1, /*initiated=*/8, /*completed=*/10, /*stream_resets=*/0,
+      /*gate_exceeded=*/0, /*inherited_stragglers=*/3);
+  EXPECT_EQ(7u, successor.completed()); // 10 raw - 3 stragglers
+  EXPECT_EQ(8u, successor.initiated());
+  EXPECT_EQ(0u, successor.reset_or_timed_out());
+  EXPECT_NEAR(0.875, successor.completion_ratio(), 1e-9);
+  EXPECT_LE(successor.completion_ratio(), 1.0);
+
+  // A raw delta wholly made of stragglers floors at zero instead of
+  // underflowing; the ratio then honestly reads 0 (the phase's only own
+  // request did not complete).
+  const nighthawk::client::PhaseMetadata floored =
+      BuildPhaseMetadata(1, spec, &clean, 1, /*initiated=*/1, /*completed=*/3,
+                         /*stream_resets=*/0, /*gate_exceeded=*/0,
+                         /*inherited_stragglers=*/3);
+  EXPECT_EQ(0u, floored.completed());
+  EXPECT_DOUBLE_EQ(0.0, floored.completion_ratio());
+
+  // And the paired predecessor side: the same 3 stragglers are what phase0's
+  // censored boundary already counted (1 reset + 3 hung = 4 total there).
+  nighthawk::client::PhaseSpec predecessor_spec;
+  predecessor_spec.set_name("phase0");
+  PhaseBoundaryTiming censored;
+  censored.phase_index = 0;
+  censored.phase_id = "phase0";
+  censored.drain_censored = true;
+  const nighthawk::client::PhaseMetadata predecessor = BuildPhaseMetadata(
+      0, predecessor_spec, &censored, 1, /*initiated=*/10, /*completed=*/7, /*stream_resets=*/1,
+      /*gate_exceeded=*/0, /*inherited_stragglers=*/0);
+  EXPECT_EQ(4u, predecessor.reset_or_timed_out());
+  EXPECT_EQ("phase0", predecessor.phase_id());
 }
 
 } // namespace

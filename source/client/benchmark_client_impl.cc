@@ -160,13 +160,18 @@ void BenchmarkClientHttpImpl::terminate() {
 // FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 A1, spec 8.1/8.2).
 // beginPhaseStatistics() runs on this client's dispatcher: the swap is
 // serialized with every request start, completion and live partial
-// computation. An in-flight request at the boundary keeps writing into the
-// slab of the phase that initiated it (its decoder holds references into the
-// retired set, which the slab keeps alive); at an uncensored boundary the
-// drain has already waited for in-flight to reach zero, so the retired slab
-// is final when the swap runs. Samples lost to resets show up in the slab's
-// stream_resets delta, and requests still in flight at a censored drain in
-// the initiated-minus-completed delta (counted, not hidden; spec 8.2).
+// computation. Attribution of an in-flight request at the boundary is split:
+// the statistics its decoder holds by reference (queue-to-connect,
+// request-to-response, header/body sizes, origin latency) keep writing into
+// the slab of the phase that initiated it (the retired set, kept alive by
+// the slab), but the latency_Nxx exports route through this client's
+// exportLatency() and land in whichever set is live at completion time. At
+// an uncensored boundary the drain has already waited for in-flight to
+// reach zero before the swap, so the retired slab is final and the split is
+// invisible; at a censored boundary the straggler completions are counted
+// via the slab's stream_resets delta and the initiated-minus-completed
+// delta (counted, not hidden; spec 8.2), and PhaseMetadata excludes the
+// stragglers from the successor's completion count.
 void BenchmarkClientHttpImpl::beginPhaseStatistics(absl::string_view next_phase_id) {
   if (!fresh_statistic_provider_) {
     throw NighthawkException("phase statistic swap requested, but this benchmark client was "
@@ -217,6 +222,10 @@ PhaseStatisticSlab BenchmarkClientHttpImpl::retireLiveSetIntoSlab() {
   slab.requests_completed = requests_completed_ - phase_start_requests_completed_;
   slab.stream_resets = benchmark_client_counters_.stream_resets_.value() -
                        phase_start_stream_resets_;
+  // The in-flight count at this swap is zero at an uncensored boundary (the
+  // drain completed before the swap) and, at a censored boundary, exactly
+  // the straggler set that will complete during the successor phase.
+  slab.requests_in_flight_at_retire = requests_initiated_ - requests_completed_;
   phase_start_requests_initiated_ = requests_initiated_;
   phase_start_requests_completed_ = requests_completed_;
   phase_start_stream_resets_ = benchmark_client_counters_.stream_resets_.value();

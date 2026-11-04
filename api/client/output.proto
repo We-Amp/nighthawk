@@ -85,7 +85,9 @@ message WorkerPoolHealth {
   uint32 worker_id = 1;
   // Connections created on this worker (cumulative, engine pool counter).
   uint64 connections_created = 2;
-  // Connections live on this worker at the end of the phase.
+  // Connections live on this worker. Read once at the run's end and stamped
+  // into every phase's pool_health entry of this worker (the pool health of
+  // the run, not a per-phase snapshot).
   uint64 connections_active = 3;
 }
 
@@ -113,12 +115,18 @@ message PhaseMetadata {
   bool new_workers_cold_started = 7;
   // Requests initiated in this phase.
   uint64 initiated = 8;
-  // Requests completed in this phase (attributed via the phase's statistic
-  // slab; completions of phase-initiated requests that straggle past a
-  // censored boundary land in the successor phase's completion count).
+  // Requests completed in this phase. Completions of requests that a
+  // CENSORED predecessor boundary left in flight (stragglers completing
+  // during this phase) are EXCLUDED: the predecessor already counted them in
+  // its reset_or_timed_out, and they were initiated before this phase began.
+  // Without the exclusion the successor's completion count would double
+  // count the predecessor's censoring and its completion ratio could read
+  // above 1.
   uint64 completed = 9;
   // Samples not counted as clean completions in this phase: stream resets
   // plus the requests still in flight when a censored drain gave up waiting.
+  // The censored in-flight requests are counted here even if they complete
+  // later, during the successor phase (whose completed count excludes them).
   uint64 reset_or_timed_out = 10;
   // Starts refused by the per-phase client-side gates (counted, not queued).
   uint64 gate_exceeded = 11;

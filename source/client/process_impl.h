@@ -163,6 +163,10 @@ private:
   std::vector<StatisticPtr> vectorizeStatisticPtrMap(const StatisticPtrMap& statistics) const;
   std::vector<StatisticPtr>
   mergeWorkerStatistics(const std::vector<ClientWorkerPtr>& workers) const;
+  // FORK-ONLY (We-Amp): run-total statistics for a multi-phase run, folded
+  // from the retained per-phase slabs (the workers' live sets are empty after
+  // the end-of-run finalize). See mergePhaseTotalsStatistics() in the .cc.
+  std::vector<StatisticPtr> mergePhaseTotalsStatistics() const;
   void setupForHRTimers();
   /**
    * If there are sinks configured in bootstrap, populate stats_sinks with sinks

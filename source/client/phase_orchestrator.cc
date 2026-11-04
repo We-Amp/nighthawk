@@ -106,7 +106,8 @@ void PhaseOrchestrator::markFinalPhaseComplete() {
 nighthawk::client::PhaseMetadata
 BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
                    const PhaseBoundaryTiming* boundary, uint32_t worker_count, uint64_t initiated,
-                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded) {
+                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded,
+                   uint64_t inherited_straggler_completions) {
   nighthawk::client::PhaseMetadata metadata;
   metadata.set_phase_id(phase_spec.name());
   metadata.set_phase_index(phase_index);
@@ -128,18 +129,33 @@ BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& pha
   metadata.set_workers_changed_vs_prior_phase(false);
   metadata.set_new_workers_cold_started(false);
   metadata.set_initiated(initiated);
-  metadata.set_completed(completed);
+  // Straggler completions inherited from a censored predecessor boundary are
+  // excluded: the predecessor already counted them in its reset_or_timed_out
+  // and they were initiated before this phase began. Without the exclusion
+  // they would count twice and this phase's completion ratio could read
+  // above 1.
+  const uint64_t own_completed = completed > inherited_straggler_completions
+                                     ? completed - inherited_straggler_completions
+                                     : 0;
+  metadata.set_completed(own_completed);
   uint64_t reset_or_timed_out = stream_resets;
   if (boundary != nullptr && boundary->drain_censored) {
     // Censored drain: the requests still in flight when the deadline fired
-    // are counted, not hidden (spec 8.2).
-    reset_or_timed_out += initiated - completed;
+    // are counted, not hidden (spec 8.2) -- even if they complete later,
+    // during the successor phase (whose completed count excludes them).
+    // Guarded: the raw completed delta can exceed initiated only via the
+    // same censor-to-swap drift the cap below guards against.
+    reset_or_timed_out += initiated > completed ? initiated - completed : 0;
   }
   metadata.set_reset_or_timed_out(reset_or_timed_out);
   // Task 5's per-phase gate refusals: starts shed by the client-side gates.
   metadata.set_gate_exceeded(gate_exceeded);
+  // The cap is a drift guard: with stragglers excluded, own completions
+  // cannot exceed own initiations, so the ratio cannot honestly exceed 1
+  // (a tiny censor-to-swap drift could otherwise surface as 1.0000...+eps).
   metadata.set_completion_ratio(initiated > 0
-                                    ? static_cast<double>(completed) / static_cast<double>(initiated)
+                                    ? std::min(1.0, static_cast<double>(own_completed) /
+                                                        static_cast<double>(initiated))
                                     : 1.0);
   return metadata;
 }

@@ -36,10 +36,18 @@ struct PhaseStatisticSlab {
   // Requests completed while this phase's set was live. Exact at every
   // uncensored boundary (the drain waits for in-flight to reach zero before
   // the next phase's set is installed); at a censored boundary, stragglers
-  // complete after the swap and land in the successor phase's count.
+  // complete after the swap and land in the successor phase's raw delta --
+  // PhaseMetadata adjusts them out again via requests_in_flight_at_retire
+  // (see the PhaseMetadata proto comments).
   uint64_t requests_completed{0};
   // Stream resets observed while this phase's set was live (spec 8.2).
   uint64_t stream_resets{0};
+  // The client's cumulative in-flight count at the moment this slab was
+  // retired (the begin-phase swap of the successor, or the end-of-run
+  // finalize). Zero at every uncensored boundary (the drain completed
+  // before the swap); at a censored boundary it is the straggler set that
+  // completes during the successor phase.
+  uint64_t requests_in_flight_at_retire{0};
 };
 
 class BenchmarkClient {
@@ -77,8 +85,9 @@ public:
 
   /**
    * The phase id whose slab the live statistic set currently feeds. "main"
-   * until the first phase begins. May be called from any thread once the
-   * owning worker has signaled readiness.
+   * until the first phase begins. Call only on the client's own dispatcher
+   * (the worker's): the string is swapped by begin-phase on that dispatcher,
+   * so reading it elsewhere is a race.
    */
   virtual const std::string& currentPhaseId() const PURE;
 

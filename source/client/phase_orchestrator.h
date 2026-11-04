@@ -117,12 +117,19 @@ private:
 // resets, plus -- only when the boundary drain was censored -- the requests
 // still in flight when the deadline fired (initiated minus completed; at an
 // uncensored boundary in-flight reaches zero before the swap, so the delta
-// is zero). gate_exceeded is Task 5's per-phase gate-refusal count (starts
-// refused are shed and counted, never queued).
+// is zero). Those censored requests stay counted here even when they
+// complete later, during the successor phase: the caller passes their count
+// as `inherited_straggler_completions` (the predecessor slab's in-flight at
+// retire, when the boundary that retired it was censored) and they are
+// excluded from THIS phase's completed, so no straggler is counted twice
+// and no completion ratio reads above 1. gate_exceeded is Task 5's
+// per-phase gate-refusal count (starts refused are shed and counted, never
+// queued).
 nighthawk::client::PhaseMetadata
 BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
                    const PhaseBoundaryTiming* boundary, uint32_t worker_count, uint64_t initiated,
-                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded);
+                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded,
+                   uint64_t inherited_straggler_completions);
 
 } // namespace Client
 } // namespace Nighthawk
