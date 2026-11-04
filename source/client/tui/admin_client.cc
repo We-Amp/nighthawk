@@ -64,16 +64,17 @@ absl::StatusOr<std::string> ResolveHost(const std::string& host) {
       resolved = buf;
       break;
     }
-    if (ai->ai_family == AF_INET6 && resolved.empty() &&
-        ::inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(ai->ai_addr)->sin6_addr, buf,
-                    sizeof(buf)) != nullptr) {
-      resolved = buf;
-    }
   }
   ::freeaddrinfo(result);
   if (resolved.empty()) {
+    // Honest about the limitation: this client opens an AF_INET socket only,
+    // so an IPv6 result cannot be used — a v6-only admin host is an error, not
+    // a mangled "bad address" downstream.
     return absl::UnavailableError(
-        absl::StrCat("admin host \"", host, "\" resolved to no usable address"));
+        absl::StrCat("admin host \"", host,
+                     "\" resolved to no IPv4 address (the admin client connects "
+                     "over IPv4 only; an IPv6-only SUT admin address is not "
+                     "supported)"));
   }
   return resolved;
 }
@@ -186,6 +187,12 @@ absl::StatusOr<AdminClient::Response> AdminClient::Request(absl::string_view met
   tv.tv_usec = 0;
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  // Known gap, left as-is: the blocking ::connect() above is NOT bounded by
+  // these timeouts (SO_SNDTIMEO/SO_RCVTIMEO do not apply to connect). A
+  // SYN-dropping admin address wedges this call for the OS-level connect
+  // timeout (~1 min on macOS/Linux) before the read timeouts can ever run.
+  // Accepted: the admin address is operator-configured and local/forwarded,
+  // and the caller is a worker-pool job, not the UI thread.
 
   std::string request = absl::StrCat(method, " ", path_and_query, " HTTP/1.1\r\n",
                                      "host: ", base->first, ":", base->second, "\r\n",
@@ -255,7 +262,14 @@ absl::StatusOr<AdminClient::Response> AdminClient::Request(absl::string_view met
     if (!absl::SimpleAtoi(*cl, &length)) {
       return absl::InternalError(absl::StrCat("bad content-length \"", *cl, "\""));
     }
-    response.body = raw_body.substr(0, std::min(length, raw_body.size()));
+    // A short body is a truncation symptom, not a valid smaller payload —
+    // error out instead of silently accepting a partial body.
+    if (raw_body.size() < length) {
+      return absl::InternalError(absl::StrCat(
+          "admin response body truncated: content-length ", length, ", got ",
+          raw_body.size(), " bytes"));
+    }
+    response.body = raw_body.substr(0, length);
     return response;
   }
   response.body = raw_body;
