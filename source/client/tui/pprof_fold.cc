@@ -148,8 +148,14 @@ absl::StatusOr<FoldedTree> FoldProfile(const Profile& profile) {
         sample_idx < sample.value_size() ? sample.value(sample_idx) : 0;
     const int64_t value =
         value_idx < sample.value_size() ? sample.value(value_idx) : 0;
-    tree.total_samples += static_cast<uint64_t>(num_samples);
-    tree.total_value += static_cast<uint64_t>(value);
+    // FoldedFrame totals are unsigned; M1 targets sampled CPU/heap profiles
+    // whose values are non-negative. Delta profiles (which carry negative
+    // values) are out of scope for M1 — negatives clamp to 0 here rather
+    // than wrap around and poison the totals.
+    const uint64_t num_samples_u = num_samples < 0 ? 0 : static_cast<uint64_t>(num_samples);
+    const uint64_t value_u = value < 0 ? 0 : static_cast<uint64_t>(value);
+    tree.total_samples += num_samples_u;
+    tree.total_value += value_u;
 
     for (const auto& label : sample.label()) {
       if (str_of(label.key()) == "timestamp_ns") {
@@ -203,12 +209,12 @@ absl::StatusOr<FoldedTree> FoldProfile(const Profile& profile) {
         node_it->second->frame = std::move(frame);
       }
       node = node_it->second.get();
-      node->frame.total_samples += static_cast<uint64_t>(num_samples);
-      node->frame.total_value += static_cast<uint64_t>(value);
+      node->frame.total_samples += num_samples_u;
+      node->frame.total_value += value_u;
     }
     // Leaf attribution.
-    node->frame.self_samples += static_cast<uint64_t>(num_samples);
-    node->frame.self_value += static_cast<uint64_t>(value);
+    node->frame.self_samples += num_samples_u;
+    node->frame.self_value += value_u;
   }
 
   if (have_timestamp) {

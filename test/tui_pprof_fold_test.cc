@@ -12,9 +12,12 @@
 
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -254,8 +257,9 @@ TEST(TuiPprofFoldTest, FoldPreservesSampleAndValueTotals) {
 // Children ordering is deterministic: total_value desc.
 TEST(TuiPprofFoldTest, FoldSortsChildrenByTotalValue) {
   perftools::profiles::Profile p = SyntheticCpuProfile();
-  // main is a shared root (25ms under it via worker, 0ms zero-label) and
-  // leaf is another root (10ms); ordering must be deterministic.
+  // main is a shared root (40ms under it via worker, plus the 0ms zero-label
+  // sample attributed directly to it) and leaf is another root (10ms); the
+  // ordering must be deterministic.
   absl::StatusOr<FoldedTree> tree = FoldProfile(p);
   ASSERT_TRUE(tree.ok());
   ASSERT_GE(tree->root.size(), 2u);
@@ -423,6 +427,110 @@ TEST(TuiPprofWorkerPoolTest, PoolRunsJobsToCompletion) {
   }
   std::lock_guard<std::mutex> lock(mu);
   EXPECT_EQ(done.size(), kThreads * kJobsPerThread);
+}
+
+// Fixture-fidelity cross-check (task 3 Step 4, made permanent by review):
+// the committed fixture IS the Task 1 machine-route output —
+// `go tool pprof -proto -output /tmp/out.pb
+// pprof-binaries/b2d89e0ae53916f28770771fbdd49c5c99c5c5a2/envoy envoy-1.prof`
+// over the staged SUT CPU profile (runbook
+// docs/operations/nighthawk-sut-profiled.md, machine-route evidence
+// 2026-11-04; fixture sha256 4753dfb270878bda2f729da066684377122002a344e8b71e2
+// e63a4f223088c90, byte-identical to that run's /tmp/out.pb). The expected
+// values below are the independent `go tool pprof -top` ground truth on that
+// same file, not this fold code's output: 630ms total across 63 x 10ms flat
+// samples, with named flat rows operator== 20ms and event_active,
+// duration_cast, StringResizeAndOverwriteFallback 10ms each (the
+// unsymbolized remainder aggregates into -top's [envoy]/[libc.so.6]
+// mapping rows, which fold reports per-address instead).
+TEST(TuiPprofFoldTest, FoldMatchesPprofTopGroundTruth) {
+  absl::StatusOr<perftools::profiles::Profile> profile =
+      LoadProfile(FixturePath("test/fixtures/nh_sut_pprof.pb.gz"));
+  ASSERT_TRUE(profile.ok());
+  absl::StatusOr<FoldedTree> tree = FoldProfile(*profile);
+  ASSERT_TRUE(tree.ok());
+
+  EXPECT_EQ(tree->total_samples, 63u);
+  EXPECT_EQ(tree->total_value, 630000000u);
+
+  // Root-level conservation.
+  uint64_t root_value = 0;
+  uint64_t root_samples = 0;
+  for (const FoldedFrame& f : tree->root) {
+    auto [f_samples, f_value] = CheckNodeConservation(f);
+    root_samples += f_samples;
+    root_value += f_value;
+  }
+  EXPECT_EQ(root_samples, 63u);
+  EXPECT_EQ(root_value, 630000000u);
+
+  // The four named flat rows from `go tool pprof -top` (self-value sums
+  // aggregated over every node carrying the name).
+  auto flat_of = [&](const char* name) {
+    uint64_t flat = 0;
+    std::function<void(const std::vector<FoldedFrame>&)> walk =
+        [&](const std::vector<FoldedFrame>& frames) {
+          for (const FoldedFrame& f : frames) {
+            if (f.function == name) {
+              flat += f.self_value;
+            }
+            walk(f.children);
+          }
+        };
+    walk(tree->root);
+    return flat;
+  };
+  EXPECT_EQ(flat_of("operator=="), 20000000u);
+  EXPECT_EQ(flat_of("event_active"), 10000000u);
+  EXPECT_EQ(flat_of("duration_cast"), 10000000u);
+  EXPECT_EQ(flat_of("StringResizeAndOverwriteFallback"), 10000000u);
+}
+
+// Honest check of the default argv against the REAL tool presence on this
+// machine: with `go` on PATH, Symbolize must NOT return kNotFound — the
+// spawn has to resolve the bare tool name through PATH (a posix_spawn
+// instead of posix_spawnp regression fails exactly here, and the argv-seam
+// tests cannot see it). The real tool then fails fast on the bogus input
+// paths with kInternal. Without `go` on PATH, kNotFound is the expectation.
+bool ProgramOnPath(const std::string& program) {
+  const char* path_env = std::getenv("PATH");
+  if (path_env == nullptr) {
+    return false;
+  }
+  size_t start = 0;
+  const std::string path(path_env);
+  while (start <= path.size()) {
+    size_t end = path.find(':', start);
+    if (end == std::string::npos) {
+      end = path.size();
+    }
+    const std::string dir = path.substr(start, end - start);
+    if (!dir.empty()) {
+      const std::string candidate = dir + "/" + program;
+      if (access(candidate.c_str(), X_OK) == 0) {
+        return true;
+      }
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+TEST(TuiPprofSymbolizerTest, SymbolizeDefaultArgvTracksRealToolPresence) {
+  const bool go_on_path = ProgramOnPath("go");
+  ProfileSymbolizer symbolizer({}, "/tmp/nh-build-id-binaries");
+  absl::Status status = symbolizer.Symbolize(
+      "no-such-raw.prof", "no-such-binary", "/tmp/nh-tui-symbolize-out.pb.gz");
+  if (go_on_path) {
+    EXPECT_NE(status.code(), absl::StatusCode::kNotFound)
+        << "default argv must resolve through PATH when the tool exists: "
+        << status;
+    EXPECT_EQ(status.code(), absl::StatusCode::kInternal)
+        << "real tool started but must fail fast on the missing inputs: "
+        << status;
+  } else {
+    EXPECT_EQ(status.code(), absl::StatusCode::kNotFound) << status;
+  }
 }
 
 }  // namespace

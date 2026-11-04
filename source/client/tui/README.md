@@ -34,7 +34,10 @@ bounded FIFO pool of `absl::Mutex`-driven workers; the destructor drains and
 joins. Symbolization jobs go through it (`profile_symbolizer.h`): a
 `go tool pprof -proto` run over a full-DWARF binary is slow (~40 min observed
 on the staged Envoy binary), so it must never run on the render or steering
-paths. The other named-thread contracts above are implemented as specified.
+paths. Note that quitting while a symbolization job runs blocks in the pool's
+`waitpid`/join for the tool's remaining runtime — up to the ~40-minute worst
+case above. The other named-thread contracts above are implemented as
+specified.
 
 ## The quarantine rule
 

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <utility>
 #include <vector>
 
 #include "absl/strings/str_cat.h"
@@ -27,41 +28,65 @@ namespace {
 constexpr char kBinaryPathEnvVar[] = "PPROF_BINARY_PATH";
 constexpr size_t kStderrTailBytes = 2048;
 
-// Reads at most the last kStderrTailBytes bytes of the child's stderr capture.
-std::string ReadStderrTail(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return "";
+// The child's stderr capture file. RAII so the temp file is unlinked on every
+// exit path (early spawn failures included).
+class StderrCapture {
+ public:
+  // Returns an empty capture if the temp file cannot be created.
+  static StderrCapture Create() {
+    const char* dir = std::getenv("TMPDIR");
+    std::string tmpl =
+        absl::StrCat(dir != nullptr && dir[0] != '\0' ? dir : "/tmp",
+                     "/nh-pprof-stderr-XXXXXX");
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    const int fd = mkstemp(buf.data());
+    StderrCapture capture;
+    if (fd >= 0) {
+      close(fd);
+      capture.path_ = std::string(buf.data());
+    }
+    return capture;
   }
-  in.seekg(0, std::ios::end);
-  const std::streamoff size = in.tellg();
-  if (size <= 0) {
-    return "";
-  }
-  const std::streamoff skip =
-      size > static_cast<std::streamoff>(kStderrTailBytes)
-          ? size - static_cast<std::streamoff>(kStderrTailBytes)
-          : 0;
-  in.seekg(skip, std::ios::beg);
-  std::string tail((std::istreambuf_iterator<char>(in)),
-                   std::istreambuf_iterator<char>());
-  return tail;
-}
 
-std::string TempFilePath() {
-  const char* dir = std::getenv("TMPDIR");
-  std::string tmpl =
-      absl::StrCat(dir != nullptr && dir[0] != '\0' ? dir : "/tmp",
-                   "/nh-pprof-stderr-XXXXXX");
-  std::vector<char> buf(tmpl.begin(), tmpl.end());
-  buf.push_back('\0');
-  const int fd = mkstemp(buf.data());
-  if (fd < 0) {
-    return "";
+  StderrCapture(const StderrCapture&) = delete;
+  StderrCapture& operator=(const StderrCapture&) = delete;
+  StderrCapture(StderrCapture&& other) noexcept
+      : path_(std::exchange(other.path_, {})) {}
+  ~StderrCapture() {
+    if (!path_.empty()) {
+      unlink(path_.c_str());
+    }
   }
-  close(fd);
-  return std::string(buf.data());
-}
+
+  bool ok() const { return !path_.empty(); }
+  const std::string& path() const { return path_; }
+
+  // At most the last kStderrTailBytes bytes of the child's stderr.
+  std::string ReadTail() const {
+    std::ifstream in(path_, std::ios::binary);
+    if (!in) {
+      return "";
+    }
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size <= 0) {
+      return "";
+    }
+    const std::streamoff skip =
+        size > static_cast<std::streamoff>(kStderrTailBytes)
+            ? size - static_cast<std::streamoff>(kStderrTailBytes)
+            : 0;
+    in.seekg(skip, std::ios::beg);
+    std::string tail((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    return tail;
+  }
+
+ private:
+  StderrCapture() = default;
+  std::string path_;
+};
 
 }  // namespace
 
@@ -122,10 +147,11 @@ absl::Status ProfileSymbolizer::Symbolize(absl::string_view raw_profile_path,
   }
   envp.push_back(nullptr);
 
-  const std::string stderr_path = TempFilePath();
-  if (stderr_path.empty()) {
+  StderrCapture stderr_capture = StderrCapture::Create();
+  if (!stderr_capture.ok()) {
     return absl::InternalError("cannot create stderr capture file");
   }
+  const std::string& stderr_path = stderr_capture.path();
 
   posix_spawn_file_actions_t actions;
   if (posix_spawn_file_actions_init(&actions) != 0) {
@@ -149,8 +175,13 @@ absl::Status ProfileSymbolizer::Symbolize(absl::string_view raw_profile_path,
   posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
 
   pid_t pid = -1;
+  // posix_spawnp (NOT posix_spawn): the default tool argv {"go", "tool",
+  // "pprof"} names the tool through PATH, and only the *p variant resolves
+  // argv[0] through the child's PATH. With plain posix_spawn the primary
+  // route would always fail ENOENT and silently degrade to the
+  // tool-absent path (regression the argv-seam tests cannot see).
   const int spawn_rc =
-      posix_spawn(&pid, argv[0], &actions, &attr, argv.data(), envp.data());
+      posix_spawnp(&pid, argv[0], &actions, &attr, argv.data(), envp.data());
   posix_spawnattr_destroy(&attr);
   posix_spawn_file_actions_destroy(&actions);
   if (spawn_rc == ENOENT || spawn_rc == EACCES || spawn_rc == ENOTDIR) {
@@ -160,7 +191,7 @@ absl::Status ProfileSymbolizer::Symbolize(absl::string_view raw_profile_path,
   }
   if (spawn_rc != 0) {
     return absl::InternalError(
-        absl::StrCat("posix_spawn failed for ", argv[0], ": ",
+        absl::StrCat("posix_spawnp failed for ", argv[0], ": ",
                      std::strerror(spawn_rc)));
   }
 
@@ -178,7 +209,7 @@ absl::Status ProfileSymbolizer::Symbolize(absl::string_view raw_profile_path,
         "pprof tool succeeded but produced no output at: ", out_path));
   }
 
-  std::string tail = ReadStderrTail(stderr_path);
+  std::string tail = stderr_capture.ReadTail();
   std::string why = WIFEXITED(status)
                         ? absl::StrCat("exit status ", WEXITSTATUS(status))
                         : absl::StrCat("killed by signal ", WTERMSIG(status));
