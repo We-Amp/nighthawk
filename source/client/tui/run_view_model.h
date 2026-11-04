@@ -79,6 +79,17 @@ struct RunViewModel {
   // kSpikeRatio over its recent floor; decremented otherwise.
   int spike_frames_remaining = 0;
   double spike_ratio = 0.0;
+
+  // M1 SUT-stats scrape state (set by the TuiApp scrape cadence, never by
+  // ApplySnapshot; reset with the model at every startRun). Sticky for the
+  // run once detected: the status bar names it "reset or label-set change"
+  // because the per-name summed scrape deltas make a label-set change
+  // indistinguishable from a counter reset — the honest wording (task 7's
+  // folded note).
+  bool sut_counter_reset_detected = false;
+  // Total histogram-family sample lines dropped by the scrape parser (they
+  // have no meaningful delta). Rendered as a one-line count when nonzero.
+  uint64_t sut_histogram_line_drops = 0;
 };
 
 // How many consecutive flushes a detected spike stays annotated.

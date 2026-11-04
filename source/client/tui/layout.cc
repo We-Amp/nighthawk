@@ -333,77 +333,115 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
   return ftxui::vbox(std::move(rows));
 }
 
-ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open) {
+ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open, int active_tab) {
   // Rendered strictly from the shell's real key map (tui_app's navigate-mode
   // handler and the dialog editor's keys) — nothing here invents a binding.
   // While a session is open the n key cannot succeed; the hint says so
   // instead of advertising a key that would silently refuse (M0b review
-  // finding).
-  const char* n_hint = session_open ? "n new run (unavailable: session open)" : "n new run";
+  // finding). Labels are compressed to the 100-column minimum: with the M1
+  // keys the bars stay under the width so nothing clips.
+  const char* n_hint = session_open ? "n new run (session open)" : "n new run";
   std::string bar;
   if (mode == InputMode::kEditingStartRun) {
     bar = "tab field | enter apply | esc cancel";
+  } else if (mode == InputMode::kEditingSearch) {
+    bar = "type to search | enter apply | esc cancel";
+  } else if (active_tab == 1) {
+    // The flame tab: the pane's own keys (the key map table's flame rows).
+    bar = "Arrows nav | Enter zoom | Esc root | / find | p win | d diff | N noise";
+    if (running) {
+      bar += " | s stop";
+    }
+    bar += " | q quit | ? help";
   } else if (running) {
-    bar = absl::StrCat(n_hint, " | c charts | k knobs | s stop | q quit (stops run) | ? help");
+    bar = absl::StrCat(n_hint, " | c charts | f flame | k knobs | s stop | q quit (stops run) | "
+                               "? help");
   } else {
-    bar = absl::StrCat(n_hint, " | c charts | k knobs | q quit | ? help");
+    bar = absl::StrCat(n_hint, " | c charts | f flame | k knobs | q quit | ? help");
   }
   return ftxui::text(bar);
 }
 
 ftxui::Element RenderTabStrip(int active_tab) {
   // One-row tab strip (backlog item 11), rendered under the status bar: the
-  // active tab inverted, panes that do not exist yet dimmed with their
-  // reason in the text (`flame (m1)` — M1's next pane), so a monochrome
-  // paste still tells implemented from pending. Tab order matches the key
-  // map: c -> charts (0), k -> knobs (2); flame (1) has no key until M1.
+  // active tab inverted. As of M1 all three panes exist (charts, flame,
+  // knobs); nothing renders dimmed anymore. Tab order matches the key map:
+  // c -> charts (0), f -> flame (1), k -> knobs (2).
   const bool charts_active = active_tab == 0;
+  const bool flame_active = active_tab == 1;
   const bool knobs_active = active_tab == 2;
   return ftxui::hbox({
       ftxui::text("| "),
       charts_active ? ftxui::text("charts") | ftxui::inverted : ftxui::text("charts"),
       ftxui::text(" | "),
-      ftxui::text("flame (m1)") | ftxui::dim,
+      flame_active ? ftxui::text("flame") | ftxui::inverted : ftxui::text("flame"),
       ftxui::text(" | "),
       knobs_active ? ftxui::text("knobs") | ftxui::inverted : ftxui::text("knobs"),
       ftxui::text(" |"),
   });
 }
 
+// The navigate-mode key map, as data (see NavigateKeyBindings in the header):
+// the single source of truth the help overlay and the key-map test read;
+// HandleShellEvent is written against the same table.
+const std::vector<KeyBinding>& KeyBindingTable() {
+  static const std::vector<KeyBinding>* const table = new std::vector<KeyBinding>{
+      {"c", "switch to the charts tab"},
+      {"k", "switch to the knobs tab"},
+      {"f", "switch to the flamegraph tab"},
+      {"n", "open the start-run dialog"},
+      {"s", "stop the running run (live runs only)"},
+      {"q", "quit; a running run is stopped first"},
+      {"?", "toggle help (esc closes it too)"},
+      {"Arrows", "flamegraph frame navigation (flame tab)"},
+      {"Enter", "zoom to the selected frame (flame tab)"},
+      {"Esc/Backspace", "unzoom to the tree root (flame tab)"},
+      {"/", "search mode (enter applies, esc cancels)"},
+      {"p", "start/stop a profile window"},
+      {"d", "differential (default: last two pure)"},
+      {"N", "noise-floor view (plain n stays dialog)"},
+  };
+  return *table;
+}
+
+std::vector<KeyBinding> NavigateKeyBindings() { return KeyBindingTable(); }
+
 ftxui::Element RenderHelpOverlay() {
   // Narrowed to 64 columns (batch-2 polish): the overlay sits at column 10,
   // so its right edge clears the charts' right-margin readout pairs (which
   // start near column 76 at the 100-column minimum) — the readouts behind it
   // are no longer fragmented. Height stays within rows 3..28 so the status
-  // bar (rows 0-2) and the key bar (row 29) both stay visible.
+  // bar (rows 0-2) and the key bar (row 29) both stay visible — the M1 keys
+  // are therefore GROUPED (every binding covered; the key-map test asserts
+  // the one-row-per-binding table and the help's coverage of every key).
   const int outer_width = 64;
   const int inner_width = outer_width - 4;
   std::vector<ftxui::Element> lines;
   lines.push_back(ftxui::text(borderRule(outer_width)));
-  lines.push_back(ftxui::text(borderedRow("help", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("help (? toggles, esc closes)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("keys (navigate)", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  n          open the start-run dialog", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  s          stop the running run (live runs only)", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  c / k      switch to the charts / knobs tab", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  q          quit; a running run is stopped first", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  ?          toggle this help (esc closes it too)", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("keys (start-run dialog)", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  tab        move to the next field", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  enter      apply; invalid fields keep the dialog open", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  esc        cancel and close the dialog", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  c / k / f       charts / knobs / flame tab", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  n               open the start-run dialog", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  N               noise-floor view (plain n stays)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  s               stop the running run", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  q               quit; a live run is stopped first", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  Arrows          flame frame navigation (flame tab)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  Enter           zoom to the selected frame", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  Esc/Backspace   unzoom to the tree root", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  /               flame search (enter applies)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  p               start/stop a profile window", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  d               differential (last two pure)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("keys (start-run dialog): tab next field | enter apply | esc", inner_width)));
   lines.push_back(ftxui::text(borderedRow("status-bar fields", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  state      idle | running | completed | stopped", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  elapsed    since the first flush; with the run's", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("             duration: 39s/60s plus remaining", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  target     uri under load; (target pending) in the", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("             sub-second pre-ack window", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  phase      placeholder until M2 real phase ids", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  epoch      placeholder until M3 steering epochs", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  flush 1s   chart cadence: one column per flush", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  4xx/rst/t/o  per-flush client-side failure rates", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  session    session recording path", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  mode       navigate, or editing while a dialog owns", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("             the keyboard", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  state/elapsed  idle|running|completed|stopped; 39s/60s", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  target         uri under load; (target pending) pre-ack", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  phase/epoch    placeholders until M2 / M3", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  flush 1s       chart cadence: one column per flush", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  4xx/rst/t/o    per-flush client-side failure rates", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  session        session recording path", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  mode           navigate, or editing (input owns keys)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  profiler       flame: idle | window open | folding...", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  sut cells      reset-or-label-set marker; hist drops", inner_width)));
   lines.push_back(ftxui::text(borderRule(outer_width)));
   return ftxui::vbox(std::move(lines));
 }
@@ -453,7 +491,8 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                             const RunViewModel& model, const StartRunDialogModel& dialog,
                             absl::string_view session_path,
                             const nighthawk::client::CommandLineOptions& knob_options,
-                            const OverlayState* overlay) {
+                            const OverlayState* overlay, const FlamePaneState* flame,
+                            absl::string_view profiler_state) {
   // The min-size gate wraps everything: below the declared minimum, render
   // the message and nothing else — no partial status bar, no wrapped charts.
   if (width < kMinTerminalWidth || height < kMinTerminalHeight) {
@@ -470,13 +509,40 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                                 ? static_cast<uint64_t>(knob_options.max_pending_requests().value())
                                 : 0);
     break;
-  case 1:
-    // Tab 1 is the flamegraph pane: not built until M1. The dimmed tab-strip
-    // cell names the milestone, and the pane body says the same thing, so
-    // landing here (no key routes to it in M0b) is visibly refused rather
-    // than silently blank.
-    pane = ftxui::text("flame (m1): pane lands in M1") | ftxui::dim;
+  case 1: {
+    // Tab 1 is the flamegraph pane (M1): the current window's tree through
+    // RenderFlamegraph (which applies zoom + collapse from the view state),
+    // under a provenance/note header. The honest empty state when no window
+    // has landed (or the shell passed no flame state at all).
+    static const FlamePaneState kEmptyFlame;
+    const FlamePaneState& state = flame == nullptr ? kEmptyFlame : *flame;
+    if (state.tree == nullptr) {
+      std::vector<ftxui::Element> rows;
+      rows.push_back(ftxui::text("flame: no profile window yet") | ftxui::dim);
+      rows.push_back(ftxui::text("press p during a run to pull one; d/N compare pure windows") |
+                     ftxui::dim);
+      if (!state.note.empty()) {
+        rows.push_back(ftxui::text(state.note) | ftxui::dim);
+      }
+      pane = ftxui::vbox(std::move(rows));
+    } else {
+      std::vector<ftxui::Element> rows;
+      rows.push_back(ftxui::text(state.window_header.substr(
+          0, static_cast<size_t>(std::max(0, width)))));
+      if (!state.note.empty()) {
+        rows.push_back(ftxui::text(
+            state.note.substr(0, static_cast<size_t>(std::max(0, width)))));
+      }
+      // The renderer gets the uncollapsed, unzoomed tree + the view state:
+      // zoom, collapse, scroll, search and the diff overlay are all applied
+      // (and path-translated) inside RenderFlamegraph.
+      const int pane_height = height - 5 - static_cast<int>(rows.size());
+      rows.push_back(RenderFlamegraph(*state.tree, state.view, state.diff, width,
+                                      std::max(1, pane_height)));
+      pane = ftxui::vbox(std::move(rows));
+    }
     break;
+  }
   case 2:
     // Tab 2 is the knob pane, rendered from the most recent run's options
     // (unset defaults before any run). Empty options never render an empty
@@ -493,11 +559,13 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
   // pane; the key bar is pinned to the bottom row via the filler, so it
   // reads from the same row in every frame and every mode.
   ftxui::Element frame = ftxui::vbox({
-      RenderStatusBar(model, mode, session_path, dialog.uri(), knob_options.duration().seconds()),
+      RenderStatusBar(model, mode, session_path, dialog.uri(),
+                      knob_options.duration().seconds(), profiler_state),
       RenderTabStrip(active_tab),
       pane,
       ftxui::filler(),
-      RenderKeyBar(mode, model.run_state == "running", /*session_open=*/!session_path.empty()),
+      RenderKeyBar(mode, model.run_state == "running", /*session_open=*/!session_path.empty(),
+                   active_tab),
   });
 
   // While the start-run dialog owns the keyboard, the bordered dialog overlay

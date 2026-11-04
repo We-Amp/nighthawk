@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "absl/strings/string_view.h"
 #include "ftxui/component/component.hpp"
@@ -8,6 +9,7 @@
 
 #include "api/client/options.pb.h"
 
+#include "source/client/tui/flamegraph.h"
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/start_run_dialog.h"
@@ -18,9 +20,9 @@ namespace Tui {
 
 // FORK-ONLY (We-Amp): the TUI shell's layout contract (spec §4):
 //   - a persistent 3-row status bar always on screen (rows 0..2),
-//   - a one-row tab strip under the status bar (row 3): `| charts | flame
-//     (m1) | knobs |`, the active tab inverted, not-yet-implemented panes
-//     dimmed with their reason (backlog item 11),
+//   - a one-row tab strip under the status bar (row 3): `| charts | flame |
+//     knobs |`, the active tab inverted (backlog item 11; as of M1 the flame
+//     cell is a live pane, no longer the dimmed placeholder),
 //   - the active tab's pane owns the screen below the strip,
 //   - a persistent mode-aware key bar pinned to the bottom row (row 29 at the
 //     declared minimum),
@@ -78,19 +80,43 @@ struct OverlayState {
   ftxui::Component duration_input;
 };
 
+// The M1 flame pane's render input (composed by TuiApp's BuildFlamePane): the
+// current window's tree, the shell's live view state, the paired differential,
+// and the status/note lines. RenderLayout renders it for tab 1; a null `flame`
+// (or a null tree) renders the honest empty state instead.
+struct FlamePaneState {
+  // The most recent window's tree (uncollapsed, unzoomed; the renderer
+  // applies zoom + collapse from the view state). Null when no window exists.
+  const FoldedTree* tree = nullptr;
+  // One-line provenance: window number, type, purity, work units,
+  // symbolization, interval source.
+  std::string window_header;
+  // The controller's latest note (pipeline outcomes, refusals).
+  std::string note;
+  // The shell's live view state (zoom/selection/search/diff toggles).
+  FlamegraphViewState view;
+  // The paired differential overlay's result when diff_mode is on and an
+  // overlay has landed; null otherwise.
+  const DifferentialResult* diff = nullptr;
+};
+
 // The full frame for one redraw: min-size gate, then status bar over the
 // tab strip, the active tab's pane, and the key bar, plus the dialog/help
 // overlay while one is open. `width`/`height` are the terminal dimensions —
 // Task 6 feeds them from the terminal size each frame. Tabs (the tab strip's
-// order): 0 = charts, 1 = flame (M1's pane, dimmed placeholder), 2 = knobs
-// (rendered from `knob_options`, the most recent run's options; unset
-// defaults before any run). `overlay` may be null (the plain pane renders).
+// order): 0 = charts, 1 = flame (M1's live pane, rendered from `flame`),
+// 2 = knobs (rendered from `knob_options`, the most recent run's options;
+// unset defaults before any run). `overlay` may be null (the plain pane
+// renders). `flame` may be null (tab 1 then renders the empty state).
+// `profiler_state` feeds the status bar's profiler cell (empty = "idle").
 ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mode,
                             const RunViewModel& model, const StartRunDialogModel& dialog,
                             absl::string_view session_path,
                             const nighthawk::client::CommandLineOptions& knob_options =
                                 nighthawk::client::CommandLineOptions{},
-                            const OverlayState* overlay = nullptr);
+                            const OverlayState* overlay = nullptr,
+                            const FlamePaneState* flame = nullptr,
+                            absl::string_view profiler_state = "");
 
 // The charts tab (tab 0): on a completed run a completion-summary block
 // first (backlog item 7: totals, error ratio, final percentiles, the saved
@@ -107,23 +133,36 @@ ftxui::Element RenderChartsPane(const RunViewModel& model, int width, int height
                                 absl::string_view session_path = "",
                                 uint64_t pool_pending_cap = 0);
 
-// The one-row tab strip (backlog item 11): `| charts | flame (m1) | knobs |`
-// under the status bar. The active tab renders inverted; a pane that does
-// not exist yet renders dimmed with its reason in the text (`flame (m1)`)
-// so pressing a key that leads there is visibly refused even through a
-// monochrome paste.
+// The one-row tab strip (backlog item 11): `| charts | flame | knobs |` under
+// the status bar. The active tab renders inverted. All three panes exist as
+// of M1: the flame cell is no longer the dimmed M1 placeholder.
 ftxui::Element RenderTabStrip(int active_tab);
 
 // The persistent bottom-row key bar, rendered from the shell's real key map:
-// navigate names n/c/k/q/? (plus s while a run is live, and q's stop-then-
-// quit), editing names the dialog's tab/enter/esc. `session_open` marks the
-// state where `n` can never succeed (a session is open until it is closed
-// with q): the n hint is then annotated as unavailable instead of
+// navigate names n/c/f/k/q/? (plus s while a run is live, and q's stop-then-
+// quit); on the flame tab it names the flame-pane keys instead; editing modes
+// name the dialog's or the search field's tab/enter/esc. `session_open`
+// marks the state where `n` can never succeed (a session is open until it is
+// closed with q): the n hint is then annotated as unavailable instead of
 // advertising a key that would silently refuse.
-ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open);
+ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open,
+                            int active_tab = 0);
 
-// The `?` help overlay: every key of the real key map and every status-bar
-// field with a one-line definition, so no on-screen token stays undefined.
+// The navigate-mode key map as data — the SINGLE SOURCE OF TRUTH the help
+// overlay renders from and the key-map test asserts (TuiApp's handler is
+// written against the same table; a row dropped from either side is a
+// visible test failure). The M2/M3 collision fix is pinned here in code:
+// plain n opens the start-run dialog, N (Shift+n) opens the noise-floor
+// view, / enters search.
+struct KeyBinding {
+  const char* key;
+  const char* action;
+};
+std::vector<KeyBinding> NavigateKeyBindings();
+
+// The `?` help overlay: every key of the real key map (rendered from
+// NavigateKeyBindings) and every status-bar field with a one-line
+// definition, so no on-screen token stays undefined.
 ftxui::Element RenderHelpOverlay();
 
 // The start-run dialog overlay: a bordered box (kDialogOverlay* geometry)

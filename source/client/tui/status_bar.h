@@ -35,11 +35,15 @@ inline constexpr int kStatusBarFlushIntervalSeconds = 1;
 //      monochrome paste next to row 0's "[editing] " prefix.
 //
 // `uri` is the dialog draft (the only pre-M3 source of a target uri);
-// `duration_seconds` is the run's configured duration (0 = unset). Pure
-// function, no terminal I/O.
+// `duration_seconds` is the run's configured duration (0 = unset).
+// `profiler_state` is the M1 flamegraph pipeline's state cell ("idle" |
+// "window open <n>s" | "folding..."; empty renders "idle"). The M1 SUT-stats
+// cells (reset-or-label-set-change marker, histogram-drop count) render from
+// the model's scrape state. Pure function, no terminal I/O.
 ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
                                absl::string_view session_path, absl::string_view uri = "",
-                               int duration_seconds = 0);
+                               int duration_seconds = 0,
+                               absl::string_view profiler_state = "");
 
 } // namespace Tui
 } // namespace Client

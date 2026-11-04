@@ -62,11 +62,55 @@ message RunEndRecord {
   int64 ended_unix_ns = 4;
 }
 
+// One pulled and phase-aligned profile window, appended to the session per
+// spec §4 session recording (M1). FORK-ONLY.
+message ProfileWindowRecord {
+  // "cpu" | "alloc".
+  string profile_type = 1;
+  // Window interval on the SUT clock (spec §8.5): the parsed profile's own
+  // stamps when it carries timestamps, otherwise the fetch orchestration's
+  // collector boundary (mac wall; local venue). The record's
+  // purity_fraction/interval facts must be read against that clock, never
+  // cross-compared with a metric series' stamps from the other domain.
+  int64 start_unix_ns = 2;
+  int64 end_unix_ns = 3;
+  // Fraction of the window inside one drain-complete phase (spec §8.3).
+  // 1.0 = pure; anything below is excluded-and-marked: ComputeDifferential
+  // refuses every pair with an impure side, so an impure record can never be
+  // re-used as comparable.
+  double purity_fraction = 4;
+  // Constant "main" pre-A1.
+  string phase_id = 5;
+  // The start request's concurrency (the 8.4 non-comparability key).
+  uint64 worker_count = 6;
+  // Completed requests inside the window — the per-unit-of-work denominator
+  // (spec §8.4), anchor-mapped through the first snapshot.
+  uint64 work_units = 7;
+  // Whether the folded tree resolved to function names; an unsymbolized
+  // window renders with the explicit banner (graceful degradation).
+  bool symbolized = 8;
+  // Provenance: the --pprof-tool argv prefix used for symbolization (empty
+  // when symbolization was not attempted).
+  string symbolizer_tool = 9;
+  // The RAW staged profile bytes, verbatim. Format boundary (T2 finding):
+  // for the gperftools SUT this is the LEGACY binary profile — readable only
+  // through the symbolizer machine route, never parseable in-process. The
+  // session is self-describing: zero re-fetch to re-analyze.
+  bytes raw_profile = 10;
+}
+
 // One frame of a session file.
 message SessionRecord {
   oneof record {
     SessionHeader header = 1;
     MetricSeriesRecord metric_series = 2;
     RunEndRecord run_end = 3;
+    // M1's first added case (see the format-evolution rule at the top of this
+    // file): a reader that predates it reports an unknown case as the
+    // version-skew signal — the M0b reader's RECORD_NOT_SET rejection turns
+    // it into a DataLoss error naming the offset, never a silent skip. The
+    // asymmetry is forward-compat only: the NEW reader reads old files fine;
+    // an old reader does NOT read a file carrying this record.
+    ProfileWindowRecord profile_window = 4;
   }
 }

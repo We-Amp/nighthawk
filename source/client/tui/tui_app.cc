@@ -1,13 +1,21 @@
 #include "source/client/tui/tui_app.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/event.hpp"
 #include "ftxui/component/screen_interactive.hpp"
@@ -15,7 +23,11 @@
 #include "ftxui/screen/screen.hpp"
 #include "tclap/CmdLine.h"
 
+#include "source/client/tui/pprof_fold.h"
+
 #include "source/client/tui/layout.h"
+#include "source/client/tui/profile_session_conversion.h"
+#include "source/client/tui/profile_symbolizer.h"
 #include "source/client/tui/session_conversion.h"
 #include "source/client/tui/start_run_dialog.h"
 #include "source/client/tui/status_bar.h"
@@ -34,6 +46,212 @@ using ftxui::Renderer;
 // How long finishSession waits for the stopped run's on_finished before
 // giving up (and letting the writer drain without a run end record).
 constexpr std::chrono::seconds kFinishTimeout{30};
+
+// The SUT stats scrape cadence: one scrape per stats flush interval (spec §4;
+// plan task 7 wiring).
+constexpr auto kScrapeCadence = std::chrono::seconds(kStatusBarFlushIntervalSeconds);
+
+// The admin clock surface's granularity: the RFC 7231 Date header carries
+// whole seconds only, so an observed mac<->SUT offset within this bound is
+// truncation, not skew. Clock-offset uncertainty is recorded only beyond it.
+constexpr int64_t kDateGranularityNs = 1'000'000'000;
+
+int64_t nowUnixNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// Reads a whole file; nullopt on any failure (missing, unreadable).
+std::optional<std::string> ReadWholeFile(const std::string& path) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file.is_open()) {
+    return std::nullopt;
+  }
+  std::ostringstream ss;
+  ss << file.rdbuf();
+  return ss.str();
+}
+
+// One pool job's outcome: the produced window (pure or excluded-and-marked)
+// plus what the session record and the flame-pane note need.
+struct ProfileJobOutcome {
+  bool has_window = false;
+  ProfileWindow window;
+  // The staged raw profile bytes (for the session record) and the
+  // provenance label.
+  std::string raw_bytes;
+  std::string symbolizer_tool;
+  // Human-facing outcome line for the flame pane note.
+  std::string note;
+};
+
+// ONE pool-job pipeline (plan task 6): the fetched+retrieved staged profile
+// becomes an aligned ProfileWindow (pure) or an excluded-and-marked one
+// (impure — Review Focus 3 end-to-end). Never crashes on a bad profile and
+// never fabricates an interval: the window interval is the parsed profile's
+// own stamps when it carries timestamps (the §8.5 sanctioned join key), the
+// fetch orchestration's collector boundary otherwise.
+//
+// Symbolization path: the machine route runs FIRST when a SUT binary is
+// configured; the documented raw-proto fallback (LoadProfile on the staged
+// file directly) covers proto-native sources — a staged legacy gperftools
+// profile without a working symbolizer degrades to no window (the reason
+// lands in the outcome note), never a crash.
+ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
+                                     const FetchedProfile& fetched,
+                                     const ProfileJobInput& input,
+                                     int64_t clock_offset_uncertainty_ns) {
+  ProfileJobOutcome outcome;
+  outcome.symbolizer_tool = absl::StrJoin(config.pprof_tool_argv, " ");
+
+  outcome.raw_bytes = ReadWholeFile(fetched.local_path).value_or("");
+  if (outcome.raw_bytes.empty()) {
+    outcome.note = absl::StrCat("profile fetch failed: staged file unreadable: ",
+                                fetched.local_path);
+    return outcome;
+  }
+
+  // Tree: symbolize-then-fallback.
+  absl::StatusOr<FoldedTree> tree_or = absl::InternalError("profile not loaded");
+  if (!config.sut_binary_path.empty()) {
+    ProfileSymbolizer symbolizer(config.pprof_tool_argv, config.pprof_binary_path);
+    const std::string symbolized_path = absl::StrCat(fetched.local_path, ".symbolized.pb");
+    const absl::Status symbolized =
+        symbolizer.Symbolize(fetched.local_path, config.sut_binary_path, symbolized_path);
+    if (symbolized.ok()) {
+      auto profile_or = LoadProfile(symbolized_path);
+      if (profile_or.ok()) {
+        tree_or = FoldProfile(*profile_or);
+      } else {
+        tree_or = profile_or.status();
+      }
+    } else if (!absl::IsNotFound(symbolized)) {
+      // A tool that exists but failed is worth reporting verbatim; a missing
+      // tool falls through to the fallback silently (the graceful
+      // degradation path).
+      outcome.note = absl::StrCat("symbolization failed: ", symbolized.message());
+    }
+  }
+  if (!tree_or.ok()) {
+    // Raw-proto fallback: proto-native staged profiles parse directly (the
+    // unsymbolized-degradation shape — locations without functions fold to
+    // "0x<addr>" frames). A legacy gperftools profile cannot; the outcome
+    // note says so.
+    auto profile_or = LoadProfile(fetched.local_path);
+    if (profile_or.ok()) {
+      tree_or = FoldProfile(*profile_or);
+    } else if (outcome.note.empty()) {
+      outcome.note = absl::StrCat(
+          "profile unusable: no working symbolizer and the staged profile is not a "
+          "pprof proto (legacy gperftools format needs the machine route): ",
+          profile_or.status().message());
+    }
+  }
+  if (!tree_or.ok()) {
+    if (outcome.note.empty()) {
+      outcome.note = absl::StrCat("profile fold failed: ", tree_or.status().message());
+    }
+    return outcome;
+  }
+
+  // Window interval selection + the §8.5 cross-check (plan task 4's TODO,
+  // owned by this wiring): when the tree carries timestamps, the tree's own
+  // interval is authoritative — the fetch-orchestration interval is verified
+  // against it, with any disagreement beyond the admin Date granularity
+  // recorded as mac<->SUT clock-offset uncertainty. Without tree timestamps
+  // (the legacy gperftools conversion — the live M1 path), the fetch
+  // orchestration bounds the interval.
+  int64_t window_start = fetched.requested_start_unix_ns;
+  int64_t window_end = fetched.requested_end_unix_ns;
+  int64_t uncertainty = clock_offset_uncertainty_ns;
+  if (tree_or->time_nanos != 0 && tree_or->duration_nanos != 0) {
+    const int64_t observed_offset =
+        std::abs(tree_or->time_nanos - fetched.requested_start_unix_ns);
+    uncertainty = std::max(uncertainty, std::max<int64_t>(0, observed_offset - kDateGranularityNs));
+    window_start = tree_or->time_nanos;
+    window_end = tree_or->time_nanos + tree_or->duration_nanos;
+  }
+
+  // Phase interval (the major-fix producer): pre-A1 the whole run is one
+  // "main" phase. A finished run's span is [run_start, recorded run end]; a
+  // live run's phase-so-far ends at the window's own fetch boundary (the
+  // run has not stopped yet, and a window fetched mid-run is contained by
+  // construction — purity claims stay relative to observed run time until
+  // M2's real phase events replace this producer).
+  PhaseInterval phase = PreA1RunInterval(
+      input.run_start_unix_ns,
+      input.run_finished ? input.run_end_unix_ns
+                         : std::max(input.run_start_unix_ns + 1, fetched.requested_end_unix_ns),
+      input.worker_count);
+
+  // Work units through the anchor: monotonic ~= wall - (anchor.wall -
+  // anchor.monotonic).
+  const int64_t anchor_offset = input.anchor.wall_time_unix_ns - input.anchor.monotonic_ns;
+  const uint64_t lo_monotonic_ns =
+      static_cast<uint64_t>(std::max<int64_t>(0, window_start - anchor_offset));
+  const uint64_t hi_monotonic_ns =
+      static_cast<uint64_t>(std::max<int64_t>(0, window_end - anchor_offset));
+  const uint64_t work_units =
+      CompletedWorkInMonotonicRange(input.completed_series, lo_monotonic_ns, hi_monotonic_ns);
+
+  // Align. The rejected (impure) case builds the EXCLUDED-AND-MARKED window
+  // directly instead of round-tripping through WindowPhaseAlignment::Align:
+  // Align takes the tree BY VALUE and destroys it on every error return, so
+  // the marked window (which carries the tree for rendering) must be
+  // assembled here. The rejection conditions mirror Align's documented
+  // contract exactly, and the purity fraction is the same overlap formula.
+  const int64_t overlap_start = std::max(window_start, phase.start_unix_ns);
+  const int64_t overlap_end = std::min(window_end, phase.end_unix_ns);
+  const bool contained =
+      phase.drain_complete && window_end <= phase.end_unix_ns && overlap_end > overlap_start;
+
+  ProfileWindow window;
+  window.tree = *std::move(tree_or);
+  window.start_unix_ns = window_start;
+  window.end_unix_ns = window_end;
+  window.phase_id = phase.phase_id;
+  window.worker_count = input.worker_count;
+  window.work_units = work_units;
+  window.profile_type = fetched.profile_type;
+  window.symbolized = window.tree.symbolized;
+  window.interval_source = (window.tree.time_nanos != 0 && window.tree.duration_nanos != 0)
+                               ? WindowIntervalSource::kProfileTimestamps
+                               : WindowIntervalSource::kFetchOrchestration;
+  window.clock_offset_uncertainty_ns = uncertainty;
+
+  if (contained) {
+    auto aligned = WindowPhaseAlignment::Align(std::move(window.tree), phase, window.start_unix_ns,
+                                               window.end_unix_ns, window.worker_count,
+                                               window.work_units, window.profile_type, uncertainty);
+    if (aligned.ok()) {
+      outcome.has_window = true;
+      outcome.window = *std::move(aligned);
+      outcome.note = absl::StrCat("window pulled: pure (work units ", work_units, ")");
+      return outcome;
+    }
+    // Align can still reject a "contained" pair only on the degenerate
+    // guards (kInvalidArgument) — no window, honest failure.
+    outcome.note = absl::StrCat("window rejected: ", aligned.status().message());
+    return outcome;
+  }
+
+  // Excluded-and-marked: never pure, never comparable (ComputeDifferential
+  // refuses every pair with an impure side). The window still lands — in the
+  // store and the session — with the impurity carried in purity_fraction.
+  const int64_t duration = window_end - window_start;
+  const double purity =
+      duration > 0 && overlap_end > overlap_start
+          ? static_cast<double>(overlap_end - overlap_start) / static_cast<double>(duration)
+          : 0.0;
+  window.purity_fraction = purity;
+  outcome.has_window = true;
+  outcome.window = std::move(window);
+  outcome.note = absl::StrCat(
+      "window EXCLUDED-AND-MARKED (purity ", absl::StrFormat("%.3f", purity),
+      " < 1.0): never comparable — ", "window straddles the run interval");
+  return outcome;
+}
 
 } // namespace
 
@@ -58,6 +276,77 @@ void FillOverlayState(const ShellState& state, OverlayState* overlay) {
   // a refused submit silent again while every state-level assertion stays
   // green (the re-review finding).
   overlay->start_rejected = state.start_rejected;
+}
+
+std::vector<CounterPoint>
+MergeCompletedSeries(const absl::flat_hash_map<std::string, std::vector<CounterPoint>>& counters) {
+  static const char* const kCompletedNames[] = {
+      "benchmark.http_1xx", "benchmark.http_2xx",      "benchmark.http_3xx",
+      "benchmark.http_4xx", "benchmark.http_5xx",      "benchmark.http_xxx",
+      "benchmark.stream_resets", "benchmark.pool_connection_failure",
+  };
+  // The union of stamps, ascending and deduplicated.
+  std::vector<uint64_t> stamps;
+  for (const char* name : kCompletedNames) {
+    auto it = counters.find(name);
+    if (it == counters.end()) {
+      continue;
+    }
+    for (const CounterPoint& point : it->second) {
+      stamps.push_back(point.monotonic_ns);
+    }
+  }
+  std::sort(stamps.begin(), stamps.end());
+  stamps.erase(std::unique(stamps.begin(), stamps.end()), stamps.end());
+
+  // C(t) per source series (last value at or before t), summed at every
+  // union stamp — the same convention CompletedWorkInMonotonicRange applies
+  // to the merged result.
+  std::vector<CounterPoint> merged;
+  merged.reserve(stamps.size());
+  for (const uint64_t stamp : stamps) {
+    uint64_t value = 0;
+    for (const char* name : kCompletedNames) {
+      auto it = counters.find(name);
+      if (it == counters.end()) {
+        continue;
+      }
+      uint64_t at_or_before = 0;
+      for (const CounterPoint& point : it->second) {
+        if (point.monotonic_ns <= stamp) {
+          at_or_before = point.value;
+        }
+      }
+      value += at_or_before;
+    }
+    merged.push_back(CounterPoint{stamp, value});
+  }
+  return merged;
+}
+
+FlamePaneState BuildFlamePane(std::shared_ptr<const std::vector<ProfileWindow>> windows,
+                              const FlamegraphViewState& view, absl::string_view note,
+                              const DiffOverlay* overlay) {
+  FlamePaneState pane;
+  pane.view = view;
+  pane.note = std::string(note);
+  if (windows == nullptr || windows->empty()) {
+    return pane;
+  }
+  const ProfileWindow& window = windows->back();
+  pane.tree = &window.tree;
+  pane.window_header = absl::StrCat(
+      "window #", windows->size(), ": ", window.profile_type,
+      " | purity ", absl::StrFormat("%.2f", window.purity_fraction),
+      " | work units ", window.work_units,
+      window.symbolized ? "" : " | UNSYMBOLIZED (no working --pprof-tool)",
+      window.interval_source == WindowIntervalSource::kProfileTimestamps
+          ? " | interval: profile timestamps"
+          : " | interval: fetch orchestration");
+  if (view.diff_mode && overlay != nullptr) {
+    pane.diff = &overlay->result();
+  }
+  return pane;
 }
 
 bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunController& controller,
@@ -129,10 +418,46 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     return false; // let the text inputs handle the character
   }
 
+  // The search input mode (M1, the flame pane's frame search): typed
+  // characters edit the draft; enter applies it to the view state, esc
+  // cancels and discards. Both exits post the one forced redraw
+  // RefreshSuspended's rule requires.
+  if (state.mode == InputMode::kEditingSearch) {
+    if (event == Event::Escape) {
+      state.search_field.clear();
+      state.mode = InputMode::kNavigate;
+      state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+      force_redraw();
+      return true;
+    }
+    if (event == Event::Return) {
+      state.flame_view.search = state.search_field;
+      state.mode = InputMode::kNavigate;
+      state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+      force_redraw();
+      return true;
+    }
+    if (event == Event::Backspace) {
+      if (!state.search_field.empty()) {
+        state.search_field.pop_back();
+      }
+      return true;
+    }
+    if (event.is_character()) {
+      state.search_field += event.character();
+      return true;
+    }
+    return false;
+  }
+
   // Navigate mode key map. Tab indices match the tab strip's order: c ->
-  // charts (0), k -> knobs (2); flame (1) is M1's pane and takes no key yet.
+  // charts (0), f -> flame (1, M1), k -> knobs (2).
   if (event == Event::Character('c')) {
     state.active_tab = 0;
+    return true;
+  }
+  if (event == Event::Character('f')) {
+    state.active_tab = 1;
     return true;
   }
   if (event == Event::Character('k')) {
@@ -145,7 +470,8 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
   }
   if (state.help_open && event == Event::Escape) {
     // Only escape's navigate-mode job is closing the help overlay; it is
-    // listed in the overlay's own footer line.
+    // listed in the overlay's own footer line. (On the flame tab a second
+    // esc unzooms — the overlay's footer names esc's flame-tab job too.)
     state.help_open = false;
     return true;
   }
@@ -167,6 +493,95 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
   if (event == Event::Character('q')) {
     return quitShell(controller, exit_loop);
   }
+
+  // --- M1 flame-pane keys --------------------------------------------------
+  //
+  // p/d/N work from any tab (they drive the pipeline, whose pane lives on
+  // tab 1); the frame-navigation keys act only when the flame tab is up.
+  if (event == Event::Character('/')) {
+    // Search entry: the draft starts empty; the applied query (any earlier
+    // enter) stays in force until a new one lands, and esc discards the
+    // draft without touching the applied query. Global (the highlights are
+    // only visible on the flame tab, but entering the mode from anywhere is
+    // harmless and keeps the key map simple).
+    state.search_field.clear();
+    state.mode = InputMode::kEditingSearch;
+    state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+    return true;
+  }
+
+  if (event == Event::Character('p')) {
+    const absl::Status status = controller.profileWindowOpen()
+                                    ? controller.StopProfileWindowAndFold()
+                                    : controller.StartProfileWindow();
+    if (!status.ok()) {
+      controller.NoteFlameStatus(std::string(status.message()));
+    }
+    return true;
+  }
+  if (event == Event::Character('d') || event == Event::Character('N')) {
+    const bool noise_floor = event == Event::Character('N');
+    if (state.flame_view.diff_mode && state.flame_diff_is_noise == noise_floor) {
+      // The toggle off: a second press of the same key exits the view.
+      state.flame_view.diff_mode = false;
+      controller.NoteFlameStatus(noise_floor ? "noise-floor view closed" : "differential closed");
+    } else {
+      state.flame_view.diff_mode = true;
+      state.flame_diff_is_noise = noise_floor;
+      controller.ComputeWindowDiffForLastTwoPureWindows(noise_floor);
+    }
+    return true;
+  }
+
+  if (state.active_tab == 1) {
+    const auto windows = controller.loadWindows();
+    const FoldedTree* tree =
+        (windows != nullptr && !windows->empty()) ? &windows->back().tree : nullptr;
+    if (event == Event::ArrowDown || event == Event::ArrowUp || event == Event::ArrowLeft ||
+        event == Event::ArrowRight) {
+      if (tree != nullptr) {
+        // Navigation addresses the ZOOMED tree (paths are post-re-root,
+        // pre-collapse per flamegraph.h's addressing contract).
+        const FoldedTree zoomed =
+            ZoomToFrame(*tree, state.flame_view.zoom_path.value_or(FramePath{}));
+        const FramePath current = state.flame_view.selected.value_or(FramePath{});
+        FramePath next = current;
+        if (event == Event::ArrowDown) {
+          next = NavDown(zoomed, current);
+        } else if (event == Event::ArrowUp) {
+          next = NavUp(zoomed, current);
+        } else {
+          next = NavSibling(zoomed, current, event == Event::ArrowRight ? 1 : -1);
+        }
+        if (ResolveSelection(zoomed, next).has_value()) {
+          state.flame_view.selected = next;
+        }
+      }
+      return true;
+    }
+    if (event == Event::Return) {
+      // Zoom to the selected frame: re-root (the addressing contract keeps
+      // the selection in post-zoom coordinates; it restarts at the new root).
+      if (tree != nullptr && state.flame_view.selected.has_value() &&
+          !state.flame_view.selected->empty()) {
+        const FoldedTree zoomed =
+            ZoomToFrame(*tree, state.flame_view.zoom_path.value_or(FramePath{}));
+        if (ResolveSelection(zoomed, *state.flame_view.selected).has_value()) {
+          state.flame_view.zoom_path = *state.flame_view.selected;
+          state.flame_view.selected = FramePath{};
+        }
+      }
+      return true;
+    }
+    if (event == Event::Escape || event == Event::Backspace) {
+      if (state.flame_view.zoom_path.has_value()) {
+        state.flame_view.zoom_path.reset();
+        state.flame_view.selected = FramePath{};
+      }
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -175,16 +590,363 @@ RunController::RunController(const std::shared_ptr<grpc::ChannelInterface>& chan
     : session_prefix_(std::move(session_prefix)),
       // feed_ last, matching declaration order: it is destroyed first, which
       // is what makes teardown-with-a-live-run safe (see the header comment).
+      // pool_ after it joins any in-flight M1 job first of all members.
+      scrape_admin_(AdminEndpoints{}),
       feed_(channel,
             RunFeedCallbacks{std::bind(&RunController::onSnapshot, this, std::placeholders::_1),
                              std::bind(&RunController::onCompleted, this, std::placeholders::_1),
                              std::bind(&RunController::onFinished, this, std::placeholders::_1)}) {}
 
-RunController::~RunController() = default;
+RunController::~RunController() {
+  // Stop the scrape cadence and join it before any member it touches goes
+  // away (the pool's destructor joins the profile/differential jobs).
+  scraping_.store(false, std::memory_order_relaxed);
+  if (scraper_.joinable()) {
+    scraper_.join();
+  }
+}
 
 void RunController::set_snapshot_notification(std::function<void()> callback) {
   std::lock_guard<std::mutex> lock(mutex_);
   snapshot_notification_ = std::move(callback);
+}
+
+void RunController::ConfigureProfiling(ProfilePipelineConfig config) {
+  // Configure-once, before use (pool jobs capture config by value at submit;
+  // nothing here is hot-swappable — a second call is refused honestly).
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (profiling_configured_) {
+    return;
+  }
+  profiling_configured_ = true;
+  profile_config_ = std::move(config);
+  fetcher_ = std::make_unique<ProfileFetcher>(
+      AdminClient(profile_config_.admin),
+      profile_config_.retriever_kind == ProfilePipelineConfig::RetrieverKind::kVolumeMount
+          ? std::unique_ptr<ProfileRetriever>(
+                std::make_unique<VolumeMountRetriever>(profile_config_.mount_root))
+          : std::unique_ptr<ProfileRetriever>(std::make_unique<ScpRetriever>(profile_config_.scp_host)),
+      profile_config_.sut_profile_path, profile_config_.staging_dir);
+  scrape_admin_ = AdminClient(profile_config_.admin);
+}
+
+bool RunController::profilingConfigured() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return profiling_configured_;
+}
+
+absl::Status RunController::StartProfileWindow() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!profiling_configured_) {
+      return absl::FailedPreconditionError(
+          "profiling is not configured (pass --profile-mount or --scp-host)");
+    }
+    if (!has_run_stamp_) {
+      return absl::FailedPreconditionError(
+          "no run to align against: pull profile windows during (or after) a run");
+    }
+  }
+  if (window_open_.exchange(true)) {
+    return absl::FailedPreconditionError("a profile window is already open (p closes it)");
+  }
+  int window_seconds = 5;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    window_seconds = profile_config_.window_seconds;
+  }
+  // Single small POST on the steering thread; the blocking fetch belongs to
+  // the pool job (profile_fetcher.h's threading contract).
+  const absl::Status started = fetcher_->StartWindow(window_seconds);
+  if (!started.ok()) {
+    window_open_.store(false, std::memory_order_relaxed);
+    return started;
+  }
+  {
+    absl::MutexLock lock(&diff_mu_);
+    flame_note_ = absl::StrCat("profile window open (", window_seconds, "s) - p closes it");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status RunController::StopProfileWindowAndFold() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!profiling_configured_) {
+      return absl::FailedPreconditionError(
+          "profiling is not configured (pass --profile-mount or --scp-host)");
+    }
+    if (!anchor_.valid()) {
+      return absl::FailedPreconditionError(
+          "no snapshot anchor yet: the work-units join needs the run's first flush");
+    }
+  }
+  if (!window_open_.exchange(false)) {
+    return absl::FailedPreconditionError("no profile window is open (p opens one)");
+  }
+  folding_.store(true, std::memory_order_relaxed);
+
+  // Capture the job inputs on the steering thread, under the model mutex:
+  // the completed-work series as of the stop moment, the anchor, and the run
+  // stamps. A run that ENDS while the fetch runs is the straddle case and is
+  // handled inside the job (run_finished was captured before the fetch).
+  // shared_ptr (not unique_ptr): Submit's queue is a std::function, which
+  // needs a copyable callable.
+  auto input = std::make_shared<ProfileJobInput>();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    input->anchor = anchor_;
+    input->run_start_unix_ns = run_start_unix_ns_;
+    input->run_finished = run_finished_;
+    input->run_end_unix_ns = run_end_unix_ns_;
+    input->worker_count = worker_count_;
+    input->completed_series = MergeCompletedSeries(model_.counters);
+    // RunFeed clears its running flag BEFORE on_finished fires (run_feed.cc's
+    // teardown order), so "feed idle but stamp not yet recorded" means the
+    // terminal event is in flight. Treat the run as ended now: the window's
+    // fetch stamp will land past this moment, which is exactly the
+    // straddle case — never a silently pure window over a dead run.
+    if (!feed_.running() && !input->run_finished) {
+      input->run_finished = true;
+      input->run_end_unix_ns = nowUnixNs();
+    }
+  }
+
+  // ONE pool job: fetch + retrieve -> symbolize -> load -> fold -> align ->
+  // store + session record (plan task 6 pipeline). The job owns copies of
+  // everything mutable it touches.
+  PprofWorkerPool* pool = &pool_;
+  RunController* self = this;
+  pool->Submit([self, input]() { self->FinishProfileWindowJob(*input); });
+  return absl::OkStatus();
+}
+
+void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
+  ProfilePipelineConfig config;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config = profile_config_;
+  }
+  // The job's own admin client: AdminClient is not thread-safe, and the
+  // scrape cadence may be running on its own client concurrently.
+  AdminClient job_admin(config.admin);
+
+  absl::StatusOr<FetchedProfile> fetched = fetcher_->StopWindowAndFetch();
+  if (!fetched.ok()) {
+    // Post-failed-disable recovery (profile_fetcher.h's contract): the
+    // window is closed; the SUT profiler may still run. Best-effort disable
+    // with the job's own client, then surface the reason.
+    (void)job_admin.EnableCpuProfiler(false);
+    {
+      absl::MutexLock lock(&diff_mu_);
+      flame_note_ = absl::StrCat("profile fetch failed: ", fetched.status().message());
+    }
+    folding_.store(false, std::memory_order_relaxed);
+    std::function<void()> notification;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      notification = snapshot_notification_;
+    }
+    if (notification != nullptr) {
+      notification();
+    }
+    return;
+  }
+
+  // Clock-offset uncertainty (plan major-fix): the observed mac<->SUT offset
+  // beyond the admin Date granularity. Unavailable (no clock surface) -> 0,
+  // recorded-absent.
+  int64_t uncertainty_ns = 0;
+  const absl::StatusOr<int64_t> sut_now = job_admin.FetchSutUnixTimeNs();
+  if (sut_now.ok()) {
+    const int64_t observed = std::abs(*sut_now - nowUnixNs());
+    uncertainty_ns = std::max<int64_t>(0, observed - kDateGranularityNs);
+  }
+
+  const ProfileJobOutcome outcome = RunProfilePipeline(config, *fetched, input, uncertainty_ns);
+
+  if (outcome.has_window) {
+    // Append to the immutable store; the render side only ever reads it.
+    auto windows = window_store_.load();
+    std::vector<ProfileWindow> updated = windows != nullptr ? *windows : std::vector<ProfileWindow>();
+    updated.push_back(outcome.window);
+    window_store_.store(std::move(updated));
+
+    // Session record: the raw staged bytes ride along (self-describing
+    // session). Enqueued under the writer mutex; enqueue after close counts
+    // as a drop, so a race with finishSession is safe by contract.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (writer_ != nullptr) {
+        nighthawk::client::SessionRecord record;
+        *record.mutable_profile_window() =
+            ToProfileWindowRecord(outcome.window, outcome.raw_bytes, outcome.symbolizer_tool);
+        writer_->enqueue(std::move(record));
+      }
+    }
+  }
+
+  {
+    absl::MutexLock lock(&diff_mu_);
+    flame_note_ = outcome.note;
+  }
+  folding_.store(false, std::memory_order_relaxed);
+  std::function<void()> notification;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    notification = snapshot_notification_;
+  }
+  if (notification != nullptr) {
+    notification();
+  }
+}
+
+bool RunController::profileWindowOpen() const {
+  return window_open_.load(std::memory_order_relaxed);
+}
+
+std::string RunController::profileWindowState() const {
+  if (folding_.load(std::memory_order_relaxed)) {
+    return "folding...";
+  }
+  if (window_open_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return absl::StrCat("window open ", profile_config_.window_seconds, "s");
+  }
+  return "idle";
+}
+
+std::shared_ptr<const std::vector<ProfileWindow>> RunController::loadWindows() const {
+  return window_store_.load();
+}
+
+void RunController::ComputeWindowDiffForLastTwoPureWindows(bool noise_floor) {
+  const auto snapshots = window_store_.load();
+  const std::string label = noise_floor ? "noise floor" : "differential";
+  if (snapshots == nullptr || snapshots->size() < 2) {
+    absl::MutexLock lock(&diff_mu_);
+    flame_note_ = absl::StrCat(label, " needs two pure windows (pulled ",
+                               snapshots == nullptr ? 0 : snapshots->size(), ")");
+    return;
+  }
+  // The default selection: the two most recent pure windows (append-only
+  // store: indices stay valid across later appends).
+  std::vector<size_t> pure;
+  for (size_t i = 0; i < snapshots->size(); ++i) {
+    if ((*snapshots)[i].purity_fraction >= 1.0) {
+      pure.push_back(i);
+    }
+  }
+  if (pure.size() < 2) {
+    absl::MutexLock lock(&diff_mu_);
+    flame_note_ = absl::StrCat(label, " needs two pure windows (", pure.size(),
+                               " pure of ", snapshots->size(), " pulled)");
+    return;
+  }
+  const size_t base = pure[pure.size() - 2];
+  const size_t cur = pure[pure.size() - 1];
+  RunController* self = this;
+  pool_.Submit([self, snapshots, base, cur, noise_floor]() {
+    // Pool-side computation; the overlay TYPE-pairs the result with the
+    // snapshot that owns its frame pointers (flamegraph.h's lifetime rule).
+    absl::StatusOr<DifferentialResult> result =
+        noise_floor ? ComputeNoiseFloor((*snapshots)[base], (*snapshots)[cur])
+                    : ComputeDifferential((*snapshots)[base], (*snapshots)[cur]);
+    std::string note;
+    std::optional<DiffOverlay> overlay;
+    if (result.ok()) {
+      auto paired = DiffOverlay::Pair(snapshots, *std::move(result));
+      if (paired.ok()) {
+        overlay = *std::move(paired);
+        note = absl::StrCat(noise_floor ? "noise floor" : "differential", ": windows #", base + 1,
+                            " vs #", cur + 1,
+                            overlay->result().comparable
+                                ? ""
+                                : absl::StrCat(" (non-comparable: ",
+                                               overlay->result().incomparable_reason, ")"));
+      } else {
+        note = paired.status().message();
+      }
+    } else {
+      note = result.status().message();
+    }
+    absl::MutexLock lock(&self->diff_mu_);
+    self->diff_overlay_ = std::move(overlay);
+    self->flame_note_ = note;
+    std::function<void()> notification;
+    {
+      std::lock_guard<std::mutex> lock(self->mutex_);
+      notification = self->snapshot_notification_;
+    }
+    if (notification != nullptr) {
+      notification();
+    }
+  });
+}
+
+std::optional<DiffOverlay> RunController::loadDiffOverlay() const {
+  absl::MutexLock lock(&diff_mu_);
+  return diff_overlay_;
+}
+
+std::string RunController::flameNote() const {
+  absl::MutexLock lock(&diff_mu_);
+  return flame_note_;
+}
+
+void RunController::NoteFlameStatus(std::string note) {
+  absl::MutexLock lock(&diff_mu_);
+  flame_note_ = std::move(note);
+}
+
+void RunController::ScrapeLoop() {
+  while (scraping_.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(kScrapeCadence);
+    if (!scraping_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    // Engine-side wall stamp when the clock surface answers (§8.5); the mac
+    // wall otherwise (documented fallback — deltas only need forward time,
+    // and per-series rendering never cross-compares the timelines).
+    absl::StatusOr<int64_t> wall = scrape_admin_.FetchSutUnixTimeNs();
+    absl::StatusOr<std::string> prom = scrape_admin_.FetchPrometheusStats();
+    if (!prom.ok()) {
+      continue; // no SUT admin / unreachable: the charts simply lack sut.*
+    }
+    const SutScrape scrape{wall.ok() ? *wall : nowUnixNs(), *prom};
+    // Histogram-line drop count for the throttled note (the pure layer does
+    // not log; this is the wiring's counting half).
+    int histogram_drops = 0;
+    ParsePrometheusCounters(scrape.prom_text, &histogram_drops);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!has_prev_scrape_) {
+        // Baseline-only first scrape (task 7's folded T6 note): strict
+        // interval deltas only — no synthetic first-interval points.
+        prev_scrape_ = scrape;
+        has_prev_scrape_ = true;
+        continue;
+      }
+      absl::StatusOr<SutStatsDelta> delta = DeltaScrapes(prev_scrape_, scrape);
+      prev_scrape_ = scrape;
+      if (delta.ok()) {
+        for (auto& [name, points] : delta->series) {
+          auto& series = model_.counters[name];
+          for (const CounterPoint& point : points) {
+            series.push_back(point);
+          }
+          while (series.size() > kRunViewModelMaxPoints) {
+            series.erase(series.begin());
+          }
+        }
+        model_.sut_counter_reset_detected =
+            model_.sut_counter_reset_detected || delta->counter_reset_detected;
+        model_.sut_histogram_line_drops += histogram_drops;
+        store_.store(model_);
+      }
+      // Out-of-order scrapes re-baseline silently (never a negative delta).
+    }
+  }
 }
 
 absl::Status RunController::startRun(const nighthawk::client::StartRequest& request) {
@@ -215,6 +977,25 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     // the model before the run launches, so row 0 never reads "(no target)"
     // once the state leaves idle.
     model_.target_uri = request.options().uri().value();
+    // M1 run stamps + anchor reset + worker count (the PreA1RunInterval
+    // producer's inputs; spec §8.5 metadata).
+    has_run_stamp_ = true;
+    run_start_unix_ns_ = nowUnixNs();
+    run_end_unix_ns_ = 0;
+    run_finished_ = false;
+    anchor_ = ClockAnchor{};
+    has_prev_scrape_ = false;
+    const std::string& concurrency = request.options().concurrency().value();
+    uint32_t parsed = 0;
+    worker_count_ =
+        (!concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0)
+            ? parsed
+            : 1;
+    // The scrape cadence runs while the run is live (plan task 7 wiring).
+    if (profiling_configured_ && !scraping_.exchange(true)) {
+      RunController* self = this;
+      scraper_ = std::thread([self]() { self->ScrapeLoop(); });
+    }
   }
   store_.store(model_);
 
@@ -222,9 +1003,7 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
   // returns, snapshots can arrive on the read thread, and one delivered before
   // a later-opened writer would be lost to the session file. A failure here
   // surfaces without a run ever launching.
-  const int64_t unix_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::system_clock::now().time_since_epoch())
-                              .count();
+  const int64_t unix_ns = nowUnixNs();
   const std::string path = absl::StrCat(session_prefix_, "-", unix_ns, ".nhsession");
   auto writer_or =
       SessionWriter::open(path, ToSessionHeader(request, /*session_id=*/path, unix_ns));
@@ -252,12 +1031,12 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
       finished_ = true;
       writer = std::move(writer_);
       session_path_.clear();
+      run_finished_ = true;
+      run_end_unix_ns_ = nowUnixNs();
     }
     nighthawk::client::RunEndRecord run_end;
     run_end.set_completed(false);
-    run_end.set_ended_unix_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  std::chrono::system_clock::now().time_since_epoch())
-                                  .count());
+    run_end.set_ended_unix_ns(nowUnixNs());
     // A close error on this header-only session is not surfaced (the start
     // failure is the actionable status); the close still happened exactly
     // once.
@@ -290,7 +1069,7 @@ const nighthawk::client::CommandLineOptions& RunController::knobOptions() const 
 
 absl::Status RunController::finishSession(bool completed) {
   // Stop-if-running, then wait for on_finished: close() is single-call and
-  // strictly after the feed's terminal event, per the session writer's
+  // strictly after the run feed's terminal event, per the session writer's
   // ordering contract.
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -328,9 +1107,7 @@ absl::Status RunController::finishSession(bool completed) {
   if (completed && has_output) {
     *run_end.mutable_output() = output;
   }
-  run_end.set_ended_unix_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count());
+  run_end.set_ended_unix_ns(nowUnixNs());
   return writer->close(run_end);
 }
 
@@ -349,13 +1126,20 @@ absl::Status RunController::handleLoopExit() {
 void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) {
   // The snapshot path (spec §4): fold into the model, swap the immutable
   // store copy, persist the record, then ping the shell for exactly one
-  // gated redraw. The notification fires outside the mutex so a callback that
-  // re-enters the controller cannot deadlock.
-  model_ = ApplySnapshot(std::move(model_), snapshot);
-  store_.store(model_);
+  // gated redraw. The model mutation is under the mutex now that the M1
+  // scrape thread also folds into the model; the notification fires outside
+  // the mutex so a callback that re-enters the controller cannot deadlock.
   std::function<void()> notification;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // The clock anchor: the FIRST live snapshot's (wall, monotonic) pair —
+    // the §8.5 join key the profile pipeline maps window intervals through.
+    if (!anchor_.valid()) {
+      anchor_.wall_time_unix_ns = snapshot.wall_time_unix_ns();
+      anchor_.monotonic_ns = snapshot.monotonic_ns();
+    }
+    model_ = ApplySnapshot(std::move(model_), snapshot);
+    store_.store(model_);
     if (writer_ != nullptr) {
       nighthawk::client::SessionRecord record;
       *record.mutable_metric_series() = ToMetricSeries(snapshot);
@@ -374,30 +1158,47 @@ void RunController::onCompleted(const nighthawk::client::Output& output) {
     final_output_ = output;
     completed_ = true;
     has_output_ = true;
+    model_.run_state = "completed";
+    store_.store(model_);
   }
   // A natural run end only; a cancelled run never sees this callback.
-  model_.run_state = "completed";
-  store_.store(model_);
 }
 
 void RunController::onFinished(const absl::Status& /*status*/) {
-  model_.run_state = lastRunEndedCompleted() ? "completed" : "stopped";
-  store_.store(model_);
-  std::lock_guard<std::mutex> lock(mutex_);
-  finished_ = true;
+  // The run-end stamp (mac wall, §8.5 metadata) — the PreA1RunInterval end
+  // for windows fetched after the run. The scrape cadence stops with the
+  // run: deltas of a stopped run would be idle-time noise.
+  scraping_.store(false, std::memory_order_relaxed);
+  if (scraper_.joinable() && scraper_.get_id() != std::this_thread::get_id()) {
+    scraper_.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // completed_ (set by onCompleted, same thread) — lastRunEndedCompleted()
+    // would deadlock here: it locks the mutex this block already holds.
+    model_.run_state = completed_ ? "completed" : "stopped";
+    store_.store(model_);
+    run_finished_ = true;
+    run_end_unix_ns_ = nowUnixNs();
+    finished_ = true;
+  }
   cv_.notify_all();
 }
 
 namespace {
 
 // The interactive shell: RenderLayout composition, the navigate-mode key map
-// (c charts, k knobs, n start-run dialog, s stop, q quit) and the dialog
-// editor. The lifecycle logic lives in RunController; this layer only owns
-// the terminal. FTXUI's ScreenInteractive loop is not headless-testable —
-// this binding is exercised manually (Task 7).
-int runInteractive(const std::string& address, const std::string& session_prefix) {
+// (c charts, f flame, k knobs, n start-run dialog, s stop, q quit) and the
+// dialog editor. The lifecycle logic lives in RunController; this layer only
+// owns the terminal. FTXUI's ScreenInteractive loop is not headless-testable
+// — this binding is exercised manually (Task 8).
+int runInteractive(const std::string& address, const std::string& session_prefix,
+                   const std::optional<ProfilePipelineConfig>& profiling) {
   auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
   RunController controller(channel, session_prefix);
+  if (profiling.has_value()) {
+    controller.ConfigureProfiling(*profiling);
+  }
 
   ShellState state;
   Component uri_input = Input(&state.uri_field, "target uri");
@@ -410,7 +1211,8 @@ int runInteractive(const std::string& address, const std::string& session_prefix
 
   // Exactly one redraw per stored snapshot, gated by the input mode (spec §4):
   // while an input mode owns the keyboard the panes catch up only on the one
-  // forced redraw the dialog close posts.
+  // forced redraw the dialog close posts. Pool-job completions (window
+  // folded, differential computed) post through the same gate.
   controller.set_snapshot_notification([&screen, &state]() {
     if (!RefreshSuspended(state.mode_mirror.load(std::memory_order_relaxed))) {
       screen.PostEvent(Event::Custom);
@@ -435,9 +1237,19 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     overlay.uri_input = uri_input;
     overlay.rps_input = rps_input;
     overlay.duration_input = duration_input;
+    // The flame pane (tab 1) composes from the controller's immutable stores
+    // + the shell's view state — the same BuildFlamePane the tests use. The
+    // overlay (and its owning snapshot, held inside the DiffOverlay) stays
+    // alive through the render.
+    const std::optional<DiffOverlay> overlay_optional =
+        state.flame_view.diff_mode ? controller.loadDiffOverlay() : std::nullopt;
+    FlamePaneState flame = BuildFlamePane(controller.loadWindows(), state.flame_view,
+                                          controller.flameNote(),
+                                          overlay_optional.has_value() ? &*overlay_optional
+                                                                       : nullptr);
     return RenderLayout(screen.dimx(), screen.dimy(), state.active_tab, state.mode, view_model,
                         state.dialog, controller.sessionPath(), controller.knobOptions(),
-                        &overlay);
+                        &overlay, &flame, controller.profileWindowState());
   });
 
   Component app = CatchEvent(view, [&](Event event) {
@@ -485,6 +1297,45 @@ int runTui(int argc, const char* const* argv, std::ostream& err) {
   TCLAP::SwitchArg selftest(
       "", "selftest",
       "Render one static frame into an off-screen screen, print \"tui ok\" and exit.", cmd);
+  // M1 profiling flags (plan task 6). Profiling is configured when a profile
+  // mount (volume retriever) or scp host (rig variant) is given; without one
+  // the p/d/N keys refuse with an honest message.
+  TCLAP::ValueArg<std::string> admin_base(
+      "", "admin-base", "SUT admin endpoint base URL. Default: http://127.0.0.1:9901.", false,
+      "http://127.0.0.1:9901", "string", cmd);
+  TCLAP::ValueArg<std::string> profile_retriever(
+      "", "profile-retriever", "Profile retriever kind: mount or scp. Default: mount.", false,
+      "mount", "string", cmd);
+  TCLAP::ValueArg<std::string> profile_mount(
+      "", "profile-mount",
+      "Local path of the SUT profile bind mount (the mount retriever reads there). Empty = "
+      "profiling unconfigured.",
+      false, "", "string", cmd);
+  TCLAP::ValueArg<std::string> scp_host(
+      "", "scp-host", "scp destination (user@host) for the rig retriever.", false, "", "string",
+      cmd);
+  TCLAP::ValueArg<std::string> sut_profile_path(
+      "", "sut-profile-path",
+      "SUT-side path the CPU profiler writes (admin.profile_path). Default: "
+      "/var/local/profiling/envoy.prof.",
+      false, "/var/local/profiling/envoy.prof", "string", cmd);
+  TCLAP::ValueArg<std::string> profile_staging(
+      "", "profile-staging", "Local staging directory for fetched profiles. Default: "
+      "/tmp/nh-profiles.",
+      false, "/tmp/nh-profiles", "string", cmd);
+  TCLAP::ValueArg<std::string> pprof_tool(
+      "", "pprof-tool",
+      "Symbolizer argv prefix, space separated (SUBPROCESS ONLY - never a linked dependency). "
+      "Default: \"go tool pprof\".",
+      false, "go tool pprof", "string", cmd);
+  TCLAP::ValueArg<std::string> sut_binary(
+      "", "sut-binary",
+      "SUT binary path inside the PPROF_BINARY_PATH layout (binary reachability for "
+      "symbolization). Empty = no symbolization attempted.",
+      false, "", "string", cmd);
+  TCLAP::ValueArg<int> profile_window_seconds(
+      "", "profile-window-seconds", "Profile window length for the p flow. Default: 5.", false, 5,
+      "int", cmd);
   cmd.setExceptionHandling(false);
   try {
     cmd.parse(argc, argv);
@@ -513,7 +1364,28 @@ int runTui(int argc, const char* const* argv, std::ostream& err) {
     return 0;
   }
 
-  return Tui::runInteractive(address.getValue(), session_prefix.getValue());
+  std::optional<Tui::ProfilePipelineConfig> profiling;
+  if (!profile_mount.getValue().empty() || !scp_host.getValue().empty()) {
+    Tui::ProfilePipelineConfig config;
+    config.admin.admin_base = admin_base.getValue();
+    config.retriever_kind =
+        (profile_retriever.getValue() == "scp" || !scp_host.getValue().empty())
+            ? Tui::ProfilePipelineConfig::RetrieverKind::kScp
+            : Tui::ProfilePipelineConfig::RetrieverKind::kVolumeMount;
+    config.mount_root = profile_mount.getValue();
+    config.scp_host = scp_host.getValue();
+    config.sut_profile_path = sut_profile_path.getValue();
+    config.staging_dir = profile_staging.getValue();
+    // The argv prefix splits on plain spaces ("go tool pprof").
+    config.pprof_tool_argv = absl::StrSplit(pprof_tool.getValue(), ' ', absl::SkipEmpty());
+    config.sut_binary_path = sut_binary.getValue();
+    config.window_seconds = profile_window_seconds.getValue();
+    const char* binary_layout = std::getenv("PPROF_BINARY_PATH");
+    config.pprof_binary_path = binary_layout != nullptr ? binary_layout : "";
+    profiling = std::move(config);
+  }
+
+  return Tui::runInteractive(address.getValue(), session_prefix.getValue(), profiling);
 }
 
 } // namespace Client

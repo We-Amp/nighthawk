@@ -145,6 +145,37 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): profile-window session recording tests (M1 task 6).
+# Plain cc_test, same quarantine reasoning as tui_view_model_test.
+cc_test(
+    name = "tui_profile_session_test",
+    srcs = ["tui_profile_session_test.cc"],
+    deps = [
+        "//source/client/tui:tui_lib",
+        "@com_google_absl//absl/strings",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
+# FORK-ONLY (We-Amp): headless flamegraph-pipeline integration tests (M1 task
+# 6) — the full fetch -> fold -> align -> store -> session pipeline the TUI
+# drives, over an in-proc Nighthawk service and a stub SUT admin. An
+# envoy_cc_test (like tui_session_pipeline_test) because it needs ServiceImpl
+# and the grpc server stack; the pipeline code under test stays inside the
+# quarantine.
+envoy_cc_test(
+    name = "tui_flamegraph_pipeline_test",
+    srcs = ["tui_flamegraph_pipeline_test.cc"],
+    deps = [
+        "//source/client:nighthawk_service_lib",
+        "//source/client/tui:tui_lib",
+    ],
+)
+
 # FORK-ONLY (We-Amp): chart renderer tests. Plain cc_test, same quarantine
 # reasoning as tui_view_model_test.
 cc_test(

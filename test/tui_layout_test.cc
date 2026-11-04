@@ -12,9 +12,11 @@
 
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/layout.h"
+#include "source/client/tui/profile_windows.h"
 #include "source/client/tui/run_view_model.h"
 #include "source/client/tui/start_run_dialog.h"
 #include "source/client/tui/status_bar.h"
+#include "source/client/tui/tui_app.h"
 
 namespace Nighthawk {
 namespace Client {
@@ -177,17 +179,19 @@ TEST(LayoutTest, StatusBarOccupiesThreeRowsAtMinSize) {
   EXPECT_NE(lines[1].find("pre-phase-engine placeholder"), std::string::npos);
   EXPECT_NE(lines[2].find(kSessionPath), std::string::npos);
   // Row 3 is the tab strip; the charts pane starts at row 4 with the
-  // percentile band's legend row.
-  EXPECT_NE(lines[3].find("| charts | flame (m1) | knobs |"), std::string::npos);
+  // percentile band's legend row. M1: all three panes exist, so the strip
+  // names them plainly.
+  EXPECT_NE(lines[3].find("| charts | flame | knobs |"), std::string::npos);
   EXPECT_NE(lines[4].find("p50"), std::string::npos);
 }
 
-// The tab strip (backlog item 11): every frame names the panes, the active
-// tab renders inverted, and the not-yet-built pane is dimmed with its reason.
+// The tab strip (backlog item 11): every frame names the panes and the
+// active tab renders inverted. As of M1 all three panes exist, so nothing
+// renders dimmed anymore.
 TEST(TabStripTest, StripNamesPanesAndMarksTheActiveTab) {
-  // Charts active (the default tab): "charts" inverted, flame dimmed.
+  // Charts active (the default tab): "charts" inverted.
   Frame charts = frameAt(InputMode::kNavigate, runningModel(), filledDialog());
-  EXPECT_NE(charts.lines[3].find("| charts | flame (m1) | knobs |"), std::string::npos)
+  EXPECT_NE(charts.lines[3].find("| charts | flame | knobs |"), std::string::npos)
       << "row3=[" << charts.lines[3] << "]";
   bool inverted_charts = false;
   bool inverted_knobs = false;
@@ -221,21 +225,67 @@ TEST(TabStripTest, StripNamesPanesAndMarksTheActiveTab) {
   EXPECT_FALSE(inverted_charts);
   EXPECT_TRUE(inverted_knobs);
 
-  // The reason rides in the text (survives a monochrome paste), and the
-  // unimplemented pane never renders inverted.
-  EXPECT_NE(knobs.lines[3].find("flame (m1)"), std::string::npos);
+  // M1: the flame cell is a live pane — named plainly, never dimmed.
+  EXPECT_NE(knobs.lines[3].find("flame"), std::string::npos);
+  EXPECT_EQ(knobs.lines[3].find("flame (m1)"), std::string::npos);
 }
 
-// Tab 1 is the flamegraph pane: M1's pane, visibly refused for now (dimmed
-// strip cell and a body naming the milestone), and never a blank screen.
-TEST(LayoutTest, FlameTabRendersAVisiblyRefusedPlaceholder) {
+// Tab 1 is the flamegraph pane (M1): without a pulled window it renders the
+// honest empty state (never a blank screen); with a window the pane renders
+// the provenance header and the flamegraph itself.
+TEST(LayoutTest, FlameTabRendersEmptyStateThenThePane) {
+  // Empty state: no flame state at all.
   ftxui::Element element = RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate,
                                         runningModel(), filledDialog(), kSessionPath);
   std::string text;
   for (const std::string& line : screenLines(element, 100, 30)) {
     text += line + "\n";
   }
-  EXPECT_NE(text.find("flame (m1): pane lands in M1"), std::string::npos);
+  EXPECT_NE(text.find("flame: no profile window yet"), std::string::npos);
+  EXPECT_NE(text.find("press p during a run"), std::string::npos);
+
+  // A window: BuildFlamePane composes the same state the shell does, and the
+  // pane renders the provenance header plus the folded tree.
+  FoldedTree tree;
+  tree.total_samples = 2;
+  tree.total_value = 30000000;
+  tree.value_unit = "cpu-nanoseconds";
+  tree.symbolized = true;
+  FoldedFrame root;
+  root.function = "envoy.worker.main";
+  root.total_samples = 2;
+  root.total_value = 30000000;
+  root.symbolized = true;
+  tree.root.push_back(root);
+
+  ProfileWindow window;
+  window.tree = tree;
+  window.start_unix_ns = 1;
+  window.end_unix_ns = 2;
+  window.purity_fraction = 1.0;
+  window.phase_id = "main";
+  window.worker_count = 1;
+  window.work_units = 42;
+  window.profile_type = "cpu";
+  window.symbolized = true;
+  std::vector<ProfileWindow> windows{window};
+  ProfileWindowStore store;
+  store.store(std::move(windows));
+
+  FlamegraphViewState view;
+  FlamePaneState flame = BuildFlamePane(store.load(), view, /*note=*/"", /*overlay=*/nullptr);
+  ftxui::Element pane_element =
+      RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate, runningModel(),
+                   filledDialog(), kSessionPath,
+                   nighthawk::client::CommandLineOptions{}, /*overlay=*/nullptr, &flame);
+  std::string pane_text;
+  for (const std::string& line : screenLines(pane_element, 100, 30)) {
+    pane_text += line + "\n";
+  }
+  EXPECT_NE(pane_text.find("window #1: cpu"), std::string::npos) << pane_text;
+  EXPECT_NE(pane_text.find("purity 1.00"), std::string::npos);
+  EXPECT_NE(pane_text.find("work units 42"), std::string::npos);
+  EXPECT_NE(pane_text.find("envoy.worker.main"), std::string::npos) << pane_text;
 }
 
 // Pre-A1 placeholder semantics: phase and epoch ids carry placeholder markers
@@ -306,20 +356,20 @@ TEST(KeyBarTest, NavigateIdleBarNamesTheNavigationKeys) {
   EXPECT_EQ(frame.lines[29].find("s stop"), std::string::npos);
   EXPECT_EQ(frame.lines[29].find("(stops run)"), std::string::npos);
   // frameAt renders with a session path present (a session open until q):
-  // the n hint is annotated as unavailable there, since pressing it would
-  // silently refuse (M0b final-review finding).
-  EXPECT_NE(frame.lines[29].find("n new run (unavailable: session open)"), std::string::npos);
+  // the n hint is annotated there, since pressing it would silently refuse
+  // (M0b final-review finding; compressed to the 100-column minimum in M1).
+  EXPECT_NE(frame.lines[29].find("n new run (session open)"), std::string::npos);
 }
 
 // With no session open the n hint is a plain affordance again: no stale
-// "unavailable" annotation.
+// annotation.
 TEST(KeyBarTest, NavigateBarWithClosedSessionNamesNAvailable) {
   ftxui::Element element =
       RenderLayout(100, 30, /*active_tab=*/0, InputMode::kNavigate, RunViewModel{},
                    filledDialog(), /*session_path=*/"");
   Frame frame = renderFrame(element, 100, 30);
   EXPECT_NE(frame.lines[29].find("n new run |"), std::string::npos);
-  EXPECT_EQ(frame.lines[29].find("unavailable"), std::string::npos);
+  EXPECT_EQ(frame.lines[29].find("(session open)"), std::string::npos);
 }
 
 TEST(KeyBarTest, RunningBarNamesStopAndTheQuitStopsWarning) {
@@ -327,6 +377,29 @@ TEST(KeyBarTest, RunningBarNamesStopAndTheQuitStopsWarning) {
   ASSERT_EQ(frame.lines.size(), 30u);
   EXPECT_NE(frame.lines[29].find("s stop"), std::string::npos);
   EXPECT_NE(frame.lines[29].find("q quit (stops run)"), std::string::npos);
+}
+
+// M1: the navigate bars name the flame tab, and on the flame tab the key bar
+// names the pane's own keys (the key map table's flame rows).
+TEST(KeyBarTest, FlameKeysAreNamed) {
+  Frame charts = frameAt(InputMode::kNavigate, runningModel(), filledDialog());
+  EXPECT_NE(charts.lines[29].find("f flame"), std::string::npos);
+
+  ftxui::Element element =
+      RenderLayout(100, 30, /*active_tab=*/1, InputMode::kNavigate, runningModel(),
+                   filledDialog(), kSessionPath);
+  Frame frame = renderFrame(element, 100, 30);
+  ASSERT_EQ(frame.lines.size(), 30u);
+  EXPECT_NE(frame.lines[29].find("Arrows nav"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("Enter zoom"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("Esc root"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("/ find"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("p win"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("d diff"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("N noise"), std::string::npos);
+  EXPECT_NE(frame.lines[29].find("s stop"), std::string::npos);
+  // The compressed flame bar stays under the width: nothing clips.
+  EXPECT_LE(frame.lines[29].size(), 100u);
 }
 
 TEST(KeyBarTest, EditingBarNamesTheDialogKeys) {
@@ -350,24 +423,44 @@ TEST(InputModeTest, SearchInputModeSuspendsRefresh) {
   EXPECT_TRUE(RefreshSuspended(InputMode::kEditingSearch));
 }
 
-// The `?` help overlay lists every key and every status-bar field with a
-// one-line definition.
+// The `?` help overlay lists every key (the M1 keys are grouped so the
+// overlay still fits above the key bar) and every status-bar field with a
+// definition. Coverage of the key map table is asserted per binding below.
 TEST(HelpOverlayTest, HelpListsKeysAndStatusBarFields) {
   OverlayState overlay;
   overlay.help_open = true;
   Frame frame = frameAt(InputMode::kNavigate, runningModel(), filledDialog(), &overlay);
   EXPECT_TRUE(frame.contains("help"));
-  EXPECT_TRUE(frame.contains("n          open the start-run dialog"));
-  EXPECT_TRUE(frame.contains("q          quit; a running run is stopped first"));
-  EXPECT_TRUE(frame.contains("tab        move to the next field"));
-  EXPECT_TRUE(frame.contains("enter      apply"));
-  EXPECT_TRUE(frame.contains("esc        cancel"));
-  EXPECT_TRUE(frame.contains("state      idle | running | completed | stopped"));
-  EXPECT_TRUE(frame.contains("flush 1s   chart cadence: one column per flush"));
-  EXPECT_TRUE(frame.contains("4xx/rst/t/o  per-flush client-side failure rates"));
-  EXPECT_TRUE(frame.contains("session    session recording path"));
+  EXPECT_TRUE(frame.contains("open the start-run dialog"));
+  EXPECT_TRUE(frame.contains("noise-floor view"));
+  EXPECT_TRUE(frame.contains("flame frame navigation"));
+  EXPECT_TRUE(frame.contains("zoom to the selected frame"));
+  EXPECT_TRUE(frame.contains("unzoom to the tree root"));
+  EXPECT_TRUE(frame.contains("search"));
+  EXPECT_TRUE(frame.contains("start/stop a profile window"));
+  EXPECT_TRUE(frame.contains("differential"));
+  EXPECT_TRUE(frame.contains("tab next field"));
+  EXPECT_TRUE(frame.contains("idle|running|completed|stopped"));
+  EXPECT_TRUE(frame.contains("chart cadence: one column per flush"));
+  EXPECT_TRUE(frame.contains("per-flush client-side failure rates"));
+  EXPECT_TRUE(frame.contains("session recording path"));
+  EXPECT_TRUE(frame.contains("idle | window open | folding"));
+  EXPECT_TRUE(frame.contains("reset-or-label-set"));
+
+  // Coverage: every documented binding's key token appears somewhere in the
+  // help text — the grouped overlay cannot silently drop a binding from the
+  // NavigateKeyBindings table.
+  std::string text;
+  for (const std::string& line : frame.lines) {
+    text += line + "\n";
+  }
+  for (const KeyBinding& binding : NavigateKeyBindings()) {
+    EXPECT_NE(text.find(binding.key), std::string::npos)
+        << "help overlay lost key: " << binding.key;
+  }
+
   // The help overlay never breaks the layout contract: status bar and key
-  // bar stay on their rows.
+  // bar stay on their rows (the grouped overlay fits above row 29).
   EXPECT_NE(frame.lines[0].find("running"), std::string::npos);
   EXPECT_NE(frame.lines[29].find("? help"), std::string::npos);
 }

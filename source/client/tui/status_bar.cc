@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/strings/str_cat.h"
 #include "ftxui/dom/elements.hpp"
@@ -40,7 +42,7 @@ std::string modeName(InputMode mode) {
 
 ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
                                absl::string_view session_path, absl::string_view uri,
-                               int duration_seconds) {
+                               int duration_seconds, absl::string_view profiler_state) {
   const std::string state =
       model.run_state.empty() ? "idle" : model.run_state;
   const bool left_idle = state != "idle";
@@ -99,19 +101,33 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
       " [pre-phase-engine placeholder] | epoch: ", epoch.empty() ? "(none)" : epoch,
       epoch.empty() ? "" : " [placeholder]", " | flush ", kStatusBarFlushIntervalSeconds, "s");
 
-  // Row 2: session path + input mode. The mode cell renders inverse-video
-  // while an input mode owns the keyboard.
+  // Row 2: session path + input mode + the M1 SUT-stats and profiler cells.
+  // The mode cell renders inverse-video while an input mode owns the
+  // keyboard. The scrape cells render only when their condition holds: the
+  // reset marker uses task 7's folded wording ("reset or label-set change" —
+  // the per-name summed scrape deltas make the two indistinguishable), and
+  // the histogram-drop count appears once scrapes actually dropped lines.
   const std::string row2_prefix =
       absl::StrCat("session: ", session_path.empty() ? "(none)" : session_path, " | mode: ");
   ftxui::Element mode_cell = ftxui::text(modeName(mode));
-  if (mode == InputMode::kEditingStartRun) {
+  if (mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch) {
     mode_cell = mode_cell | ftxui::inverted;
   }
+  std::vector<ftxui::Element> row2 = {ftxui::text(row2_prefix), mode_cell};
+  if (model.sut_counter_reset_detected) {
+    row2.push_back(ftxui::text(" | sut: reset or label-set change"));
+  }
+  if (model.sut_histogram_line_drops > 0) {
+    row2.push_back(ftxui::text(absl::StrCat(" | sut hist drops ",
+                                            model.sut_histogram_line_drops)));
+  }
+  row2.push_back(ftxui::text(
+      absl::StrCat(" | profiler: ", profiler_state.empty() ? "idle" : profiler_state)));
 
   return ftxui::vbox({
       ftxui::text(row0),
       ftxui::text(row1),
-      ftxui::hbox({ftxui::text(row2_prefix), mode_cell}),
+      ftxui::hbox(std::move(row2)),
   });
 }
 

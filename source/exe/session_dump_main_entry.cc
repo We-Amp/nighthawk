@@ -1,7 +1,10 @@
 // FORK-ONLY (We-Amp): entry point for the nighthawk_session_dump binary, the
 // headless reader for .nhsession files. Prints one JSON line per record; the
-// record's oneof discloses its type naturally ("header", "metricSeries" or
-// "runEnd").
+// record's oneof discloses its type naturally ("header", "metricSeries",
+// "runEnd" or — since M1 — "profileWindow"). Forward-compat asymmetry (M1):
+// this reader reads pre-M1 files fine; a PRE-M1 reader/dump hitting a file
+// that carries profile_window records FAILS at the parked RECORD_NOT_SET
+// rejection — unknown cases are never silently skipped.
 #include <iostream>
 
 #include "google/protobuf/util/json_util.h"

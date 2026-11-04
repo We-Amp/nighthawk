@@ -105,7 +105,11 @@ Everything else in the TUI's dependency graph is out:
   `go tool pprof -proto -output <out> <binary> <raw>` with
   `PPROF_BINARY_PATH` in the child env (the Task 1 machine route). No pprof
   parsing or DWARF reading happens in-process, and no in-repo quarantine
-  surface changes because of it.
+  surface changes because of it. Confirmed at the M1 wiring (task 6): the
+  `--pprof-tool` flag plumbs the argv prefix into the symbolizer constructor,
+  the fetch→fold→render pipeline (`tui_app.cc`) invokes it only from pool
+  jobs, and no new linked dependency entered through that path (the cquery
+  intersection check below still runs empty over every TUI target).
 
 Notably NOT allowed: `//source/common` (its `Utility::parseCommand` helper is
 re-implemented inline in `tui_app.cc` for exactly this reason), Envoy test
