@@ -19,6 +19,7 @@ package nighthawk.client;
 import "api/client/live.proto";
 import "api/client/output.proto";
 import "api/client/service.proto";
+import "google/protobuf/duration.proto";
 
 // First record of a session file: identifies the format and records the
 // options the run was started with.
@@ -119,6 +120,58 @@ message ProfileWindowRecord {
   int64 clock_offset_uncertainty_ns = 12;
 }
 
+// One phase boundary of a multi-phase run, persisted when the boundary's
+// engine event and the phase's metadata are in hand (M2 Task 7). FORK-ONLY.
+//
+// NORMATIVE READING RULE (the DQ-3 ruling, binding on every consumer):
+// boundary records are METADATA, never synthetic metric snapshots. The TUI
+// timeline and the profile-window alignment join on these records — the
+// discrete (wall_time_unix_ns, monotonic_ns) events the engine emitted at the
+// boundary — and on nothing else. The idle gap sits INSIDE the
+// drain-complete flag for purity accounting (a phase's purity clock starts at
+// drain-complete); the gap itself is rendered as a labeled gap and is never
+// subtracted from or added to any percentile series. No synthetic flushes at
+// boundaries.
+message PhaseBoundaryRecord {
+  // The phase that is ENDING at this boundary.
+  string phase_id = 1;
+  // The phase starting after the boundary (empty when the run ended: the
+  // final phase's record has no successor).
+  string next_phase_id = 2;
+  // The ending phase's zero-based position in the run's phase vector.
+  uint32 phase_index = 3;
+  // The engine-emitted (wall, monotonic) pair stamped at the boundary
+  // (spec 8.5) — the join key that replaces the M1 first-snapshot clock
+  // anchor in window alignment.
+  int64 wall_time_unix_ns = 4;
+  int64 monotonic_ns = 5;
+  // Duration of the non-destructive boundary drain (spec 8.6: recorded,
+  // never zero-silent). Zero for the run's final phase, which ends at the
+  // run teardown rather than at a boundary drain.
+  google.protobuf.Duration drain_duration = 6;
+  // Last drain completion -> next phase's first scheduled work (spec 8.6).
+  google.protobuf.Duration idle_gap = 7;
+  // Workers active in the ending phase (the 8.4 non-comparability key).
+  uint32 worker_count = 8;
+  // ATTRIBUTION (explicit): true iff the transition INTO next_phase_id
+  // cold-started workers — the successor's new_workers_cold_started (Task 6
+  // metadata), NOT the ending phase's own flag (that describes the ending
+  // phase's ENTRY boundary, the previous one). A record-joining consumer
+  // must be able to reproduce the timeline's cold mark from this field
+  // alone.
+  bool new_workers_cold_started = 9;
+  // 8.6 pool-health surfacing: the ending phase's aggregate connection
+  // totals (the per-worker sums of its PhaseMetadata.pool_health; per-worker
+  // detail lives there, the boundary record carries the aggregate the TUI
+  // prints).
+  uint64 connections_created = 10;
+  uint64 connections_active = 11;
+  // Claim-discipline counts for the ending phase (spec 8.2: counted, not
+  // hidden; the ratio is computed in the output, not the consumer).
+  double completion_ratio = 12;
+  uint64 gate_exceeded = 13;
+}
+
 // One frame of a session file.
 message SessionRecord {
   oneof record {
@@ -132,5 +185,10 @@ message SessionRecord {
     // asymmetry is forward-compat only: the NEW reader reads old files fine;
     // an old reader does NOT read a file carrying this record.
     ProfileWindowRecord profile_window = 4;
+    // M2's added case (see the format-evolution rule at the top of this
+    // file): one per phase boundary, carrying the engine event pair and the
+    // boundary's metadata aggregate. The M1-era reader rejection asymmetry
+    // applies unchanged — new reads old, old does NOT read new.
+    PhaseBoundaryRecord phase_boundary = 5;
   }
 }

@@ -133,6 +133,150 @@ TEST(KnobPaneTest, KnobPaneShowsUnsetDefaults) {
   EXPECT_NE(text.find("not configured"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// M2 Task 7: the staged next-phase preview. While a run is active, edits to
+// phase-gated knobs stage into a preview that is visually distinct, never
+// applied to the current phase, and discardable.
+// ---------------------------------------------------------------------------
+
+using nighthawk::client::PhaseSpec;
+
+PhaseSpec stagedSpec() {
+  PhaseSpec spec;
+  spec.set_name("spike");
+  spec.mutable_duration()->set_seconds(5);
+  spec.set_requests_per_second(400);
+  spec.mutable_concurrency()->set_value("4");
+  spec.mutable_connections()->set_value(64);
+  spec.mutable_max_pending_requests()->set_value(2048);
+  return spec;
+}
+
+// The staged state is visually distinct: every preview line carries the
+// STAGED tag (never LIVE (M3) or PHASE-GATED), a header names the staged
+// phase and states the preview is discardable, and the staged values —
+// including the connections value (PhaseSpec field 5) — all render.
+TEST(KnobPaneTest, StagedEditsVisuallyDistinctAndDiscardable) {
+  CommandLineOptions current = fullySetOptions();
+  PhaseSpec staged = stagedSpec();
+
+  std::vector<KnobDisplay> preview = NextPhasePreviewKnobs(staged, current);
+  ASSERT_EQ(preview.size(), 4u);
+  EXPECT_EQ(preview[0].name, "rps");
+  EXPECT_EQ(preview[1].name, "concurrency");
+  EXPECT_EQ(preview[2].name, "connections");
+  EXPECT_EQ(preview[3].name, "queue bounds");
+  for (const KnobDisplay& knob : preview) {
+    EXPECT_EQ(knob.steering, KnobSteering::kStaged) << "knob " << knob.name;
+  }
+  EXPECT_EQ(preview[0].value, "400");
+  EXPECT_EQ(preview[1].value, "4");
+  // Staged connections value (PhaseSpec field 5, major-1 consistency).
+  EXPECT_EQ(preview[2].value, "64");
+  // Staged pending bound; active not staged: inherits the run-level value
+  // (each half states its own provenance).
+  EXPECT_EQ(preview[3].value, "pending=2048 active=512 (inherit)");
+
+  ftxui::Element pane = RenderNextPhasePreview(staged, current, /*current_workers=*/2,
+                                               /*next_phase_index=*/1, /*width=*/100, /*height=*/20);
+  std::vector<std::string> lines = screenLines(pane, 100, 20);
+  std::string text;
+  for (const std::string& line : lines) {
+    text += line + "\n";
+  }
+  EXPECT_NE(text.find("[staged: spike"), std::string::npos) << text;
+  EXPECT_NE(text.find("discard"), std::string::npos) << text;
+  EXPECT_NE(text.find("STAGED"), std::string::npos) << text;
+  EXPECT_NE(text.find("400"), std::string::npos) << text;
+  EXPECT_NE(text.find("64"), std::string::npos) << text;
+  // Cold-start surfacing: 4 staged workers over 2 active -> the two new
+  // workers start cold (Task 6 metadata wording).
+  EXPECT_NE(text.find("starts 2 new worker(s) (cold)"), std::string::npos) << text;
+}
+
+// Discarding the staged edits (empty staged spec) renders nothing: the
+// preview is empty and the current-phase display is untouched.
+TEST(KnobPaneTest, DiscardedStagingRendersNoPreview) {
+  CommandLineOptions current = fullySetOptions();
+  PhaseSpec discarded; // no name: nothing staged
+
+  EXPECT_TRUE(NextPhasePreviewKnobs(discarded, current).empty());
+  ftxui::Element pane = RenderNextPhasePreview(discarded, current, 2, 1, 100, 20);
+  std::string text;
+  for (const std::string& line : screenLines(pane, 100, 20)) {
+    text += line;
+  }
+  EXPECT_EQ(text.find("staged"), std::string::npos) << text;
+  EXPECT_EQ(text.find("STAGED"), std::string::npos) << text;
+}
+
+// Unstaged preview fields inherit: rps/concurrency/queue bounds fall back to
+// the run-level values, connections falls back to the run-level value before
+// reading unset.
+TEST(KnobPaneTest, UnstagedPreviewFieldsInheritRunValues) {
+  CommandLineOptions current = fullySetOptions();
+  PhaseSpec staged; // a spec with a name but no staged values
+  staged.set_name("coast");
+
+  std::vector<KnobDisplay> preview = NextPhasePreviewKnobs(staged, current);
+  ASSERT_EQ(preview.size(), 4u);
+  EXPECT_EQ(preview[0].value, "100 (inherit)");
+  EXPECT_EQ(preview[1].value, "2 (inherit)");
+  EXPECT_EQ(preview[2].value, "50 (inherit)");
+  EXPECT_EQ(preview[3].value, "pending=1024 (inherit) active=512 (inherit)");
+}
+
+// The worker-set annotation between the current phase and the staged one:
+// growth cold-starts the delta, shrink folds it, equality says nothing.
+TEST(KnobPaneTest, WorkerSetAnnotationCoversColdStartFoldAndFlat) {
+  EXPECT_EQ(WorkerSetAnnotation(/*current_workers=*/4, /*staged_workers=*/4,
+                                /*next_phase_index=*/2),
+            "");
+  EXPECT_EQ(WorkerSetAnnotation(2, 5, 2), "starts 3 new worker(s) (cold)");
+  EXPECT_EQ(WorkerSetAnnotation(4, 2, 2), "2 workers folded into phase 2");
+}
+
+// A non-numeric staged concurrency ("auto") renders the preview without a
+// worker-set annotation: the worker delta is a count comparison, and a
+// non-numeric value carries no count.
+TEST(KnobPaneTest, NonNumericStagedConcurrencyDoesNotAnnotate) {
+  CommandLineOptions current = fullySetOptions();
+  PhaseSpec staged = stagedSpec();
+  staged.mutable_concurrency()->set_value("auto");
+
+  ftxui::Element pane = RenderNextPhasePreview(staged, current, /*current_workers=*/2,
+                                               /*next_phase_index=*/1, /*width=*/100,
+                                               /*height=*/20);
+  std::string text;
+  for (const std::string& line : screenLines(pane, 100, 20)) {
+    text += line + "\n";
+  }
+  EXPECT_NE(text.find("[staged: spike"), std::string::npos) << text;
+  EXPECT_EQ(text.find("new worker(s)"), std::string::npos) << text;
+  EXPECT_EQ(text.find("workers folded"), std::string::npos) << text;
+}
+
+// The staged edits never leak into the current phase's knob display: the
+// current pane is built only from the run options and never carries the
+// staged tag or the staged values.
+TEST(KnobPaneTest, StagedEditsNeverLeakIntoCurrentPane) {
+  CommandLineOptions current = fullySetOptions();
+  std::vector<KnobDisplay> knobs = KnobsFromOptions(current);
+  for (const KnobDisplay& knob : knobs) {
+    EXPECT_NE(knob.steering, KnobSteering::kStaged) << "knob " << knob.name;
+    EXPECT_NE(knob.value, "400") << "knob " << knob.name;
+    EXPECT_NE(knob.value, "64") << "knob " << knob.name;
+  }
+
+  ftxui::Element pane = RenderKnobPane(knobs, 100, 20);
+  std::string text;
+  for (const std::string& line : screenLines(pane, 100, 20)) {
+    text += line + "\n";
+  }
+  EXPECT_EQ(text.find("STAGED"), std::string::npos) << text;
+  EXPECT_EQ(text.find("staged"), std::string::npos) << text;
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "ftxui/dom/elements.hpp"
 
 namespace Nighthawk {
@@ -129,6 +130,146 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
       ftxui::text(row1),
       ftxui::hbox(std::move(row2)),
   });
+}
+
+namespace {
+
+// The per-worker pool sums of one phase's metadata (the 8.6 aggregate).
+std::pair<uint64_t, uint64_t> poolSums(const nighthawk::client::PhaseMetadata& phase) {
+  uint64_t created = 0;
+  uint64_t active = 0;
+  for (const nighthawk::client::WorkerPoolHealth& health : phase.pool_health()) {
+    created += health.connections_created();
+    active += health.connections_active();
+  }
+  return {created, active};
+}
+
+} // namespace
+
+std::vector<PhaseTimelineSegment> PhaseTimelineSegments(
+    const std::vector<nighthawk::client::PhaseSpec>& specs,
+    const std::vector<nighthawk::client::PhaseMetadata>& metadata,
+    absl::string_view current_phase_id) {
+  std::vector<PhaseTimelineSegment> segments;
+  segments.reserve(metadata.size());
+  for (const nighthawk::client::PhaseMetadata& phase : metadata) {
+    PhaseTimelineSegment segment;
+    segment.phase_id = phase.phase_id();
+    segment.is_current = phase.phase_id() == current_phase_id;
+    // Durations live on the specs, matched by the phase's position.
+    if (phase.phase_index() < specs.size()) {
+      segment.duration_seconds = specs[phase.phase_index()].duration().seconds();
+    }
+
+    // The claim-discipline pair always renders from the metadata (spec 8.2:
+    // counted, not hidden).
+    segment.has_completion = true;
+    segment.completion_ratio = phase.completion_ratio();
+    segment.has_gate = true;
+    segment.gate_exceeded = phase.gate_exceeded();
+
+    // Pool aggregates are the per-worker sums of this phase's entries.
+    const bool has_pool = phase.pool_health_size() > 0;
+    const auto [created, active] = poolSums(phase);
+
+    // The boundary fields of segment N describe the transition INTO phase
+    // N+1 — the boundary that ended this phase: its drain/idle timings come
+    // from this phase's metadata; the worker-set change and cold start are
+    // recorded on the successor's metadata (they happened at this boundary);
+    // the pool delta is the transition delta into the successor.
+    if (phase.phase_index() + 1 < metadata.size()) {
+      const nighthawk::client::PhaseMetadata& successor = metadata[phase.phase_index() + 1];
+      segment.drain_seconds =
+          phase.drain_duration().seconds() + phase.drain_duration().nanos() / 1e9;
+      segment.idle_gap_seconds =
+          phase.has_idle_gap() ? phase.idle_gap().seconds() + phase.idle_gap().nanos() / 1e9 : 0.0;
+      segment.worker_count_changed = successor.workers_changed_vs_prior_phase();
+      segment.new_workers_cold_started = successor.new_workers_cold_started();
+      if (has_pool && successor.pool_health_size() > 0) {
+        const auto [successor_created, successor_active] = poolSums(successor);
+        segment.has_pool = true;
+        segment.pool_created_delta =
+            static_cast<int64_t>(successor_created) - static_cast<int64_t>(created);
+        segment.pool_active = successor_active;
+      }
+    }
+    segments.push_back(std::move(segment));
+  }
+  return segments;
+}
+
+std::string PhaseTimelineStrip(const std::vector<PhaseTimelineSegment>& segments) {
+  if (segments.empty()) {
+    return "";
+  }
+  std::string strip = "[";
+  for (size_t i = 0; i < segments.size(); ++i) {
+    const PhaseTimelineSegment& segment = segments[i];
+    if (i > 0) {
+      absl::StrAppend(&strip, " | ");
+    }
+    // The phase span; the current phase is wrapped in "*".
+    const std::string duration = absl::StrCat(static_cast<uint64_t>(segment.duration_seconds), "s");
+    if (segment.is_current) {
+      absl::StrAppend(&strip, "*", segment.phase_id, " ", duration, "*");
+    } else {
+      absl::StrAppend(&strip, segment.phase_id, " ", duration);
+    }
+    // Claim-discipline pair next to the current phase (spec 8.2).
+    if (segment.is_current) {
+      if (segment.has_completion) {
+        absl::StrAppend(&strip, absl::StrFormat(" ratio=%.2f", segment.completion_ratio));
+      }
+      if (segment.has_gate) {
+        absl::StrAppend(&strip, " gate=", segment.gate_exceeded);
+      }
+    }
+    // The boundary that ended this phase (never on the final phase), as a
+    // visible gap segment.
+    if (i + 1 < segments.size()) {
+      absl::StrAppend(&strip, " |");
+      if (segment.drain_seconds > 0) {
+        absl::StrAppend(&strip, absl::StrFormat(" drain %.1fs", segment.drain_seconds));
+      }
+      if (segment.idle_gap_seconds > 0) {
+        absl::StrAppend(&strip, absl::StrFormat(" gap %.1fs", segment.idle_gap_seconds));
+      }
+      if (segment.has_pool) {
+        // The plan's pool-health vocabulary, with an explicit sign so a
+        // shrinking worker set reads as a negative delta.
+        const int64_t delta = segment.pool_created_delta;
+        absl::StrAppend(&strip, " pool: created=", delta < 0 ? "-" : "+",
+                        static_cast<uint64_t>(delta < 0 ? -delta : delta),
+                        " active=", segment.pool_active);
+      }
+      if (segment.worker_count_changed) {
+        // 8.4: windows across this boundary are marked non-comparable.
+        absl::StrAppend(&strip, " cmp!");
+      }
+      if (segment.new_workers_cold_started) {
+        absl::StrAppend(&strip, " cold");
+      }
+    }
+  }
+  absl::StrAppend(&strip, "]");
+  return strip;
+}
+
+ftxui::Element RenderPhaseTimeline(const std::vector<PhaseTimelineSegment>& segments, int width) {
+  if (width <= 0) {
+    return ftxui::emptyElement();
+  }
+  std::string strip = PhaseTimelineStrip(segments);
+  if (strip.empty()) {
+    return ftxui::emptyElement();
+  }
+  // The persistent bar's truncation contract: the strip clips to the pane
+  // width rather than wrapping or overflowing.
+  if (strip.size() > static_cast<size_t>(width)) {
+    strip.resize(static_cast<size_t>(width));
+  }
+  return ftxui::vbox({ftxui::text(strip)});
 }
 
 } // namespace Tui

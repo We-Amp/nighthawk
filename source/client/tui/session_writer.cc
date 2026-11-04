@@ -186,6 +186,10 @@ absl::Status SessionWriter::writeRecordLocked(const nighthawk::client::SessionRe
     case nighthawk::client::SessionRecord::kProfileWindow:
       type = "profile_window";
       break;
+    case nighthawk::client::SessionRecord::kPhaseBoundary:
+      type = "phase_boundary";
+      monotonic_ns = record.phase_boundary().monotonic_ns();
+      break;
     case nighthawk::client::SessionRecord::RECORD_NOT_SET:
       return absl::InternalError("refusing to write an unset session record");
   }

@@ -246,6 +246,25 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): M2 phase timeline + PhaseBoundaryRecord tests (Task 7
+# phase 1: the pure render/conversion halves). Plain cc_test, same quarantine
+# reasoning as tui_view_model_test.
+cc_test(
+    name = "tui_phase_timeline_test",
+    srcs = ["tui_phase_timeline_test.cc"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 # FORK-ONLY (We-Amp): profile-fetch layer tests (admin window control +
 # out-of-band retrieval + stats scrape). Plain cc_test, same quarantine
 # reasoning as tui_view_model_test; the SUT admin is stood in for by a tiny

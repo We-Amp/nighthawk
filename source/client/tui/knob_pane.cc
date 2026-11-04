@@ -1,10 +1,13 @@
 #include "source/client/tui/knob_pane.h"
 
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/numbers.h"
 
 namespace Nighthawk {
 namespace Client {
@@ -15,13 +18,23 @@ constexpr const char* kUnsetValue = "unset";
 constexpr const char* kRampUnconfigured = "not configured";
 constexpr const char* kLiveTag = "LIVE (M3)";
 constexpr const char* kPhaseGatedTag = "PHASE-GATED";
+constexpr const char* kStagedTag = "STAGED";
+constexpr const char* kInheritSuffix = " (inherit)";
 // Column the value starts at (the name field's fixed width); the steering tag
 // trails the value after a second fixed-width column.
 constexpr int kNameColumn = 14;
 constexpr int kValueColumn = 44;
 
 const char* steeringTag(KnobSteering steering) {
-  return steering == KnobSteering::kLiveM3 ? kLiveTag : kPhaseGatedTag;
+  switch (steering) {
+  case KnobSteering::kLiveM3:
+    return kLiveTag;
+  case KnobSteering::kPhaseGated:
+    return kPhaseGatedTag;
+  case KnobSteering::kStaged:
+    return kStagedTag;
+  }
+  return kPhaseGatedTag;
 }
 
 // Fixed-width columns keep the knob lines tabular; the steering tag lands at a
@@ -30,6 +43,21 @@ const char* steeringTag(KnobSteering steering) {
 std::string knobLine(const KnobDisplay& knob) {
   return absl::StrFormat("%-*s%-*s%s", kNameColumn, knob.name, kValueColumn, knob.value,
                          steeringTag(knob.steering));
+}
+
+// The staged worker count from a concurrency string, for the worker-set
+// annotation. Concurrency may be non-numeric ("auto") — no count, no
+// annotation (nullopt).
+std::optional<uint32_t> stagedWorkerCount(const nighthawk::client::PhaseSpec& staged) {
+  if (!staged.has_concurrency() || staged.concurrency().value().empty()) {
+    return std::nullopt;
+  }
+  const std::string& value = staged.concurrency().value();
+  int parsed = 0;
+  if (!absl::SimpleAtoi(value, &parsed) || parsed <= 0) {
+    return std::nullopt;
+  }
+  return static_cast<uint32_t>(parsed);
 }
 
 } // namespace
@@ -96,6 +124,116 @@ ftxui::Element RenderKnobPane(const std::vector<KnobDisplay>& knobs, int width, 
   rows.push_back(ftxui::text("knobs (display-only; steering lands in M3)"));
   for (const KnobDisplay& knob : knobs) {
     rows.push_back(ftxui::text(knobLine(knob)));
+  }
+  return ftxui::vbox(std::move(rows));
+}
+
+std::vector<KnobDisplay> NextPhasePreviewKnobs(
+    const nighthawk::client::PhaseSpec& staged,
+    const nighthawk::client::CommandLineOptions& run_options) {
+  std::vector<KnobDisplay> preview;
+  if (staged.name().empty()) {
+    // Nothing staged (the discarded state): no preview lines at all.
+    return preview;
+  }
+
+  // rps stages preview-only until M3's ack path exists (M2 stages the whole
+  // next-phase config; the timeline marks nothing until the engine confirms
+  // the boundary).
+  preview.push_back({/*name=*/"rps",
+                     staged.requests_per_second() > 0
+                         ? absl::StrCat(staged.requests_per_second())
+                         : absl::StrCat(
+                               run_options.has_requests_per_second()
+                                   ? run_options.requests_per_second().value()
+                                   : 0,
+                               kInheritSuffix),
+                     KnobSteering::kStaged});
+
+  preview.push_back({/*name=*/"concurrency",
+                     staged.has_concurrency() && !staged.concurrency().value().empty()
+                         ? staged.concurrency().value()
+                         : absl::StrCat(
+                               run_options.has_concurrency() &&
+                                       !run_options.concurrency().value().empty()
+                                   ? run_options.concurrency().value()
+                                   : std::string(kUnsetValue),
+                               kInheritSuffix),
+                     KnobSteering::kStaged});
+
+  // Staged connections value (PhaseSpec field 5, major-1 consistency);
+  // unstaged it inherits the run-level value (options.proto's rule).
+  preview.push_back(
+      {/*name=*/"connections",
+       staged.has_connections()
+           ? absl::StrCat(staged.connections().value())
+           : absl::StrCat(run_options.has_connections()
+                              ? absl::StrCat(run_options.connections().value())
+                              : std::string(kUnsetValue),
+                          kInheritSuffix),
+       KnobSteering::kStaged});
+
+  // Queue bounds fold the two limiter knobs into one line; an unstaged half
+  // inherits the run-level value.
+  const std::string staged_pending = staged.has_max_pending_requests()
+                                         ? absl::StrCat(staged.max_pending_requests().value())
+                                         : absl::StrCat(
+                                               run_options.has_max_pending_requests()
+                                                   ? absl::StrCat(
+                                                         run_options.max_pending_requests()
+                                                             .value())
+                                                   : std::string(kUnsetValue),
+                                               kInheritSuffix);
+  const std::string staged_active = staged.has_max_active_requests()
+                                        ? absl::StrCat(staged.max_active_requests().value())
+                                        : absl::StrCat(
+                                              run_options.has_max_active_requests()
+                                                  ? absl::StrCat(run_options.max_active_requests()
+                                                                     .value())
+                                                  : std::string(kUnsetValue),
+                                              kInheritSuffix);
+  preview.push_back({/*name=*/"queue bounds",
+                     absl::StrCat("pending=", staged_pending, " active=", staged_active),
+                     KnobSteering::kStaged});
+
+  return preview;
+}
+
+std::string WorkerSetAnnotation(uint32_t current_workers, uint32_t staged_workers,
+                                uint32_t next_phase_index) {
+  if (staged_workers > current_workers) {
+    return absl::StrCat("starts ", staged_workers - current_workers, " new worker(s) (cold)");
+  }
+  if (staged_workers < current_workers) {
+    return absl::StrCat(current_workers - staged_workers, " workers folded into phase ",
+                        next_phase_index);
+  }
+  return "";
+}
+
+ftxui::Element RenderNextPhasePreview(const nighthawk::client::PhaseSpec& staged,
+                                      const nighthawk::client::CommandLineOptions& run_options,
+                                      uint32_t current_workers, uint32_t next_phase_index,
+                                      int width, int height) {
+  if (staged.name().empty() || width <= 0 || height <= 0) {
+    return ftxui::emptyElement();
+  }
+  std::vector<ftxui::Element> rows;
+  // The header names the staged phase and states the preview's contract:
+  // next phase only, discardable, nothing marked until the engine confirms.
+  rows.push_back(ftxui::text(absl::StrCat(
+      "[staged: ", staged.name(),
+      " -- applies at the next phase only; discardable]")));
+  for (const KnobDisplay& knob : NextPhasePreviewKnobs(staged, run_options)) {
+    rows.push_back(ftxui::text(knobLine(knob)));
+  }
+  const std::optional<uint32_t> staged_workers = stagedWorkerCount(staged);
+  if (staged_workers.has_value()) {
+    const std::string workers =
+        WorkerSetAnnotation(current_workers, *staged_workers, next_phase_index);
+    if (!workers.empty()) {
+      rows.push_back(ftxui::text(workers));
+    }
   }
   return ftxui::vbox(std::move(rows));
 }
