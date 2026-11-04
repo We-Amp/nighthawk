@@ -57,11 +57,12 @@ absl::Status validatePhaseVector(const nighthawk::client::CommandLineOptions& op
         "per-phase concurrency on the PhaseSpec entries instead");
   }
 
-  if (phase_count == 1) {
-    // A single phase is legacy-equivalent (a one-element vector, legacy-shaped
-    // output); no per-phase whitelist validation applies.
-    return absl::OkStatus();
-  }
+  // A single phase is legacy-equivalent run-wise (a one-element vector,
+  // legacy-shaped output), but its declared fields are validated like any
+  // other phase: a malformed one-element vector must fail fast, not silently
+  // run with a zero duration or zero rps. The >=2-only checks (concurrency
+  // within the max over phases, name uniqueness) degrade to trivially true
+  // for a single entry, so the loop below can run unconditionally.
 
   // Per-phase concurrency declarations must be concrete positive integers and
   // may not exceed the maximum declared over all phases (that maximum is the
