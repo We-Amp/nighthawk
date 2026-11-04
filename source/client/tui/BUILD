@@ -15,9 +15,11 @@ envoy_package()
 envoy_cc_library(
     name = "tui_lib",
     srcs = [
+        "admin_client.cc",
         "charts.cc",
         "knob_pane.cc",
         "layout.cc",
+        "profile_fetcher.cc",
         "run_feed.cc",
         "run_view_model.cc",
         "session_conversion.cc",
@@ -28,10 +30,12 @@ envoy_cc_library(
         "tui_app.cc",
     ],
     hdrs = [
+        "admin_client.h",
         "charts.h",
         "input_mode.h",
         "knob_pane.h",
         "layout.h",
+        "profile_fetcher.h",
         "run_feed.h",
         "run_view_model.h",
         "session_conversion.h",
@@ -51,6 +55,7 @@ envoy_cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@ftxui//:component",
         "@ftxui//:dom",
         "@ftxui//:screen",
