@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 
 namespace Nighthawk {
@@ -66,6 +67,137 @@ uint64_t CounterValueAtOrBefore(const std::vector<CounterPoint>& series, uint64_
 }
 
 }  // namespace
+
+std::vector<PhaseInterval> PhaseIntervalsFromBoundaries(
+    int64_t run_start_unix_ns, int64_t run_end_unix_ns,
+    const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
+    const std::vector<nighthawk::client::PhaseSpec>& specs) {
+  if (events.empty() || run_end_unix_ns <= run_start_unix_ns) {
+    return {};
+  }
+  // Interval starts: run start, then each boundary's wall stamp (ascending;
+  // the engine emits boundaries in phase order).
+  std::vector<PhaseInterval> intervals;
+  intervals.reserve(events.size() + 1);
+  int64_t cursor = run_start_unix_ns;
+  for (size_t i = 0; i < events.size(); ++i) {
+    const nighthawk::client::PhaseBoundaryEvent& event = events[i];
+    const int64_t boundary = event.wall_time_unix_ns();
+    if (boundary <= cursor || boundary > run_end_unix_ns) {
+      // A boundary outside the run span cannot open an interval; skip it
+      // (recorded data, never fabricated).
+      continue;
+    }
+    PhaseInterval interval;
+    interval.phase_id = event.ending_phase_id();
+    interval.start_unix_ns = cursor;
+    interval.end_unix_ns = boundary;
+    interval.drain_complete = true;
+    interval.worker_count = event.worker_count();
+    intervals.push_back(std::move(interval));
+    cursor = boundary;
+  }
+  // The final interval: the phase the last boundary opened (the event's own
+  // phase fields name it), ending at the run end.
+  PhaseInterval last;
+  last.phase_id = events.back().phase_id();
+  last.start_unix_ns = cursor;
+  last.end_unix_ns = run_end_unix_ns;
+  last.drain_complete = true;
+  last.worker_count = 0;
+  // Worker count from the specs by phase id; unknown (0) when absent — that
+  // marks differentials non-comparable instead of guessing.
+  for (const nighthawk::client::PhaseSpec& spec : specs) {
+    if (spec.name() == last.phase_id) {
+      int parsed = 0;
+      if (spec.has_concurrency() && absl::SimpleAtoi(spec.concurrency().value(), &parsed) &&
+          parsed > 0) {
+        last.worker_count = static_cast<uint64_t>(parsed);
+      }
+      break;
+    }
+  }
+  intervals.push_back(std::move(last));
+  return intervals;
+}
+
+SplitAlignment WindowPhaseAlignment::AlignSplit(
+    FoldedTree tree, const std::vector<PhaseInterval>& intervals, int64_t start_unix_ns,
+    int64_t end_unix_ns, std::string profile_type, int64_t clock_offset_uncertainty_ns,
+    const std::vector<CounterPoint>& completed_series, int64_t anchor_offset_ns) {
+  if (end_unix_ns <= start_unix_ns) {
+    // Mirror Align's degenerate guard; the caller excludes-and-marks.
+    SplitAlignment invalid;
+    (void)invalid;
+    return SplitAlignment{};
+  }
+  SplitAlignment result;
+  int64_t cursor = start_unix_ns;
+  for (const PhaseInterval& interval : intervals) {
+    if (cursor >= end_unix_ns) {
+      break;
+    }
+    const int64_t boundary = std::min<int64_t>(interval.end_unix_ns, end_unix_ns);
+    if (boundary <= cursor) {
+      continue;
+    }
+    // One part: [cursor, min(interval end, window end)). Fully inside the
+    // interval by construction.
+    const int64_t part_start = std::max(cursor, interval.start_unix_ns);
+    const int64_t part_end = boundary;
+    cursor = boundary;
+    if (part_end <= part_start) {
+      continue;
+    }
+
+    ProfileWindow part;
+    part.start_unix_ns = part_start;
+    part.end_unix_ns = part_end;
+    part.phase_id = interval.phase_id;
+    part.worker_count = interval.worker_count;
+    part.profile_type = profile_type;
+    part.symbolized = tree.symbolized;
+    part.interval_source = (tree.time_nanos != 0 && tree.duration_nanos != 0)
+                               ? WindowIntervalSource::kProfileTimestamps
+                               : WindowIntervalSource::kFetchOrchestration;
+    part.clock_offset_uncertainty_ns = clock_offset_uncertainty_ns;
+    // Each part carries its own per-unit-of-work denominator through the
+    // caller's anchor mapping.
+    const uint64_t lo = static_cast<uint64_t>(std::max<int64_t>(0, part_start - anchor_offset_ns));
+    const uint64_t hi = static_cast<uint64_t>(std::max<int64_t>(0, part_end - anchor_offset_ns));
+    part.work_units = CompletedWorkInMonotonicRange(completed_series, lo, hi);
+
+    if (!interval.drain_complete) {
+      part.purity_fraction = 0.0;
+      result.reasons.push_back(absl::StrCat("part [", part_start, ", ", part_end,
+                                            "] in phase '", interval.phase_id,
+                                            "': drain not complete"));
+      result.excluded.push_back(std::move(part));
+      continue;
+    }
+    if (part_end - part_start < kMinSplitWindowNs) {
+      part.purity_fraction = 0.0;
+      result.reasons.push_back(absl::StrCat("part [", part_start, ", ", part_end, "] in phase '",
+                                            interval.phase_id, "': below the ",
+                                            kMinSplitWindowNs / 1000000000,
+                                            "s meaningful-minimum rule; excluded-and-marked"));
+      result.excluded.push_back(std::move(part));
+      continue;
+    }
+    part.purity_fraction = 1.0;
+    result.pure.push_back(std::move(part));
+  }
+  // The tree rides into the FIRST part (the only tree the flame renderer
+  // needs; the parts are one window's samples). Later parts carry an empty
+  // tree by design: the store renders the newest window, and a split lands
+  // newest-part-last so the visible tree is the part the pane shows.
+  if (!result.pure.empty()) {
+    result.pure.front().tree = std::move(tree);
+  } else if (!result.excluded.empty()) {
+    result.excluded.front().tree = std::move(tree);
+  }
+  return result;
+}
 
 absl::StatusOr<ProfileWindow> WindowPhaseAlignment::Align(
     FoldedTree tree, const PhaseInterval& phase, int64_t start_unix_ns, int64_t end_unix_ns,

@@ -91,11 +91,11 @@ std::optional<std::string> ReadWholeFile(const std::string& path) {
   return ss.str();
 }
 
-// One pool job's outcome: the produced window (pure or excluded-and-marked)
-// plus what the session record and the flame-pane note need.
+// One pool job's outcome: the produced windows (pure, and excluded-and-
+// marked; a split window yields up to two parts) plus what the session
+// records and the flame-pane note need.
 struct ProfileJobOutcome {
-  bool has_window = false;
-  ProfileWindow window;
+  std::vector<ProfileWindow> windows;
   // The staged raw profile bytes (for the session record) and the
   // provenance label.
   std::string raw_bytes;
@@ -209,21 +209,60 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
     window_end = tree_or->time_nanos + tree_or->duration_nanos;
   }
 
-  // Phase interval (the major-fix producer): pre-A1 the whole run is one
-  // "main" phase. A finished run's span is [run_start, recorded run end]; a
-  // live run's phase-so-far ends at the window's own fetch boundary (the
-  // run has not stopped yet, and a window fetched mid-run is contained by
-  // construction — purity claims stay relative to observed run time until
-  // M2's real phase events replace this producer).
+  // Work units through the anchor: monotonic ~= wall - (anchor.wall -
+  // anchor.monotonic).
+  const int64_t anchor_offset = input.anchor.wall_time_unix_ns - input.anchor.monotonic_ns;
+
+  if (!input.boundary_events.empty()) {
+    // M2 split-at-boundary alignment: engine intervals joined on the
+    // streamed (wall, monotonic) pairs (DQ-3). A window straddling a
+    // boundary splits into per-phase parts; too-short or drain-incomplete
+    // parts are excluded-and-marked with the reason.
+    const int64_t interval_end =
+        input.run_finished ? input.run_end_unix_ns
+                           : std::max(input.run_start_unix_ns + 1, fetched.requested_end_unix_ns);
+    const std::vector<PhaseInterval> intervals = PhaseIntervalsFromBoundaries(
+        input.run_start_unix_ns, interval_end, input.boundary_events, input.phase_specs);
+    if (intervals.empty()) {
+      outcome.note = "window rejected: no phase intervals from the boundary events";
+      return outcome;
+    }
+    SplitAlignment split = WindowPhaseAlignment::AlignSplit(
+        *std::move(tree_or), intervals, window_start, window_end, fetched.profile_type,
+        uncertainty, input.completed_series, anchor_offset);
+    outcome.windows = std::move(split.pure);
+    const size_t split_count = outcome.windows.size();
+    std::string note;
+    if (split_count > 0) {
+      note = absl::StrCat("window split at the boundary: ", split_count, " pure part(s)");
+      for (const std::string& reason : split.reasons) {
+        absl::StrAppend(&note, " | ", reason);
+      }
+    } else if (!split.excluded.empty()) {
+      note = "window EXCLUDED-AND-MARKED: " + split.reasons.front();
+      for (size_t i = 1; i < split.reasons.size(); ++i) {
+        absl::StrAppend(&note, " | ", split.reasons[i]);
+      }
+      outcome.windows = std::move(split.excluded);
+    } else {
+      note = "window rejected: no part overlaps the run's phase intervals";
+    }
+    if (!symbolizer_note.empty()) {
+      absl::StrAppend(&note, " | ", symbolizer_note);
+    }
+    outcome.note = std::move(note);
+    return outcome;
+  }
+
+  // Legacy single-interval path (M1 producer; no boundary events). A
+  // finished run's span is [run_start, recorded run end]; a live run's
+  // phase-so-far ends at the window's own fetch boundary.
   PhaseInterval phase = PreA1RunInterval(
       input.run_start_unix_ns,
       input.run_finished ? input.run_end_unix_ns
                          : std::max(input.run_start_unix_ns + 1, fetched.requested_end_unix_ns),
       input.worker_count);
 
-  // Work units through the anchor: monotonic ~= wall - (anchor.wall -
-  // anchor.monotonic).
-  const int64_t anchor_offset = input.anchor.wall_time_unix_ns - input.anchor.monotonic_ns;
   const uint64_t lo_monotonic_ns =
       static_cast<uint64_t>(std::max<int64_t>(0, window_start - anchor_offset));
   const uint64_t hi_monotonic_ns =
@@ -261,8 +300,7 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
                                                window.end_unix_ns, window.worker_count,
                                                window.work_units, window.profile_type, uncertainty);
     if (aligned.ok()) {
-      outcome.has_window = true;
-      outcome.window = *std::move(aligned);
+      outcome.windows.push_back(*std::move(aligned));
       outcome.note = absl::StrCat("window pulled: pure (work units ", work_units, ")");
       if (!symbolizer_note.empty()) {
         absl::StrAppend(&outcome.note, " | ", symbolizer_note);
@@ -284,8 +322,7 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
           ? static_cast<double>(overlap_end - overlap_start) / static_cast<double>(duration)
           : 0.0;
   window.purity_fraction = purity;
-  outcome.has_window = true;
-  outcome.window = std::move(window);
+  outcome.windows.push_back(std::move(window));
   outcome.note = absl::StrCat(
       "window EXCLUDED-AND-MARKED (purity ", absl::StrFormat("%.3f", purity),
       " < 1.0): never comparable — ", "window straddles the run interval");
@@ -894,6 +931,10 @@ absl::Status RunController::StopProfileWindowAndFold() {
     input->run_end_unix_ns = run_end_unix_ns_;
     input->worker_count = worker_count_;
     input->completed_series = MergeCompletedSeries(model_.counters);
+    // M2 split alignment inputs: the run's streamed boundaries and the phase
+    // specs (empty events keep the M1 producer).
+    input->boundary_events = boundary_events_;
+    input->phase_specs = {knob_options_.phases().begin(), knob_options_.phases().end()};
     // RunFeed clears its running flag BEFORE on_finished fires (run_feed.cc's
     // teardown order), so "feed idle but stamp not yet recorded" means the
     // terminal event is in flight — wait briefly for the REAL stamp.
@@ -983,14 +1024,16 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
 
   ProfileJobOutcome outcome = RunProfilePipeline(config, *fetched, input, uncertainty_ns);
 
-  if (outcome.has_window) {
+  if (!outcome.windows.empty()) {
     // Append to the immutable store; the render side only ever reads it.
     auto windows = window_store_.load();
     std::vector<ProfileWindow> updated = windows != nullptr ? *windows : std::vector<ProfileWindow>();
-    updated.push_back(outcome.window);
+    for (ProfileWindow& window : outcome.windows) {
+      updated.push_back(window);
+    }
     window_store_.store(std::move(updated));
 
-    // Session record: the raw staged bytes ride along (self-describing
+    // Session records: the raw staged bytes ride along (self-describing
     // session). Enqueued under the writer mutex; enqueue after close counts
     // as a drop, so a race with finishSession is safe by contract. When the
     // session closed before this job landed, say so (review minor): the
@@ -998,10 +1041,12 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (writer_ != nullptr) {
-        nighthawk::client::SessionRecord record;
-        *record.mutable_profile_window() =
-            ToProfileWindowRecord(outcome.window, outcome.raw_bytes, outcome.symbolizer_tool);
-        writer_->enqueue(std::move(record));
+        for (const ProfileWindow& window : outcome.windows) {
+          nighthawk::client::SessionRecord record;
+          *record.mutable_profile_window() =
+              ToProfileWindowRecord(window, outcome.raw_bytes, outcome.symbolizer_tool);
+          writer_->enqueue(std::move(record));
+        }
       } else {
         absl::StrAppend(&outcome.note, " | record not persisted: session already closed");
       }

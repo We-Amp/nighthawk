@@ -103,6 +103,12 @@ struct ProfileJobInput {
   int64_t run_end_unix_ns = 0;
   uint64_t worker_count = 1;
   std::vector<CounterPoint> completed_series;
+  // M2 Task 7: the run's streamed boundary events and the phase specs —
+  // non-empty events switch the alignment to the split-at-boundary producer
+  // (engine intervals joined on the (wall, monotonic) pairs, DQ-3); empty
+  // events keep the M1 legacy single-interval path.
+  std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events;
+  std::vector<nighthawk::client::PhaseSpec> phase_specs;
 };
 
 // FORK-ONLY (We-Amp): the headless run/session lifecycle carrier behind the

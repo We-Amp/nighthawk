@@ -20,6 +20,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "api/client/live.pb.h"
+#include "api/client/options.pb.h"
 #include "source/client/tui/pprof_fold.h"
 #include "source/client/tui/run_view_model.h"
 
@@ -59,8 +61,8 @@ struct PhaseInterval {
 
 // Pre-A1 producer (plan major-fix): the whole run is one phase — the interval
 // spans run start->stop, the drain is trivially complete, and the worker
-// count comes from the start request's concurrency. M2 replaces this producer
-// with phase-anchored events.
+// count comes from the start request's concurrency. M2 REPLACES this producer
+// with PhaseIntervalsFromBoundaries (kept for legacy single-phase runs).
 inline PhaseInterval PreA1RunInterval(int64_t run_start_unix_ns, int64_t run_end_unix_ns,
                                       uint64_t worker_count) {
   PhaseInterval interval;
@@ -71,6 +73,24 @@ inline PhaseInterval PreA1RunInterval(int64_t run_start_unix_ns, int64_t run_end
   interval.worker_count = worker_count;
   return interval;
 }
+
+// The M2 producer: the run's phase intervals from the STREAMED boundary
+// events, joined on the engine-emitted (wall, monotonic) pairs (the DQ-3
+// rule: the alignment joins on the discrete events, never synthetic
+// flushes). Interval i spans [start_i, start_{i+1}) where the starts are the
+// run start, then each boundary's wall stamp; the final interval ends at
+// `run_end_unix_ns` (a live run's caller passes the fetch boundary — never a
+// fabricated future end). Every event-opened interval is drain-complete by
+// construction (the event fires after the boundary's drain was collected);
+// the first interval counts as drain-complete like the M1 producer did (no
+// preceding drain exists to wait for). Worker counts resolve from the specs
+// by phase id (an unparseable/absent concurrency leaves 0 — such intervals
+// still align but carry the unknown count, which marks differentials
+// non-comparable per 8.4 rather than guessing). Pure.
+std::vector<PhaseInterval> PhaseIntervalsFromBoundaries(
+    int64_t run_start_unix_ns, int64_t run_end_unix_ns,
+    const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
+    const std::vector<nighthawk::client::PhaseSpec>& specs);
 
 // One symbolized profile window, aligned to a phase.
 struct ProfileWindow {
@@ -99,6 +119,33 @@ struct ProfileWindow {
   int64_t clock_offset_uncertainty_ns = 0;
 };
 
+// The split-at-boundary outcome (8.3, M2): a window straddling a phase
+// boundary is SPLIT at the boundary into per-phase parts — each part is
+// fully contained in one interval (purity exactly 1.0, its own phase id and
+// worker count). A part below kMinSplitWindowNs (the documented
+// meaningful-minimum rule: one stats flush is the smallest span a percentile
+// band can even observe), or one inside a drain-incomplete interval, is
+// EXCLUDED-AND-MARKED: it still lands (store + session) but stamped purity
+// 0.0 so no consumer can ever treat it as comparable, with the reason
+// recorded alongside.
+struct SplitAlignment {
+  // The pure split parts, ordered by start time. The tree rides into the
+  // FIRST part (one window's samples; the newest part lands last in the
+  // store so the pane renders the tree it expects).
+  std::vector<ProfileWindow> pure;
+  // The excluded-and-marked remainders, ordered by start time (purity 0.0;
+  // the reasons align by index).
+  std::vector<ProfileWindow> excluded;
+  std::vector<std::string> reasons;
+};
+
+// A split part shorter than this is "too short to be meaningful" (the
+// documented un-splittable rule): one stats flush at the default cadence is
+// the smallest span a percentile band can even observe, so a thinner part
+// carries no honest sample mass. EXCLUDED-AND-MARKED, never silently merged
+// into its neighbor.
+inline constexpr int64_t kMinSplitWindowNs = 1'000'000'000;
+
 // The pure owning function of Review Focus 3: aligns a folded tree's window
 // to a phase interval and computes its purity fraction.
 //
@@ -108,8 +155,8 @@ struct ProfileWindow {
 // (M2 machinery — impossible pre-A1, where the single phase spans the run).
 //
 // Rejections (caller EXCLUDES-AND-MARKS; M1's only handling — the
-// split-at-boundary variant is M2 scope, phase-anchored windows make splits
-// natural):
+// split-at-boundary variant is AlignSplit's, kept next to Align so the two
+// contracts read together):
 //   - drain not complete                      -> kFailedPrecondition
 //   - end past the phase end                  -> kFailedPrecondition
 //   - no overlap with the phase               -> kFailedPrecondition
@@ -120,6 +167,17 @@ class WindowPhaseAlignment {
       FoldedTree tree, const PhaseInterval& phase, int64_t start_unix_ns, int64_t end_unix_ns,
       uint64_t worker_count, uint64_t work_units, std::string profile_type,
       int64_t clock_offset_uncertainty_ns = 0);
+
+  // The split-at-boundary alignment (the SplitAlignment contract above).
+  // Degenerate input (end <= start, empty intervals) yields an empty result
+  // — the caller excludes-and-marks with its own reason.
+  static SplitAlignment AlignSplit(FoldedTree tree,
+                                   const std::vector<PhaseInterval>& intervals,
+                                   int64_t start_unix_ns, int64_t end_unix_ns,
+                                   std::string profile_type,
+                                   int64_t clock_offset_uncertainty_ns,
+                                   const std::vector<CounterPoint>& completed_series,
+                                   int64_t anchor_offset_ns);
 };
 
 // Work-units join (plan major-fix): the completed-request counter series

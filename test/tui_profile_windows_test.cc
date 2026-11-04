@@ -423,6 +423,135 @@ TEST(ProfileWindowStoreTest, StoreSwapIsImmutable) {
   EXPECT_EQ((*fresh)[1].work_units, 200u);
 }
 
+// --- M2: the split-at-boundary producer replacement. -----------------------
+
+using nighthawk::client::PhaseBoundaryEvent;
+using nighthawk::client::PhaseSpec;
+
+// Two intervals from one boundary: phase "warm" ends at the boundary's wall
+// stamp, "spike" runs from it to the run end. Worker counts resolve from the
+// specs by phase id.
+TEST(ProducerReplacementTest, IntervalsBuiltFromBoundaryEvents) {
+  PhaseBoundaryEvent event;
+  event.set_phase_index(1);
+  event.set_phase_id("spike");
+  event.set_wall_time_unix_ns(5'000);
+  event.set_ending_phase_index(0);
+  event.set_ending_phase_id("warm");
+  event.set_worker_count(2);
+
+  PhaseSpec warm;
+  warm.set_name("warm");
+  warm.mutable_concurrency()->set_value("2");
+  PhaseSpec spike;
+  spike.set_name("spike");
+  spike.mutable_concurrency()->set_value("4");
+
+  const std::vector<PhaseInterval> intervals =
+      PhaseIntervalsFromBoundaries(/*run_start_unix_ns=*/1'000, /*run_end_unix_ns=*/9'000,
+                                   {event}, {warm, spike});
+  ASSERT_EQ(intervals.size(), 2u);
+  EXPECT_EQ(intervals[0].phase_id, "warm");
+  EXPECT_EQ(intervals[0].start_unix_ns, 1'000);
+  EXPECT_EQ(intervals[0].end_unix_ns, 5'000);
+  EXPECT_EQ(intervals[0].worker_count, 2u);
+  EXPECT_TRUE(intervals[0].drain_complete);
+  EXPECT_EQ(intervals[1].phase_id, "spike");
+  EXPECT_EQ(intervals[1].start_unix_ns, 5'000);
+  EXPECT_EQ(intervals[1].end_unix_ns, 9'000);
+  EXPECT_EQ(intervals[1].worker_count, 4u);
+}
+
+// A window straddling the boundary SPLITS into two pure parts, each with its
+// phase id and worker count; the tree rides into the first part.
+TEST(ProducerReplacementTest, StraddlingWindowSplitsAtBoundary) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 100)}, /*time_nanos=*/2'000,
+                             /*duration_nanos=*/6'000);
+
+  PhaseInterval warm;
+  warm.phase_id = "warm";
+  warm.start_unix_ns = 1'000'000'000;
+  warm.end_unix_ns = 5'000'000'000;
+  warm.drain_complete = true;
+  warm.worker_count = 2;
+  PhaseInterval spike;
+  spike.phase_id = "spike";
+  spike.start_unix_ns = 5'000'000'000;
+  spike.end_unix_ns = 9'000'000'000;
+  spike.drain_complete = true;
+  spike.worker_count = 4;
+
+  // The completed-work series is in the monotonic domain; the anchor offset
+  // maps wall -> monotonic (offset 0 here).
+  std::vector<CounterPoint> series = {{2'000'000'000ull, 10}, {5'000'000'000ull, 50},
+                                      {8'000'000'000ull, 100}};
+
+  SplitAlignment split = WindowPhaseAlignment::AlignSplit(
+      tree, {warm, spike}, /*start=*/2'000'000'000, /*end=*/8'000'000'000, "cpu",
+      /*uncertainty=*/0, series,
+      /*anchor_offset_ns=*/0);
+  ASSERT_EQ(split.pure.size(), 2u);
+  EXPECT_TRUE(split.excluded.empty());
+
+  EXPECT_EQ(split.pure[0].phase_id, "warm");
+  EXPECT_EQ(split.pure[0].start_unix_ns, 2'000'000'000);
+  EXPECT_EQ(split.pure[0].end_unix_ns, 5'000'000'000);
+  EXPECT_DOUBLE_EQ(split.pure[0].purity_fraction, 1.0);
+  EXPECT_EQ(split.pure[0].worker_count, 2u);
+  // Each part carries its OWN work-units denominator.
+  EXPECT_EQ(split.pure[0].work_units, 40u);
+  EXPECT_EQ(split.pure[1].phase_id, "spike");
+  EXPECT_EQ(split.pure[1].start_unix_ns, 5'000'000'000);
+  EXPECT_EQ(split.pure[1].end_unix_ns, 8'000'000'000);
+  EXPECT_DOUBLE_EQ(split.pure[1].purity_fraction, 1.0);
+  EXPECT_EQ(split.pure[1].worker_count, 4u);
+  EXPECT_EQ(split.pure[1].work_units, 50u);
+  // The tree rides into the first part; the differential pair across the
+  // boundary is the 8.4 case (different worker counts -> marked
+  // non-comparable), computed on two separately built windows.
+  EXPECT_EQ(split.pure[0].tree.root.size(), 1u);
+
+  // The 8.4 machinery's first real-data path: differential selection across
+  // the split refuses the pair with the reason.
+  ProfileWindow current = split.pure[1];
+  current.tree = MakeTree({MakeFrame("main", 100)});
+  auto diff = ComputeDifferential(split.pure[0], current);
+  ASSERT_TRUE(diff.ok()) << diff.status();
+  EXPECT_FALSE(diff->comparable);
+  EXPECT_NE(diff->incomparable_reason.find("worker"), std::string::npos) << diff->incomparable_reason;
+}
+
+// A part below the meaningful-minimum rule (one stats flush) is
+// EXCLUDED-AND-MARKED with the reason — never silently merged, never
+// comparable (purity 0.0).
+TEST(ProducerReplacementTest, TooShortPartExcludedAndMarked) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 100)});
+  PhaseInterval warm;
+  warm.phase_id = "warm";
+  warm.start_unix_ns = 1'000'000'000;
+  warm.end_unix_ns = 5'000'000'000;
+  warm.drain_complete = true;
+  warm.worker_count = 2;
+  PhaseInterval spike;
+  spike.phase_id = "spike";
+  spike.start_unix_ns = 5'000'000'000;
+  spike.end_unix_ns = 9'000'000'000;
+  spike.drain_complete = true;
+  spike.worker_count = 4;
+
+  SplitAlignment split = WindowPhaseAlignment::AlignSplit(
+      tree, {warm, spike}, /*start=*/4'999'500'000, /*end=*/6'000'000'000, "cpu", 0, {}, 0);
+  // The "warm" part is 0.5ms — below kMinSplitWindowNs; the "spike" part is
+  // 1s exactly (the rule is inclusive: >= the minimum is pure).
+  ASSERT_EQ(split.pure.size(), 1u);
+  ASSERT_EQ(split.excluded.size(), 1u);
+  EXPECT_EQ(split.pure[0].phase_id, "spike");
+  EXPECT_DOUBLE_EQ(split.pure[0].purity_fraction, 1.0);
+  EXPECT_DOUBLE_EQ(split.excluded[0].purity_fraction, 0.0);
+  ASSERT_EQ(split.reasons.size(), 1u);
+  EXPECT_NE(split.reasons[0].find("meaningful-minimum"), std::string::npos) << split.reasons[0];
+}
+
 }  // namespace
 }  // namespace Tui
 }  // namespace Client
