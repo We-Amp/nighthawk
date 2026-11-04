@@ -27,6 +27,28 @@ cc_test(
 # FORK-ONLY (We-Amp): session file format, writer/reader, and queue drop
 # contract tests. Plain cc_test for the same reason as tui_app_test: the TUI
 # quarantine keeps this off Envoy's C++ sources and test helpers.
+# FORK-ONLY (We-Amp): pprof parse/fold/symbolize/worker-pool contract tests.
+# Plain cc_test for the same reason as tui_app_test: the TUI quarantine keeps
+# this off Envoy's C++ sources and test helpers. The data fixture is the Task
+# 1 machine-route output (real staged SUT CPU profile, symbolized by
+# `go tool pprof -proto`); see the test header for its provenance.
+cc_test(
+    name = "tui_pprof_fold_test",
+    srcs = ["tui_pprof_fold_test.cc"],
+    data = ["fixtures/nh_sut_pprof.pb.gz"],
+    deps = [
+        "//api/pprof:profile_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 cc_test(
     name = "tui_session_test",
     srcs = ["tui_session_test.cc"],

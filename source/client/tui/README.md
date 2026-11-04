@@ -29,10 +29,12 @@ immutable snapshots (`SnapshotStore`/`RunViewModel`). The lifecycle logic lives
 in the headless `RunController` (`tui_app.h`); the interactive shell only
 composes `RenderLayout` and the key map on top.
 
-**pprof worker pool: deferred to M1.** This is an inference from the milestone
-ladder, not a spec sanction: M0b has no pprof work to fold (the pool's first
-consumer is M1's flamegraph pipeline), so introducing it here would be dead
-code. The other named-thread contracts above are implemented as specified.
+**pprof worker pool: delivered in M1** (`pprof_worker_pool.h`, task 3) — a
+bounded FIFO pool of `absl::Mutex`-driven workers; the destructor drains and
+joins. Symbolization jobs go through it (`profile_symbolizer.h`): a
+`go tool pprof -proto` run over a full-DWARF binary is slow (~40 min observed
+on the staged Envoy binary), so it must never run on the render or steering
+paths. The other named-thread contracts above are implemented as specified.
 
 ## The quarantine rule
 
@@ -77,6 +79,19 @@ Everything else in the TUI's dependency graph is out:
   the test pull in)
 - `//api/client` generated protos (`grpc_service_lib`, `base_cc_proto`) and
   their transitive `@envoy_api` proto-generated code
+- `//api/pprof` generated protos (`profile_cc_proto` — the vendored
+  `perftools.profiles.Profile`, google/pprof, protobuf C++ only) and
+  `@protobuf//src/google/protobuf/io:gzip_stream` (the `-proto` output of the
+  machine route is gzipped; gzip_stream inflates it). zlib comes with
+  protobuf's own module dep (`bazel_dep(name = "zlib", version =
+  "1.3.1.bcr.5")` inside the protobuf module) — no MODULE.bazel change, no new
+  bazel_dep.
+- **Symbolization is subprocess-only** (Global Constraints): the M1
+  `ProfileSymbolizer` (`source/client/tui/profile_symbolizer.h`) shells out to
+  `go tool pprof -proto -output <out> <binary> <raw>` with
+  `PPROF_BINARY_PATH` in the child env (the Task 1 machine route). No pprof
+  parsing or DWARF reading happens in-process, and no in-repo quarantine
+  surface changes because of it.
 
 Notably NOT allowed: `//source/common` (its `Utility::parseCommand` helper is
 re-implemented inline in `tui_app.cc` for exactly this reason), Envoy test
