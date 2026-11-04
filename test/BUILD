@@ -85,6 +85,27 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): SUT prometheus scrape parse + delta layer tests. Plain
+# cc_test for the same reason as tui_view_model_test: the TUI quarantine keeps
+# this off Envoy's C++ sources and test helpers.
+cc_test(
+    name = "tui_sut_stats_test",
+    srcs = ["tui_sut_stats_test.cc"],
+    deps = [
+        "//source/client/tui:tui_lib",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/strings",
+        "@ftxui//:dom",
+        "@ftxui//:screen",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_view_model_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 # FORK-ONLY (We-Amp): chart renderer tests. Plain cc_test, same quarantine
 # reasoning as tui_view_model_test.
 cc_test(
