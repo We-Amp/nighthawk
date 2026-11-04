@@ -101,6 +101,7 @@ ProfileFetcher::ProfileFetcher(AdminClient admin, std::unique_ptr<ProfileRetriev
       sut_profile_path_(std::move(sut_profile_path)), staging_dir_(std::move(staging_dir)) {}
 
 absl::Status ProfileFetcher::StartWindow(int window_seconds) {
+  (void)window_seconds; // advisory only — the admin mutator takes no duration
   if (window_open_) {
     return absl::FailedPreconditionError(
         "a profile window is already open; close it with StopWindowAndFetch first");
@@ -110,7 +111,6 @@ absl::Status ProfileFetcher::StartWindow(int window_seconds) {
     return status;
   }
   window_open_ = true;
-  requested_window_seconds_ = window_seconds;
   requested_start_unix_ns_ = absl::GetCurrentTimeNanos();
   return absl::OkStatus();
 }
@@ -134,6 +134,9 @@ absl::StatusOr<FetchedProfile> ProfileFetcher::StopWindowAndFetch() {
     return retrieved.status();
   }
 
+  // Staged in the legacy gperftools binary format, verbatim from the SUT —
+  // NOT gzip, NOT a pprof proto (see FetchedProfile's format boundary):
+  // readable only via ProfileSymbolizer's go-tool conversion (Task 3).
   std::string staged = absl::StrCat(staging_dir_, "/cpu-", requested_end_unix_ns, ".pprof");
   absl::Status staged_status = StageFile(*retrieved, staged);
   if (!staged_status.ok()) {

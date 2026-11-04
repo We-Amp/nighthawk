@@ -338,6 +338,20 @@ TEST(AdminClientTest, FetchPrometheusStatsReturnsBody) {
   EXPECT_EQ(*stats, body);
 }
 
+TEST(AdminClientTest, ShortContentLengthBodyErrors) {
+  StubAdminServer server([](const std::string& request_line) -> std::string {
+    if (request_line == "GET /stats?format=prometheus HTTP/1.1") {
+      // Advertise more bytes than are actually sent.
+      return "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 100\r\n\r\nshort";
+    }
+    return MakeResponse(404, "not found");
+  });
+  AdminClient client(AdminEndpoints{server.admin_base()});
+  absl::StatusOr<std::string> stats = client.FetchPrometheusStats();
+  ASSERT_FALSE(stats.ok());
+  EXPECT_THAT(stats.status().message(), ::testing::HasSubstr("truncated"));
+}
+
 TEST(AdminClientTest, FetchSutUnixTimeNsParsesOrReports) {
   // With the clock-source field present: the RFC 7231 Date header parses to
   // unix ns. Thursday 1970-01-01 00:00:10 GMT is exactly 10 seconds after
@@ -382,7 +396,10 @@ TEST(ProfileFetcherTest, StopWindowDisablesThenRetrieves) {
   });
 
   VolumeMountTestHarness harness;
-  const std::string profile_bytes = "fake-gzip-cpu-profile";
+  // Deliberately NOT gzip / not a pprof proto: the SUT stages its raw CPU
+  // profile in the legacy gperftools binary format (see FetchedProfile's
+  // format boundary). Contents are opaque to this test.
+  const std::string profile_bytes = "fake-legacy-gperftools-profile";
   harness.write_sut_profile(profile_bytes);
 
   // The recording retriever snapshots the stub's request log at the moment

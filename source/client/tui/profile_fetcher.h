@@ -66,6 +66,14 @@ private:
 // The metadata the TUI records for one profile window. NOTE (spec §8.5): the
 // requested_* timestamps are mac-side call times, METADATA only — the
 // authoritative window interval comes from the parsed profile (Task 3/4).
+//
+// FORMAT BOUNDARY (T2→T3/T4/T6): the staged .pprof is the SUT's RAW CPU
+// profile in the legacy gperftools binary format (sample-count header +
+// stack records) — NOT gzip and NOT a pprof proto, despite the extension.
+// It is readable ONLY through ProfileSymbolizer's go-tool conversion
+// (`go tool pprof <sut-binary> <file>`, Task 3); nothing in the TUI may
+// parse it directly, and the authoritative window interval (Task 3/4) must
+// be read out of that conversion, not from this file.
 struct FetchedProfile {
   std::string local_path;
   std::string profile_type; // "cpu" | "alloc"
@@ -80,8 +88,9 @@ public:
                  std::string sut_profile_path, std::string staging_dir);
 
   // Enables the CPU profiler in the SUT. Fails (kFailedPrecondition) if a
-  // window is already open. `window_seconds` is recorded as metadata only —
-  // the admin mutator takes no duration; the window ends at StopWindow.
+  // window is already open. `window_seconds` is advisory bookkeeping for the
+  // caller only — the admin mutator takes no duration; the window ends at
+  // StopWindowAndFetch.
   absl::Status StartWindow(int window_seconds);
 
   // Disables the profiler (ALWAYS before retrieval — a fetch racing a live
@@ -90,6 +99,13 @@ public:
   // Blocking — call from a PprofWorkerPool job (Task 6). Fails
   // (kFailedPrecondition) if no window is open; the window is closed even
   // when disable or retrieval fails, so a wedged state never persists.
+  //
+  // Post-failed-disable recovery: the failure surfaces here and the window
+  // is already closed, so the SUT profiler may still be RUNNING. Recovery is
+  // the caller's job with its own AdminClient — call
+  // AdminClient::EnableCpuProfiler(false) directly (and optionally fetch via
+  // Retrieve()) — never by re-entering StopWindowAndFetch, which would fail
+  // kFailedPrecondition again.
   absl::StatusOr<FetchedProfile> StopWindowAndFetch();
 
   bool window_open() const { return window_open_; }
@@ -101,7 +117,6 @@ private:
   std::string staging_dir_;
   bool window_open_ = false;
   int64_t requested_start_unix_ns_ = 0;
-  int requested_window_seconds_ = 0;
 };
 
 } // namespace Tui

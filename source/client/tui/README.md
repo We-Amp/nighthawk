@@ -39,6 +39,17 @@ paths. Note that quitting while a symbolization job runs blocks in the pool's
 case above. The other named-thread contracts above are implemented as
 specified.
 
+## Profile fetch layer (M1 T2)
+
+`AdminClient` (plain-HTTP/1.1, POST-only admin mutators; /server_info clock
+source is the RFC 7231 `Date` response header — the JSON body carries no
+current-time field in Envoy 1.40.2) + `ProfileFetcher` (synchronous window
+orchestration; disable-before-fetch ordering) + pluggable `ProfileRetriever`
+(`VolumeMountRetriever` / `ScpRetriever`). **Format boundary:** the staged
+`.pprof` is the SUT's raw profile in the legacy gperftools binary format —
+NOT gzip and NOT a pprof proto despite the extension; it is readable only
+through ProfileSymbolizer's go-tool conversion (M1 T3), never by TUI code.
+
 ## The quarantine rule
 
 The TUI (`nighthawk_tui`, `//source/client/tui:tui_lib`) may depend only on
