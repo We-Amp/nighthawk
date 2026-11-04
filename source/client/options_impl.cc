@@ -14,11 +14,13 @@
 
 #include "api/client/options.pb.validate.h"
 
+#include "source/client/options_validation_phases.h"
 #include "source/client/output_formatter_impl.h"
 #include "source/common/uri_impl.h"
 #include "source/common/utility.h"
 #include "source/common/version_info.h"
 
+#include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
@@ -1010,6 +1012,15 @@ OptionsImpl::OptionsImpl(const nighthawk::client::CommandLineOptions& options) {
        options.user_defined_plugin_configs()) {
     user_defined_output_plugin_configs_.push_back(typed_config);
   }
+  // FORK-ONLY (We-Amp): phase vector (M2 A1). Validate before anything else
+  // consumes the options: errors name the offending phase index.
+  const absl::Status phases_status = validatePhaseVector(options);
+  if (!phases_status.ok()) {
+    throw MalformedArgvException(std::string(phases_status.message()));
+  }
+  for (const nighthawk::client::PhaseSpec& phase : options.phases()) {
+    phases_.push_back(phase);
+  }
   validate();
 }
 
@@ -1115,7 +1126,10 @@ CommandLineOptionsPtr OptionsImpl::toCommandLineOptionsInternal() const {
       std::make_unique<nighthawk::client::CommandLineOptions>();
 
   command_line_options->mutable_connections()->set_value(connections_);
-  if (!no_duration_) {
+  // FORK-ONLY (We-Amp): when a phase vector is present the top-level duration
+  // is mutually exclusive with it; per-phase durations live in the PhaseSpec
+  // entries, so the top-level value is not emitted.
+  if (!no_duration_ && phases_.empty()) {
     command_line_options->mutable_duration()->set_seconds(duration_);
   }
   command_line_options->mutable_requests_per_second()->set_value(requests_per_second_);
@@ -1143,7 +1157,12 @@ CommandLineOptionsPtr OptionsImpl::toCommandLineOptionsInternal() const {
       proto_endpoint->mutable_port()->set_value(endpoint.port().value());
     }
   }
-  command_line_options->mutable_concurrency()->set_value(concurrency_);
+  // FORK-ONLY (We-Amp): when a phase vector is present the top-level
+  // concurrency is mutually exclusive with it; per-phase concurrency lives in
+  // the PhaseSpec entries, so the top-level value is not emitted.
+  if (phases_.empty()) {
+    command_line_options->mutable_concurrency()->set_value(concurrency_);
+  }
   command_line_options->mutable_verbosity()->set_value(verbosity_);
   command_line_options->mutable_output_format()->set_value(output_format_);
   command_line_options->mutable_prefetch_connections()->set_value(prefetch_connections_);
@@ -1255,6 +1274,12 @@ CommandLineOptionsPtr OptionsImpl::toCommandLineOptionsInternal() const {
   for (const envoy::config::core::v3::TypedExtensionConfig& config :
        user_defined_output_plugin_configs_) {
     *command_line_options->add_user_defined_plugin_configs() = config;
+  }
+  // FORK-ONLY (We-Amp): phase vector (M2 A1). Emitted in declaration order so
+  // the serialized CommandLineOptions carries the whole vector (the M2 service
+  // path needs no service.proto change).
+  for (const nighthawk::client::PhaseSpec& phase : phases_) {
+    *command_line_options->add_phases() = phase;
   }
   return command_line_options;
 }

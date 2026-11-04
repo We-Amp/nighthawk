@@ -139,9 +139,25 @@ message Protocol {
   ProtocolOptions value = 1;
 }
 
+// FORK-ONLY (We-Amp): rebase check - PhaseSpec and the phases field on
+// CommandLineOptions below are fork additions to this shared file, kept
+// upstream-shaped at the next free slot so an A1 slice can be PR'd as-is
+// (DQ-1 ruling). Per-phase whitelist ONLY (DQ-2 ruling: no per-phase
+// protocol/TLS/uri in M2; validation rejects them if present). connections
+// inherits the run-level value when absent.
+message PhaseSpec {
+  string name = 1; // unique, non-empty; phase ids derive from it
+  google.protobuf.Duration duration = 2; // >= 1s
+  uint32 requests_per_second = 3; // >= 1
+  google.protobuf.StringValue concurrency = 4; // worker count for this phase (subset of max)
+  google.protobuf.UInt32Value connections = 5; // per-phase connection target (gate input)
+  google.protobuf.UInt32Value max_pending_requests = 6; // per-phase client-side gate
+  google.protobuf.UInt32Value max_active_requests = 7; // per-phase client-side gate
+}
+
 // TODO(oschaaf): Ultimately this will be a load test specification. The fact that it
 // can arrive via CLI is just a concrete detail. Change this to reflect that.
-// Next unused number is 121. (Field 911 is reserved FORK-ONLY (We-Amp): see
+// Next unused number is 122. (Field 911 is reserved FORK-ONLY (We-Amp): see
 // the live_streaming field below.)
 message CommandLineOptions {
   // The target requests-per-second rate. Default: 5.
@@ -349,6 +365,13 @@ message CommandLineOptions {
   // A plugin config that is to be parsed by a RateLimiterPluginConfigFactory
   // and used to create a custom rate limiter.
   envoy.config.core.v3.TypedExtensionConfig rate_limiter_plugin_config = 120;
+
+  // FORK-ONLY (We-Amp): rebase check - field number 121 is a fork addition to
+  // this shared file, upstream-shaped per the DQ-1 ruling. Per-phase
+  // specification vector. Absent (or a single entry) means a legacy run; two
+  // or more entries turn the run into a multi-phase run. Mutually exclusive
+  // with the top-level duration and concurrency options.
+  repeated nighthawk.client.PhaseSpec phases = 121;
 
   // FORK-ONLY (We-Amp): rebase check - field number 911 is fork-specific and
   // free upstream. Presence of this message opts a run in to live snapshot

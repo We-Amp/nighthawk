@@ -116,6 +116,13 @@ public:
   virtual const std::vector<envoy::config::core::v3::TypedExtensionConfig>&
   userDefinedOutputPluginConfigs() const PURE;
 
+  // FORK-ONLY (We-Amp): phase vector accessors (M2 A1). hasPhaseVector() is
+  // true iff a phase vector was configured (one entry included); phases()
+  // returns the parsed entries in declaration order. Every later phase-aware
+  // consumer branches only on these two.
+  virtual bool hasPhaseVector() const PURE;
+  virtual const std::vector<nighthawk::client::PhaseSpec>& phases() const PURE;
+
   /**
    * Converts an Options instance to an equivalent CommandLineOptions instance in terms of option
    * values.

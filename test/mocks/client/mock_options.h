@@ -91,6 +91,9 @@ public:
   MOCK_METHOD(std::optional<std::string>, executionId, (), (const, override));
   MOCK_METHOD(const std::vector<envoy::config::core::v3::TypedExtensionConfig>&,
               userDefinedOutputPluginConfigs, (), (const, override));
+  // FORK-ONLY (We-Amp): phase vector accessors (M2 A1).
+  MOCK_METHOD(bool, hasPhaseVector, (), (const, override));
+  MOCK_METHOD(const std::vector<nighthawk::client::PhaseSpec>&, phases, (), (const, override));
 };
 
 } // namespace Client

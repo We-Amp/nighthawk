@@ -135,6 +135,9 @@ public:
   userDefinedOutputPluginConfigs() const override {
     return user_defined_output_plugin_configs_;
   }
+  // FORK-ONLY (We-Amp): phase vector accessors (M2 A1).
+  bool hasPhaseVector() const override { return !phases_.empty(); }
+  const std::vector<nighthawk::client::PhaseSpec>& phases() const override { return phases_; }
 
 private:
   void parsePredicates(const TCLAP::MultiArg<std::string>& arg,
@@ -220,6 +223,8 @@ private:
   std::optional<Envoy::SystemTime> scheduled_start_;
   std::optional<std::string> execution_id_;
   std::vector<envoy::config::core::v3::TypedExtensionConfig> user_defined_output_plugin_configs_;
+  // FORK-ONLY (We-Amp): parsed phase vector (M2 A1). Empty == legacy run.
+  std::vector<nighthawk::client::PhaseSpec> phases_;
 };
 
 } // namespace Client

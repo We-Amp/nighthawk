@@ -9,6 +9,24 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "options_validation_phases_lib",
+    srcs = [
+        "options_validation_phases.cc",
+    ],
+    hdrs = [
+        "options_validation_phases.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "options_impl_lib",
     srcs = [
         "options_impl.cc",
@@ -18,6 +36,7 @@ envoy_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":options_validation_phases_lib",
         ":output_formatter_impl_lib",
         "//include/nighthawk/client:options_lib",
         "@envoy//source/common/protobuf:message_validator_lib_with_external_headers",

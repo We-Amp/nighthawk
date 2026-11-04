@@ -386,6 +386,18 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "options_phases_test",
+    srcs = ["options_phases_test.cc"],
+    deps = [
+        "//source/client:nighthawk_client_lib",
+        "//source/client:options_validation_phases_lib",
+        "//test/client:utility_lib",
+        "//test/test_common:proto_matchers",
+        "@envoy//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "output_formatter_test",
     srcs = ["output_formatter_test.cc"],
     data = [
