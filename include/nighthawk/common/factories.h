@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
+#include <optional>
 
 #include "envoy/api/api.h"
 #include "envoy/common/pure.h"
@@ -19,12 +21,18 @@ namespace Nighthawk {
 class SequencerFactory {
 public:
   virtual ~SequencerFactory() = default;
+  // FORK-ONLY (We-Amp): requests_per_second_override lets a multi-phase run
+  // build a per-phase sequencer at the phase's declared rate; unset, the
+  // run-level option is used exactly as before. Only the default linear rate
+  // limiter honors the override.
   virtual SequencerPtr create(Envoy::TimeSource& time_source, Envoy::Event::Dispatcher& dispatcher,
                               const SequencerTarget& sequencer_target,
                               TerminationPredicatePtr&& termination_predicate,
                               Envoy::Stats::Scope& scope,
                               const Envoy::MonotonicTime scheduled_starting_time,
-                              Envoy::Api::Api& api) const PURE;
+                              Envoy::Api::Api& api,
+                              std::optional<uint32_t> requests_per_second_override =
+                                  std::nullopt) const PURE;
 };
 
 class StatisticFactory {
@@ -44,9 +52,13 @@ public:
 class TerminationPredicateFactory {
 public:
   virtual ~TerminationPredicateFactory() = default;
+  // FORK-ONLY (We-Amp): duration_override lets a multi-phase run build a
+  // per-phase termination predicate from the phase's declared duration;
+  // unset, the run-level option is used exactly as before.
   virtual TerminationPredicatePtr
   create(Envoy::TimeSource& time_source, Envoy::Stats::Scope& scope,
-         const Envoy::MonotonicTime scheduled_starting_time) const PURE;
+         const Envoy::MonotonicTime scheduled_starting_time,
+         std::optional<std::chrono::seconds> duration_override = std::nullopt) const PURE;
 };
 
 /**

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <optional>
+
 #include "nighthawk/common/factories.h"
 
 #include "gmock/gmock.h"
@@ -11,7 +14,8 @@ public:
   MockTerminationPredicateFactory();
   MOCK_METHOD(TerminationPredicatePtr, create,
               (Envoy::TimeSource & time_source, Envoy::Stats::Scope& scope,
-               const Envoy::MonotonicTime scheduled_starting_time),
+               const Envoy::MonotonicTime scheduled_starting_time,
+               std::optional<std::chrono::seconds> duration_override),
               (const, override));
 };
 

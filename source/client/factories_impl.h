@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <optional>
+
 #include "envoy/api/api.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/upstream/cluster_manager.h"
@@ -44,8 +47,9 @@ public:
   SequencerPtr create(Envoy::TimeSource& time_source, Envoy::Event::Dispatcher& dispatcher,
                       const SequencerTarget& sequencer_target,
                       TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope,
-                      const Envoy::MonotonicTime scheduled_starting_time,
-                      Envoy::Api::Api& api) const override;
+                      const Envoy::MonotonicTime scheduled_starting_time, Envoy::Api::Api& api,
+                      std::optional<uint32_t> requests_per_second_override =
+                          std::nullopt) const override;
 
 private:
   /**
@@ -105,8 +109,10 @@ class TerminationPredicateFactoryImpl : public OptionBasedFactoryImpl,
                                         public TerminationPredicateFactory {
 public:
   TerminationPredicateFactoryImpl(const Options& options);
-  TerminationPredicatePtr create(Envoy::TimeSource& time_source, Envoy::Stats::Scope& scope,
-                                 const Envoy::MonotonicTime scheduled_starting_time) const override;
+  TerminationPredicatePtr
+  create(Envoy::TimeSource& time_source, Envoy::Stats::Scope& scope,
+         const Envoy::MonotonicTime scheduled_starting_time,
+         std::optional<std::chrono::seconds> duration_override = std::nullopt) const override;
   TerminationPredicate* linkConfiguredPredicates(
       TerminationPredicate& last_predicate, const TerminationPredicateMap& predicates,
       const TerminationPredicate::Status termination_status, Envoy::Stats::Scope& scope) const;

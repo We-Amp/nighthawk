@@ -444,6 +444,20 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    # FORK-ONLY (We-Amp): multi-phase run tests (M2 A1 Task 3): boundary
+    # drain, non-exiting stop, phase events, plus PhaseOrchestrator unit
+    # tests. envoy_cc_test: needs ProcessImpl and the output collector.
+    name = "phase_run_test",
+    srcs = ["phase_run_test.cc"],
+    deps = [
+        "//source/client:nighthawk_client_lib",
+        "//source/client:phase_orchestrator_lib",
+        "//test/test_common:environment_lib",
+        "@envoy//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "process_test",
     srcs = ["process_test.cc"],
     deps = [

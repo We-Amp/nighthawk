@@ -1,4 +1,5 @@
 #include <chrono>
+#include <functional>
 #include <memory>
 
 #include "nighthawk/common/exception.h"
@@ -306,6 +307,129 @@ TEST_F(SequencerIntegrationTest, CallbacksDoNotInfluenceTestDuration) {
   // ... but they ought to have not arrived at the Sequencer.
   EXPECT_EQ(0, sequencer.latencyStatistic().count());
   EXPECT_EQ(0, sequencer.blockedStatistic().count());
+}
+
+// FORK-ONLY (We-Amp): stop-mode tests for the multi-phase sequencer (M2 A1).
+// Whether stop() exits the dispatcher is exactly what these tests pin: the
+// legacy stop keeps today's exit-at-stop behavior, the phase path stops
+// without exiting so the worker dispatcher survives the boundary.
+class SequencerStopModeTest : public SequencerTest {
+public:
+  // Timer emulation, as in
+  // SequencerTestWithTimerEmulation::setupDispatcherTimerEmulation(), but with
+  // the dispatcher exit() expectation parameterized: whether stop() exits the
+  // dispatcher is the variable under test here.
+  void setupStopMode(bool expect_dispatcher_exit) {
+    timer1_ = new NiceMock<Envoy::Event::MockTimer>();
+    timer2_ = new NiceMock<Envoy::Event::MockTimer>();
+    EXPECT_CALL(*dispatcher_, createTimer_(_))
+        .WillOnce(Invoke([&](Envoy::Event::TimerCb cb) {
+          timer_cb_1_ = std::move(cb);
+          return timer1_;
+        }))
+        .WillOnce(Invoke([&](Envoy::Event::TimerCb cb) {
+          timer_cb_2_ = std::move(cb);
+          return timer2_;
+        }));
+    EXPECT_CALL(*timer1_, disableTimer()).WillOnce(Invoke([&]() { timer1_set_ = false; }));
+    EXPECT_CALL(*timer2_, disableTimer()).WillOnce(Invoke([&]() { timer2_set_ = false; }));
+    EXPECT_CALL(*timer1_, enableHRTimer(_, _))
+        .WillRepeatedly(Invoke([&](const std::chrono::microseconds,
+                                   const Envoy::ScopeTrackedObject*) { timer1_set_ = true; }));
+    EXPECT_CALL(*timer2_, enableHRTimer(_, _))
+        .WillRepeatedly(Invoke([&](const std::chrono::microseconds,
+                                   const Envoy::ScopeTrackedObject*) { timer2_set_ = true; }));
+    if (expect_dispatcher_exit) {
+      EXPECT_CALL(*dispatcher_, exit()).WillOnce(Invoke([&]() { stopped_ = true; }));
+    } else {
+      EXPECT_CALL(*dispatcher_, exit()).Times(0);
+    }
+    EXPECT_CALL(*dispatcher_, updateApproximateMonotonicTime()).Times(AtLeast(1));
+    simulation_start_ = time_system_.monotonicTime();
+    auto* unsafe_mock_termination_predicate = new MockTerminationPredicate();
+    termination_predicate_ =
+        std::unique_ptr<MockTerminationPredicate>(unsafe_mock_termination_predicate);
+    EXPECT_CALL(*unsafe_mock_termination_predicate, evaluateChain())
+        .WillRepeatedly(Invoke([this]() {
+          return (time_system_.monotonicTime() - simulation_start_) <=
+                         (stop_after_intervals_ * interval_)
+                     ? TerminationPredicate::Status::PROCEED
+                     : TerminationPredicate::Status::TERMINATE;
+        }));
+  }
+
+  // Advances simulated time and fires due timers until `done` holds or the
+  // tick budget runs out. Unlike simulateTimerLoop(), this terminates without
+  // requiring a dispatcher exit: the non-exiting stop never exits, so the
+  // loop bound has to carry the termination here.
+  void driveTimersUntil(const std::function<bool()>& done, int max_ticks = 10000) {
+    for (int i = 0; i < max_ticks && !done(); i++) {
+      time_system_.setMonotonicTime(time_system_.monotonicTime() + NighthawkTimerResolution);
+      if (timer1_set_) {
+        timer1_set_ = false;
+        timer_cb_1_();
+      }
+      if (timer2_set_) {
+        timer2_set_ = false;
+        timer_cb_2_();
+      }
+    }
+  }
+
+  const uint64_t stop_after_intervals_{2};
+
+  TerminationPredicatePtr termination_predicate_;
+  bool dispatcherStopped() const { return stopped_; }
+
+protected:
+  Envoy::MonotonicTime simulation_start_;
+
+private:
+  NiceMock<Envoy::Event::MockTimer>* timer1_{}; // not owned
+  NiceMock<Envoy::Event::MockTimer>* timer2_{}; // not owned
+  Envoy::Event::TimerCb timer_cb_1_;
+  Envoy::Event::TimerCb timer_cb_2_;
+  MockSequencerTarget target_;
+  bool timer1_set_{};
+  bool timer2_set_{};
+  bool stopped_{};
+};
+
+// Legacy regression guard: the default stop path keeps today's exact
+// behavior -- the dispatcher exits when the sequencer stops.
+TEST_F(SequencerStopModeTest, LegacyStopStillExitsDispatcher) {
+  setupStopMode(/*expect_dispatcher_exit=*/true);
+  SequencerImpl sequencer(platform_util_, *dispatcher_, time_system_,
+                          std::make_unique<LinearRateLimiter>(time_system_, frequency_),
+                          sequencer_target_, std::make_unique<StreamingStatistic>(),
+                          std::make_unique<StreamingStatistic>(), SequencerIdleStrategy::SLEEP,
+                          std::move(termination_predicate_), scope_);
+  EXPECT_CALL(platform_util_, sleep(_)).Times(AtLeast(1));
+  sequencer.start();
+  driveTimersUntil([this]() { return dispatcherStopped(); });
+  EXPECT_TRUE(dispatcherStopped());
+  EXPECT_EQ(stop_after_intervals_, sequencer.latencyStatistic().count());
+}
+
+// Regression guard for the exact dispatcher_.exit() hazard named in the A1
+// design: a boundary stop configured for the phase path must NOT exit the
+// dispatcher; the sequencer stops cleanly and the event loop keeps running.
+TEST_F(SequencerStopModeTest, NonExitingStopKeepsDispatcherAlive) {
+  setupStopMode(/*expect_dispatcher_exit=*/false);
+  SequencerImpl sequencer(platform_util_, *dispatcher_, time_system_,
+                          std::make_unique<LinearRateLimiter>(time_system_, frequency_),
+                          sequencer_target_, std::make_unique<StreamingStatistic>(),
+                          std::make_unique<StreamingStatistic>(), SequencerIdleStrategy::SLEEP,
+                          std::move(termination_predicate_), scope_);
+  bool stop_hook_fired = false;
+  sequencer.setExitDispatcherOnStop(false);
+  sequencer.setStopHook([&stop_hook_fired](bool) { stop_hook_fired = true; });
+  EXPECT_CALL(platform_util_, sleep(_)).Times(AtLeast(1));
+  sequencer.start();
+  driveTimersUntil([&stop_hook_fired]() { return stop_hook_fired; });
+  EXPECT_TRUE(stop_hook_fired);
+  EXPECT_FALSE(dispatcherStopped());
+  EXPECT_EQ(stop_after_intervals_, sequencer.latencyStatistic().count());
 }
 
 } // namespace Nighthawk

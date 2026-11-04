@@ -51,6 +51,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
+#include "absl/strings/numbers.h"
 
 // TODO(oschaaf): See if we can leverage a static module registration like Envoy does to avoid the
 // ifdefs in this file.
@@ -92,6 +93,30 @@ public:
   // Determines the concurrency Nighthawk should use based on configuration
   // (options) and the available machine resources.
   static uint32_t determineConcurrency(const Options& options) {
+    // FORK-ONLY (We-Amp): with a phase vector the top-level concurrency is
+    // rejected by validation, so the worker count is the maximum concurrency
+    // declared over the phases. (M2 Task 6 owns the bootstrap-at-max /
+    // start-stop-subset semantics on top of this count; until then every
+    // phase runs on every worker.)
+    if (options.hasPhaseVector()) {
+      uint32_t declared_max = 0;
+      bool any_declared = false;
+      for (const nighthawk::client::PhaseSpec& phase : options.phases()) {
+        uint32_t value = 0;
+        if (phase.has_concurrency() && absl::SimpleAtoi(phase.concurrency().value(), &value) &&
+            value > 0) {
+          declared_max = std::max(declared_max, value);
+          any_declared = true;
+        }
+      }
+      if (any_declared) {
+        ENVOY_LOG(info, "Starting {} threads / event loops (max over phase concurrencies).",
+                  declared_max);
+        return declared_max;
+      }
+      // No phase declares a concurrency: fall through to the legacy
+      // determination below.
+    }
     bool autoscale = options.concurrency() == "auto";
     uint32_t concurrency;
     if (autoscale) {
@@ -772,9 +797,17 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
         first_worker_start + (inter_worker_delay * worker_number), tracer_,
         options_.simpleWarmup() ? ClientWorkerImpl::HardCodedWarmupStyle::ON
                                 : ClientWorkerImpl::HardCodedWarmupStyle::OFF,
-        std::move(*plugins), live_partial_cb, live_snapshot_interval));
+        std::move(*plugins), live_partial_cb, live_snapshot_interval,
+        /*phase_driven_run=*/options_.hasPhaseVector()));
+    if (options_.hasPhaseVector()) {
+      // FORK-ONLY (We-Amp): the phase orchestrator waits on these before
+      // posting the first begin-phase: begin-phase must not land while a
+      // worker is still in its warmup's nested dispatcher run.
+      worker_ready_futures_.push_back(workers_.back()->readyFuture());
+    }
     worker_number++;
   }
+
   return absl::OkStatus();
 }
 
@@ -783,6 +816,75 @@ void ProcessImpl::recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapsho
     std::lock_guard<std::mutex> lock(live_partials_mutex_);
     live_partials_.push_back(std::move(partial));
   }
+}
+
+void ProcessImpl::setCurrentPhaseId(absl::string_view phase_id) {
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  current_phase_id_ = std::string(phase_id);
+}
+
+std::string ProcessImpl::currentPhaseId() const {
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  return current_phase_id_;
+}
+
+void ProcessImpl::emitPhaseEvent(const PhaseEvent& event) {
+  ENVOY_LOG(debug, "phase event: index {} ('{}') wall {} monotonic {}", event.phase_index,
+            event.phase_id, event.wall_time_unix_ns, event.monotonic_ns);
+  if (phase_event_cb_ != nullptr) {
+    phase_event_cb_(event);
+  }
+}
+
+// FORK-ONLY (We-Amp): the multi-phase run loop. Threading contract (M2 A1):
+// this runs on the run-calling thread, adds no thread of its own. All
+// cross-thread traffic is one-way posts into worker dispatchers plus drain
+// promises completed from the worker side; a worker dispatcher NEVER blocks
+// on another worker or on the orchestrator. The only blocking wait in the
+// system is the orchestrator's bounded future collection (deadline =
+// --timeout), and it can always time out. The boundary drain is
+// non-destructive (spec 8.6): no connection operations of any kind, no
+// drainConnections/DrainAndDelete -- that stays reserved for final
+// terminate().
+void ProcessImpl::runPhases() {
+  const std::chrono::milliseconds drain_budget(options_.timeout());
+  PhaseOrchestrator orchestrator(
+      options_.phases(), [this](const PhaseEvent& event) { emitPhaseEvent(event); });
+  // Every worker must have finished thread-local initialization and entered
+  // its dispatcher loop before the first begin-phase post (the warmup's
+  // nested dispatcher run must not pick it up). These futures always
+  // complete; the wait here is bounded in practice by worker init.
+  for (const std::shared_future<void>& ready : worker_ready_futures_) {
+    ready.wait();
+  }
+
+  for (uint32_t phase_index = 0; phase_index < orchestrator.phaseCount(); ++phase_index) {
+    const nighthawk::client::PhaseSpec& phase = orchestrator.phase(phase_index);
+    setCurrentPhaseId(phase.name());
+    orchestrator.markNextPhaseStarted(phase_index);
+    const bool final_phase = orchestrator.isFinalPhase(phase_index);
+    std::vector<std::future<PhaseDrainAck>> drain_acks;
+    for (auto& worker : workers_) {
+      drain_acks.push_back(worker->beginPhaseAsync(phase_index, phase, final_phase));
+    }
+    if (final_phase) {
+      // The final phase keeps today's exact behavior: its sequencer stops
+      // with the legacy exit-at-stop, and the workers are joined like any
+      // legacy run.
+      for (auto& worker : workers_) {
+        worker->waitForCompletion();
+      }
+      orchestrator.markFinalPhaseComplete();
+    } else {
+      // The boundary: sequencers stop without exiting the dispatcher
+      // (worker side), then a bounded non-destructive wait for in-flight
+      // completion per worker. A deadline miss is censored and recorded;
+      // the run continues into the next phase either way.
+      orchestrator.collectDrainAcks(drain_acks, drain_budget, phase_index);
+    }
+  }
+
+  boundary_timings_ = orchestrator.boundaryTimings();
 }
 
 nighthawk::client::LiveSnapshot ProcessImpl::toLiveSnapshot() {
@@ -845,7 +947,7 @@ nighthawk::client::LiveSnapshot ProcessImpl::toLiveSnapshot() {
   }
   last_live_snapshot_monotonic_ns_ = monotonic_ns;
   snapshot.set_monotonic_ns(monotonic_ns);
-  snapshot.set_phase_id("main");
+  snapshot.set_phase_id(currentPhaseId());
   snapshot.set_epoch_id(options_.executionId().value_or(""));
   return snapshot;
 }
@@ -1207,8 +1309,18 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
     return false;
   }
 
-  for (auto& w : workers_) {
-    w->waitForCompletion();
+  if (options_.hasPhaseVector()) {
+    // FORK-ONLY (We-Amp): multi-phase run. The orchestrator drives the phase
+    // boundaries from this thread (the run-calling thread that today joins
+    // the workers at teardown) and ends by joining the workers, exactly like
+    // the legacy run below.
+
+    runPhases();
+
+  } else {
+    for (auto& w : workers_) {
+      w->waitForCompletion();
+    }
   }
 
   if (!options_.statsSinks().empty() && flush_worker_ != nullptr) {
@@ -1266,6 +1378,44 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
     collector.addResult("global", mergeWorkerStatistics(workers_), counters,
                         total_execution_duration / workers_.size(), first_acquisition_time,
                         global_user_defined_outputs);
+  }
+  if (options_.hasPhaseVector()) {
+    // FORK-ONLY (We-Amp): per-phase result groups. The full per-phase output
+    // dimension (phase ids on Result, PhaseMetadata, fresh per-phase
+    // benchmark-client statistics) is M2 Task 4; these groups already give a
+    // multi-phase run observable, phase-keyed sequencer results, merged over
+    // the workers.
+    for (uint32_t phase_index = 0; phase_index < options_.phases().size(); ++phase_index) {
+      std::vector<StatisticPtr> merged;
+      std::chrono::nanoseconds total_phase_duration = 0ns;
+      uint32_t contributing_workers = 0;
+      for (auto& worker : workers_) {
+        const std::vector<StatisticPtrMap>& phase_statistics = worker->phaseStatistics();
+        if (phase_index >= phase_statistics.size() ||
+            phase_index >= worker->phaseExecutionDurations().size()) {
+          continue;
+        }
+        if (merged.empty()) {
+          merged = vectorizeStatisticPtrMap(phase_statistics[phase_index]);
+        } else {
+          uint32_t j = 0;
+          for (const auto& [id, statistic] : phase_statistics[phase_index]) {
+            merged[j] = merged[j]->combine(*statistic);
+            merged[j]->setId(id);
+            j++;
+          }
+        }
+        total_phase_duration +=
+            std::chrono::nanoseconds(worker->phaseExecutionDurations()[phase_index]);
+        contributing_workers++;
+      }
+      if (contributing_workers == 0) {
+        continue;
+      }
+      collector.addResult(
+          fmt::format("phase_{}_{}", phase_index, options_.phases()[phase_index].name()), merged,
+          {}, total_phase_duration / contributing_workers, std::nullopt, {});
+    }
   }
   if (counters.find("sequencer.failed_terminations") == counters.end()) {
     return true;

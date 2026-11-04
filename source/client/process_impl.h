@@ -1,8 +1,10 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 
 #include "absl/container/flat_hash_map.h"
 
@@ -46,6 +48,7 @@
 
 #include "source/client/benchmark_client_impl.h"
 #include "source/client/factories_impl.h"
+#include "source/client/phase_orchestrator.h"
 #include "source/client/flush_worker_impl.h"
 #include "source/client/process_bootstrap.h"
 
@@ -109,6 +112,23 @@ public:
 
   bool requestExecutionCancellation() override;
 
+  // FORK-ONLY (We-Amp): multi-phase support (M2 A1). The callback fires on
+  // the run-calling thread at each phase boundary the orchestrator marks;
+  // the TUI's phase timeline and window alignment (M2 Task 7) consume these
+  // engine-emitted (wall, monotonic) clock pairs.
+  void setPhaseEventCallback(std::function<void(const PhaseEvent&)> callback) {
+    phase_event_cb_ = std::move(callback);
+  }
+
+  /**
+   * FORK-ONLY (We-Amp): per-boundary drain bookkeeping (drain duration, idle
+   * gap, censoring) recorded by the phase orchestrator during the last run.
+   * Feeds the per-phase output metadata (M2 Task 4).
+   */
+  const std::vector<PhaseBoundaryTiming>& phaseBoundaryTimings() const {
+    return boundary_timings_;
+  }
+
 private:
   // Use CreateProcessImpl to construct an instance of ProcessImpl.
   ProcessImpl(const Options& options, Envoy::Event::TimeSystem& time_system,
@@ -147,6 +167,19 @@ private:
   // Workers push from their own dispatcher threads; the service's collector
   // thread drains via toLiveSnapshot().
   void recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapshotPartial partial);
+  // FORK-ONLY (We-Amp): multi-phase run loop. Runs on the run-calling thread
+  // (the thread that today joins the workers at teardown); posts begin-phase
+  // onto each active worker's own dispatcher and waits each boundary's
+  // per-worker drain futures with a shared deadline of --timeout.
+  void runPhases();
+  void emitPhaseEvent(const PhaseEvent& event);
+  void setCurrentPhaseId(absl::string_view phase_id);
+  std::string currentPhaseId() const;
+  std::function<void(const PhaseEvent&)> phase_event_cb_;
+  std::vector<PhaseBoundaryTiming> boundary_timings_;
+  std::vector<std::shared_future<void>> worker_ready_futures_;
+  mutable std::mutex current_phase_id_mutex_;
+  std::string current_phase_id_{"main"};
   std::mutex live_partials_mutex_;
   std::vector<nighthawk::client::WorkerLiveSnapshotPartial> live_partials_;
   // Running latest per-worker counter values and statistic summaries. Each
