@@ -129,6 +129,14 @@ public:
     return boundary_timings_;
   }
 
+  /**
+   * FORK-ONLY (We-Amp): per-phase counts of starts refused by the per-phase
+   * in-flight gates (M2 Task 5 refuse-and-count ruling: shed, never queued),
+   * folded over all workers after the phase loop. One entry per phase in
+   * order; feeds the per-phase output metadata (M2 Task 4).
+   */
+  const std::vector<uint64_t>& phaseGateExceededCounts() const { return phase_gate_exceeded_; }
+
 private:
   // Use CreateProcessImpl to construct an instance of ProcessImpl.
   ProcessImpl(const Options& options, Envoy::Event::TimeSystem& time_system,
@@ -175,8 +183,16 @@ private:
   void emitPhaseEvent(const PhaseEvent& event);
   void setCurrentPhaseId(absl::string_view phase_id);
   std::string currentPhaseId() const;
+  // FORK-ONLY (We-Amp): the raise-only runtime breaker override arm (M2
+  // Task 5, per the M2 Task 1 gate verdict). Runs on the run-calling thread
+  // (the main thread: loadNewSnapshot asserts it) and must complete before
+  // the phase's begin-phase posts so every worker installs the new snapshot
+  // before its first phase work (per-dispatcher FIFO). Single caller: the
+  // orchestrator is the only mergeValues caller in the process.
+  void applyPhaseBreakerOverrides(const PhaseResourceLimits& desired_limits);
   std::function<void(const PhaseEvent&)> phase_event_cb_;
   std::vector<PhaseBoundaryTiming> boundary_timings_;
+  std::vector<uint64_t> phase_gate_exceeded_;
   std::vector<std::shared_future<void>> worker_ready_futures_;
   mutable std::mutex current_phase_id_mutex_;
   std::string current_phase_id_{"main"};

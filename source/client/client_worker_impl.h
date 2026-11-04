@@ -132,6 +132,7 @@ public:
   const std::vector<int64_t>& phaseExecutionDurations() const override {
     return phase_execution_durations_;
   }
+  std::vector<uint64_t> phaseGateExceededCounts() const override;
 
 protected:
   void work() override;
@@ -184,6 +185,12 @@ private:
   std::vector<PhasePtr> phases_history_;
   std::vector<StatisticPtrMap> phase_statistics_;
   std::vector<int64_t> phase_execution_durations_;
+  // FORK-ONLY (We-Amp): per-phase gate bookkeeping (M2 Task 5). One snapshot
+  // of the benchmark client's cumulative gate-refusal count per begun phase,
+  // taken on this worker's dispatcher at begin-phase (all prior phase work
+  // has completed by then); phaseGateExceededCounts() derives the per-phase
+  // refusal counts from the snapshots.
+  std::vector<uint64_t> phase_gate_exceeded_starts_;
   std::promise<void> ready_promise_;
   std::shared_future<void> ready_future_;
   // Created on the orchestrator thread in beginPhaseAsync (before the post,

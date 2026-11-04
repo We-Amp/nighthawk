@@ -181,6 +181,14 @@ bool BenchmarkClientHttpImpl::tryStartRequest(CompletionCallback caller_completi
     if (requests_initiated_ - requests_completed_ >= max_in_flight) {
       // When we allow client-side queueing, we want to have a sense of time spend waiting on that
       // queue. So we return false here to indicate we couldn't initiate a new request.
+      if (count_gate_exceeded_) {
+        // FORK-ONLY (We-Amp): refuse-and-count (M2 Task 5): a start refused by
+        // the per-phase in-flight gates is shed, never queued -- queueing the
+        // refusal would silently convert open loop into closed loop and
+        // distort the measurement. Surfaced as gate_exceeded in the per-phase
+        // metadata (M2 Task 4).
+        requests_gate_exceeded_++;
+      }
       return false;
     }
   }

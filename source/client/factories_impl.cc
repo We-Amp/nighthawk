@@ -61,11 +61,20 @@ BenchmarkClientPtr BenchmarkClientFactoryImpl::create(
                                      std::make_unique<SinkableHdrStatistic>(scope, worker_id));
   auto benchmark_client = std::make_unique<BenchmarkClientHttpImpl>(
       api, dispatcher, scope, statistic, options_.protocol(), cluster_manager, tracer, cluster_name,
-      request_generator.get(), !options_.openLoop(), options_.responseHeaderWithLatencyInput(),
-      std::move(user_defined_output_plugins));
+      request_generator.get(),
+      // FORK-ONLY (We-Amp): with a phase vector the in-flight gates are
+      // active regardless of open-loop mode (M2 Task 5: phase boundaries are
+      // not live turns -- the gates enforce the phase's declared ceiling).
+      !options_.openLoop() || options_.hasPhaseVector(),
+      options_.responseHeaderWithLatencyInput(), std::move(user_defined_output_plugins));
   benchmark_client->setConnectionLimit(options_.connections());
   benchmark_client->setMaxPendingRequests(options_.maxPendingRequests());
   benchmark_client->setMaxActiveRequests(options_.maxActiveRequests());
+  // FORK-ONLY (We-Amp): a start refused by the gates is shed and counted --
+  // never queued (M2 Task 5 refuse-and-count ruling). Only phase-driven runs
+  // count: in a legacy closed-loop run a refusal is backpressure (the request
+  // is retried, not shed) and must not count as shed load.
+  benchmark_client->setCountGateExceeded(options_.hasPhaseVector());
   benchmark_client->setMaxRequestsPerConnection(options_.maxRequestsPerConnection());
   benchmark_client->setTimeout(options_.timeout());
 

@@ -47,15 +47,27 @@ int64_t wallNowNs() {
       .count();
 }
 
+// One served request, as observed on the SUT side: wall-clock (start, end).
+struct RequestSpan {
+  int64_t start_ns;
+  int64_t end_ns;
+};
+
 // A minimal HTTP/1.1 server that answers every request with an empty 200
 // response, giving the benchmark real upstream traffic, and records the
 // wall-clock timestamps of every accepted TCP connection: the SUT-side
 // observable for the no-churn-at-the-boundary assertion. Same listener
 // pattern as test/tui_run_feed_test.cc, plus per-connection serving threads
-// so concurrent pool connections don't stall each other.
+// so concurrent pool connections don't stall each other. An optional
+// per-request delay turns it into a slow SUT for the gate tests: with a
+// known service time, the offered load provably exceeds what a phase's
+// in-flight gate admits, so shed load is observable as client-side gate
+// refusals rather than as hidden queueing.
 class CountingTestHttpListener {
 public:
-  CountingTestHttpListener() {
+  explicit CountingTestHttpListener(std::chrono::microseconds request_delay =
+                                        std::chrono::microseconds::zero())
+      : request_delay_(request_delay) {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     EXPECT_NE(listen_fd_, -1);
     int one = 1;
@@ -92,6 +104,13 @@ public:
     return accepts_;
   }
 
+  // SUT-side request spans (start, end wall ns), for per-phase concurrency
+  // and completion-count observations.
+  std::vector<RequestSpan> requestSpans() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return spans_;
+  }
+
 private:
   void acceptLoop() {
     while (true) {
@@ -103,11 +122,11 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         accepts_.push_back(wallNowNs());
       }
-      connection_workers_.emplace_back([fd]() { serve(fd); });
+      connection_workers_.emplace_back([this, fd]() { serve(fd); });
     }
   }
 
-  static void serve(int fd) {
+  void serve(int fd) {
     static constexpr absl::string_view kResponse = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     std::string buffer;
     char chunk[4096];
@@ -115,7 +134,17 @@ private:
       size_t request_end;
       while ((request_end = buffer.find("\r\n\r\n")) != std::string::npos) {
         buffer.erase(0, request_end + 4);
-        if (!sendAll(fd, kResponse)) {
+        const int64_t start_ns = wallNowNs();
+        if (request_delay_ > std::chrono::microseconds::zero()) {
+          // NO_CHECK_FORMAT(real_time)
+          std::this_thread::sleep_for(request_delay_);
+        }
+        const bool sent = sendAll(fd, kResponse);
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          spans_.push_back(RequestSpan{start_ns, wallNowNs()});
+        }
+        if (!sent) {
           ::close(fd);
           return;
         }
@@ -143,10 +172,12 @@ private:
 
   int listen_fd_{-1};
   uint16_t port_{0};
+  std::chrono::microseconds request_delay_{std::chrono::microseconds::zero()};
   std::thread thread_;
   std::vector<std::thread> connection_workers_;
   mutable std::mutex mutex_;
   std::vector<int64_t> accepts_;
+  std::vector<RequestSpan> spans_;
 };
 
 // Two 2s phases on one worker: a warm phase at rps 50, then a phase at rps
@@ -176,6 +207,8 @@ public:
     std::vector<PhaseEvent> events;
     std::vector<PhaseBoundaryTiming> boundary_timings;
     std::vector<nighthawk::client::LiveSnapshot> live_snapshots;
+    // FORK-ONLY (M2 Task 5): per-phase counts of gate-refused starts.
+    std::vector<uint64_t> phase_gate_exceeded;
   };
 
   RunOutcome runPhases(const nighthawk::client::CommandLineOptions& cmd_proto,
@@ -222,6 +255,7 @@ public:
     }
     outcome.output = collector.toProto();
     outcome.boundary_timings = process_impl.phaseBoundaryTimings();
+    outcome.phase_gate_exceeded = process_impl.phaseGateExceededCounts();
     process->shutdown();
     return outcome;
   }
@@ -234,11 +268,22 @@ protected:
     return *listener_;
   }
 
+  // A slow SUT (each request holds the connection ~100ms): the gate tests
+  // drive offered load far above the admitted concurrency so shedding is
+  // observable.
+  CountingTestHttpListener& slowListener() {
+    if (!slow_listener_) {
+      slow_listener_ = std::make_unique<CountingTestHttpListener>(std::chrono::milliseconds(100));
+    }
+    return *slow_listener_;
+  }
+
   std::mutex outcome_mutex;
   Envoy::Event::RealTimeSystem time_system_; // NO_CHECK_FORMAT(real_time)
 
 private:
   std::unique_ptr<CountingTestHttpListener> listener_;
+  std::unique_ptr<CountingTestHttpListener> slow_listener_;
 };
 
 // Both phases of a 2-phase vector complete inside one ProcessImpl, presenting
@@ -348,6 +393,159 @@ TEST_F(PhaseRunTest, PhaseEventsCarryClockPairs) {
     EXPECT_GE(outcome.events[i].monotonic_ns, last_monotonic_ns);
     last_wall_ns = outcome.events[i].wall_time_unix_ns;
     last_monotonic_ns = outcome.events[i].monotonic_ns;
+  }
+}
+
+// --- M2 Task 5: per-phase resource limits without rebuilding clusters. ---
+
+// Two 2s phases at rps 100 against a SUT with ~100ms service time: both
+// phases offer far more load than their gates admit. Phase 0 inherits the
+// run-level connections (4); phase 1 declares a lower per-phase connections
+// gate (1). Bootstrap breakers sit at the max across phases (4), so only the
+// client-side gates can realize phase 1's tighter ceiling.
+nighthawk::client::CommandLineOptions makeGateTestOptions(const std::string& uri) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(uri);
+  cmd.mutable_connections()->set_value(4);
+  cmd.mutable_timeout()->set_seconds(5);
+  const char* names[] = {"gate_phase0", "gate_phase1"};
+  for (uint32_t i = 0; i < 2; ++i) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(names[i]);
+    phase->mutable_duration()->set_seconds(2);
+    phase->set_requests_per_second(100);
+    phase->mutable_concurrency()->set_value("1");
+  }
+  cmd.mutable_phases(1)->mutable_connections()->set_value(1);
+  return cmd;
+}
+
+nighthawk::client::CommandLineOptions makeThreePhaseOptions(const std::string& uri) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(uri);
+  cmd.mutable_connections()->set_value(4);
+  cmd.mutable_timeout()->set_seconds(5);
+  for (uint32_t i = 0; i < 3; ++i) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(fmt::format("phase{}", i));
+    phase->mutable_duration()->set_seconds(2);
+    phase->set_requests_per_second(50);
+    phase->mutable_concurrency()->set_value("1");
+  }
+  return cmd;
+}
+
+// Completions observed SUT-side within [from_ns, to_ns].
+int completionsInWindow(const std::vector<RequestSpan>& spans, int64_t from_ns, int64_t to_ns) {
+  int completions = 0;
+  for (const RequestSpan& span : spans) {
+    if (span.end_ns >= from_ns && span.end_ns <= to_ns) {
+      completions++;
+    }
+  }
+  return completions;
+}
+
+// Max requests the SUT served concurrently within [from_ns, to_ns].
+int maxConcurrentInWindow(const std::vector<RequestSpan>& spans, int64_t from_ns, int64_t to_ns) {
+  int max_concurrent = 0;
+  for (const RequestSpan& span : spans) {
+    if (span.end_ns < from_ns || span.start_ns > to_ns) {
+      continue;
+    }
+    int concurrent = 0;
+    for (const RequestSpan& other : spans) {
+      if (other.end_ns < from_ns || other.start_ns > to_ns) {
+        continue;
+      }
+      if (other.start_ns <= span.start_ns && other.end_ns >= span.start_ns) {
+        concurrent++;
+      }
+    }
+    max_concurrent = std::max(max_concurrent, concurrent);
+  }
+  return max_concurrent;
+}
+
+// The per-phase client-side gate is enforced even though the bootstrapped
+// breakers allow more: with a ~100ms SUT, phase 1's gate of one admitted
+// request yields roughly a tenth of phase 0's completions (gate 4), and the
+// SUT never observes the phase-1 offered load being served concurrently.
+TEST_F(PhaseRunTest, PhaseGateEnforcedClientSide) {
+  RunOutcome outcome = runPhases(makeGateTestOptions(slowListener().uri()));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(4u, outcome.events.size());
+
+  const int64_t phase0_from = outcome.events[0].wall_time_unix_ns;
+  const int64_t phase0_to = outcome.events[1].wall_time_unix_ns;
+  const int64_t phase1_from = outcome.events[2].wall_time_unix_ns;
+  const int64_t phase1_to = outcome.events[3].wall_time_unix_ns;
+  const std::vector<RequestSpan> spans = slowListener().requestSpans();
+
+  const int phase0_completions = completionsInWindow(spans, phase0_from, phase0_to);
+  const int phase1_completions = completionsInWindow(spans, phase1_from, phase1_to);
+  // Both phases ran and served traffic through their gates.
+  EXPECT_GE(phase0_completions, 20);
+  EXPECT_GE(phase1_completions, 5);
+  // Phase 1's tighter gate sheds the offered load: its throughput sits well
+  // below phase 0's despite identical rps.
+  EXPECT_LT(phase1_completions, phase0_completions / 2)
+      << "phase 1 throughput not shed by its gate (gate not enforced client-side)";
+  // The SUT never saw more than the gated concurrency in phase 1 (one
+  // admitted in-flight request; 2 admits one transient completion overlap).
+  EXPECT_LE(maxConcurrentInWindow(spans, phase1_from, phase1_to), 2);
+}
+
+// Gate-blocked behavior is refuse-and-count (never queued, never silent):
+// offered load above a phase's gate shows up as gate_exceeded counts while
+// completions stay bounded by the gated capacity.
+TEST_F(PhaseRunTest, GateExceededCountedNotQueued) {
+  RunOutcome outcome = runPhases(makeGateTestOptions(slowListener().uri()));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(4u, outcome.events.size());
+  ASSERT_EQ(2u, outcome.phase_gate_exceeded.size());
+
+  // Both phases offer ~100 rps against ~40/s (gate 4) and ~10/s (gate 1)
+  // capacity: refusals are counted in both, visibly in the tight phase.
+  EXPECT_GT(outcome.phase_gate_exceeded[0], 0u);
+  EXPECT_GT(outcome.phase_gate_exceeded[1], 0u)
+      << "gate-refused starts were neither shed-and-counted nor enforced";
+
+  const int64_t phase1_from = outcome.events[2].wall_time_unix_ns;
+  const int64_t phase1_to = outcome.events[3].wall_time_unix_ns;
+  const int phase1_completions =
+      completionsInWindow(slowListener().requestSpans(), phase1_from, phase1_to);
+  // Bounded by the gated capacity (~10/s x 2s), not by the offered load: no
+  // queue absorbed the excess (an unbounded queue would distort the
+  // measurement; the refusals above prove the excess was shed).
+  EXPECT_GT(phase1_completions, 0);
+  EXPECT_LE(phase1_completions, 35);
+}
+
+// Review Focus 1 guard against the addOrUpdateCluster temptation: across a
+// three-phase run, the cluster set must be untouched at every boundary --
+// observable SUT-side as zero connection churn in either boundary window,
+// with both boundaries recorded uncensored.
+TEST_F(PhaseRunTest, NoClusterMutationAtBoundaries) {
+  RunOutcome outcome = runPhases(makeThreePhaseOptions(listener().uri()));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(6u, outcome.events.size());
+  ASSERT_EQ(2u, outcome.boundary_timings.size());
+
+  const int64_t window_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(250ms).count();
+  for (uint32_t boundary = 0; boundary < 2; ++boundary) {
+    EXPECT_FALSE(outcome.boundary_timings[boundary].drain_censored);
+    const int64_t drain_complete_ns = outcome.events[2 * boundary + 1].wall_time_unix_ns;
+    const int64_t next_start_ns = outcome.events[2 * boundary + 2].wall_time_unix_ns;
+    int accepts_in_window = 0;
+    for (const int64_t accept_ns : listener().acceptTimestamps()) {
+      if (accept_ns >= drain_complete_ns - window_ns && accept_ns <= next_start_ns + window_ns) {
+        accepts_in_window++;
+      }
+    }
+    EXPECT_EQ(0, accepts_in_window)
+        << "connection churn at boundary " << boundary
+        << " (cluster mutation / destructive drain violation)";
   }
 }
 

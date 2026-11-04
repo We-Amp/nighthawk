@@ -60,6 +60,31 @@ public:
   virtual uint64_t inFlightRequests() const PURE;
 
   /**
+   * FORK-ONLY (We-Amp): per-phase in-flight gates (M2 Task 5). The gates
+   * realize a phase's declared ceilings on top of circuit breakers that were
+   * bootstrapped once at the max across phases: a start the gate refuses is
+   * shed and counted (gateExceededCount), never queued -- an unbounded queue
+   * would silently convert open loop into closed loop and distort the
+   * measurement. The orchestrator applies the phase's effective values on the
+   * worker dispatcher before the phase's sequencer starts.
+   */
+  virtual void setConnectionLimit(uint32_t connection_limit) PURE;
+  virtual void setMaxPendingRequests(uint32_t max_pending_requests) PURE;
+  virtual void setMaxActiveRequests(uint32_t max_active_requests) PURE;
+  /**
+   * FORK-ONLY (We-Amp): enables the gate-refusal count. Only phase-driven
+   * runs enable it: in a legacy closed-loop run a refusal is backpressure
+   * (the request is retried, not shed) and must not count as shed load.
+   */
+  virtual void setCountGateExceeded(bool count_gate_exceeded) PURE;
+  /**
+   * FORK-ONLY (We-Amp): the cumulative count of starts refused by the
+   * in-flight gates since run start (only incremented when
+   * setCountGateExceeded(true)).
+   */
+  virtual uint64_t gateExceededCount() const PURE;
+
+  /**
    * @return const Envoy::Stats::Scope& the statistics scope associated the benchmark client.
    */
   virtual Envoy::Stats::Scope& scope() const PURE;

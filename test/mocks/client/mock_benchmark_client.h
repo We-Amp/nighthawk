@@ -16,6 +16,11 @@ public:
   MOCK_METHOD(StatisticPtrMap, statistics, (), (const, override));
   MOCK_METHOD(bool, tryStartRequest, (Client::CompletionCallback), (override));
   MOCK_METHOD(uint64_t, inFlightRequests, (), (const, override));
+  MOCK_METHOD(void, setConnectionLimit, (uint32_t), (override));
+  MOCK_METHOD(void, setMaxPendingRequests, (uint32_t), (override));
+  MOCK_METHOD(void, setMaxActiveRequests, (uint32_t), (override));
+  MOCK_METHOD(void, setCountGateExceeded, (bool), (override));
+  MOCK_METHOD(uint64_t, gateExceededCount, (), (const, override));
   MOCK_METHOD(Envoy::Stats::Scope&, scope, (), (const, override));
   MOCK_METHOD(bool, shouldMeasureLatencies, (), (const, override));
   MOCK_METHOD(const Envoy::Http::RequestHeaderMap&, requestHeaders, (), (const));

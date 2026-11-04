@@ -13,6 +13,9 @@
 #include <string>
 #include <vector>
 
+#include "absl/container/node_hash_map.h"
+#include "absl/strings/string_view.h"
+
 #include "nighthawk/client/options.h"
 #include "nighthawk/common/uri.h"
 
@@ -24,7 +27,52 @@
 
 #include "source/common/uri_impl.h"
 
+#include "api/client/options.pb.h"
+
 namespace Nighthawk {
+
+// FORK-ONLY (We-Amp): per-phase resource limits (M2 A1 Task 5). The three
+// in-flight ceilings a phase declares (or inherits from the run-level options
+// when a field is absent) drive both the breaker bootstrap (at the max across
+// phases) and the client-side gates (per phase).
+struct PhaseResourceLimits {
+  uint32_t connections;
+  uint32_t max_pending_requests;
+  uint32_t max_active_requests;
+};
+
+/**
+ * Effective resource limits for one phase: the PhaseSpec's declared value
+ * when present, the run-level option's value inherited when absent.
+ * `phase == nullptr` yields the run-level limits themselves.
+ */
+PhaseResourceLimits phaseResourceLimits(const Client::Options& options,
+                                        const nighthawk::client::PhaseSpec* phase);
+
+/**
+ * The max of each limit across the phase vector (run-level limits for legacy
+ * vector-less runs): the values the circuit breakers bootstrap with. The
+ * clusters are built once at bootstrap and never touched again at phase
+ * boundaries, so every phase's ceiling can never exceed the bootstrapped
+ * breaker capacity.
+ */
+PhaseResourceLimits maxPhaseResourceLimits(const Client::Options& options);
+
+/**
+ * Raise-only runtime breaker overrides (M2 Task 1 gate verdict: FEASIBLE-WITH-
+ * CAVEATS -- the override REPLACES the effective value, so the raise-only rule
+ * is caller-enforced). Produces Envoy runtime entries for cluster
+ * `cluster_name` (the worker target clusters are named "0", "1", ...;
+ * `circuit_breakers.<cluster>.default.max_connections|max_pending_requests|
+ * max_requests`) wherever `desired_limits` exceeds `bootstrap_limits`. Values
+ * at or below the bootstrap max produce no entry: merging them would be a
+ * no-op at best, and a lowering attempt is refused by omission -- the
+ * bootstrapped breaker capacity is never undercut.
+ */
+absl::node_hash_map<std::string, std::string>
+raiseOnlyBreakerOverrides(absl::string_view cluster_name,
+                          const PhaseResourceLimits& bootstrap_limits,
+                          const PhaseResourceLimits& desired_limits);
 
 /**
  * Creates Envoy bootstrap configuration.

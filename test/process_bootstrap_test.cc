@@ -1,6 +1,8 @@
 #include <string>
 #include <vector>
 
+#include "absl/container/node_hash_map.h"
+
 #include "nighthawk/common/uri.h"
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.validate.h"
@@ -34,7 +36,9 @@ using ::Envoy::StatusHelpers::StatusIs;
 using ::testing::_;
 using ::testing::Invoke;
 using ::testing::NiceMock;
+using ::testing::Pair;
 using ::testing::Return;
+using ::testing::UnorderedElementsAre;
 
 // Parses text into Bootstrap.
 absl::StatusOr<Bootstrap> parseBootstrapFromText(const std::string& bootstrap_text) {
@@ -2148,6 +2152,99 @@ stats_server_version_override {
                                               encap_port));
   ASSERT_THAT(expected_bootstrap, StatusIs(absl::StatusCode::kOk));
   EXPECT_THAT(*encap_bootstrap, EqualsProto(*expected_bootstrap));
+}
+
+// FORK-ONLY (We-Amp): M2 Task 5 -- per-phase resource limits without
+// rebuilding clusters. With a phase vector, the circuit breakers bootstrap at
+// the max of each limit across the phases (each over its declared PhaseSpec
+// value or the inherited run-level value); the clusters are built once here
+// and never touched again at phase boundaries (addOrUpdateCluster is
+// forbidden for transitions). Per-phase pressure below the bootstrap max is
+// the client-side gates' job (see phase_run_test.cc).
+TEST_F(CreateBootstrapConfigurationTest, BootstrapBreakersAtMaxAcrossPhases) {
+  setupUriResolutionExpectations();
+
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value("http://www.example.org");
+  // Run-level values, inherited by phases that omit a field.
+  cmd.mutable_connections()->set_value(10);
+  cmd.mutable_max_active_requests()->set_value(20);
+  // Rising then falling across the phases, connections included: the
+  // bootstrap must carry the max either way.
+  nighthawk::client::PhaseSpec* phase0 = cmd.add_phases();
+  phase0->set_name("low");
+  phase0->mutable_duration()->set_seconds(1);
+  phase0->set_requests_per_second(1);
+  phase0->mutable_connections()->set_value(5);
+  phase0->mutable_max_pending_requests()->set_value(7);
+  phase0->mutable_max_active_requests()->set_value(9);
+  nighthawk::client::PhaseSpec* phase1 = cmd.add_phases();
+  phase1->set_name("high");
+  phase1->mutable_duration()->set_seconds(1);
+  phase1->set_requests_per_second(1);
+  phase1->mutable_connections()->set_value(50);
+  phase1->mutable_max_pending_requests()->set_value(30);
+  phase1->mutable_max_active_requests()->set_value(40);
+  nighthawk::client::PhaseSpec* phase2 = cmd.add_phases();
+  phase2->set_name("falling");
+  phase2->mutable_duration()->set_seconds(1);
+  phase2->set_requests_per_second(1);
+  phase2->mutable_connections()->set_value(3);
+  // phase2 omits pending/active: run-level inheritance (0 and 20).
+
+  std::unique_ptr<Client::OptionsImpl> options = std::make_unique<Client::OptionsImpl>(cmd);
+  NiceMock<Envoy::Api::MockApi> api;
+  absl::StatusOr<Bootstrap> bootstrap =
+      createBootstrapConfiguration(mock_dispatcher_, api, *options, mock_dns_resolver_factory_,
+                                   typed_dns_resolver_config_, number_of_workers_);
+  ASSERT_THAT(bootstrap, StatusIs(absl::StatusCode::kOk));
+
+  ASSERT_EQ(1, bootstrap->static_resources().clusters_size());
+  const envoy::config::cluster::v3::Cluster& cluster = bootstrap->static_resources().clusters(0);
+  EXPECT_EQ("0", cluster.name());
+  ASSERT_EQ(1, cluster.circuit_breakers().thresholds_size());
+  const envoy::config::cluster::v3::CircuitBreakers::Thresholds& thresholds =
+      cluster.circuit_breakers().thresholds(0);
+  EXPECT_EQ(50, thresholds.max_connections().value());
+  EXPECT_EQ(30, thresholds.max_pending_requests().value());
+  EXPECT_EQ(40, thresholds.max_requests().value());
+  EXPECT_EQ(0, thresholds.max_retries().value());
+
+  Envoy::MessageUtil::validate(*bootstrap, Envoy::ProtobufMessage::getStrictValidationVisitor());
+}
+
+// FORK-ONLY (We-Amp): the runtime-override arm is raise-only (M2 Task 1 gate
+// verdict: mergeValues REPLACES the effective value, so the raise-only rule
+// is caller-enforced here). A desired ceiling above the bootstrap max merges;
+// at or below it, no entry is produced (a merge would be a no-op at best and
+// a silent lowering at worst -- lowering attempts are refused by omission).
+TEST(RaiseOnlyBreakerOverridesTest, RaisesAboveBootstrap) {
+  Nighthawk::PhaseResourceLimits bootstrap{10, 5, 100};
+  Nighthawk::PhaseResourceLimits desired{25, 5, 200};
+  const absl::node_hash_map<std::string, std::string> overrides =
+      Nighthawk::raiseOnlyBreakerOverrides("0", bootstrap, desired);
+  EXPECT_THAT(overrides,
+              UnorderedElementsAre(
+                  Pair("circuit_breakers.0.default.max_connections", "25"),
+                  Pair("circuit_breakers.0.default.max_requests", "200")));
+}
+
+TEST(RaiseOnlyBreakerOverridesTest, ValuesAtBootstrapProduceNoOverride) {
+  Nighthawk::PhaseResourceLimits bootstrap{10, 5, 100};
+  Nighthawk::PhaseResourceLimits desired{10, 5, 100};
+  const absl::node_hash_map<std::string, std::string> overrides =
+      Nighthawk::raiseOnlyBreakerOverrides("1", bootstrap, desired);
+  EXPECT_TRUE(overrides.empty());
+}
+
+TEST(RaiseOnlyBreakerOverridesTest, LoweringAttemptIsRefused) {
+  Nighthawk::PhaseResourceLimits bootstrap{10, 5, 100};
+  Nighthawk::PhaseResourceLimits desired{4, 1, 50};
+  const absl::node_hash_map<std::string, std::string> overrides =
+      Nighthawk::raiseOnlyBreakerOverrides("2", bootstrap, desired);
+  EXPECT_TRUE(overrides.empty())
+      << "a lowering attempt must never be merged: the override REPLACES the "
+         "effective value, so merging it would undercut the bootstrap max";
 }
 
 } // namespace

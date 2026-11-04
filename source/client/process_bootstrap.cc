@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/str_cat.h"
+
 #include "nighthawk/client/options.h"
 #include "nighthawk/common/uri.h"
 
@@ -22,6 +24,62 @@
 #include "source/common/utility.h"
 
 namespace Nighthawk {
+
+PhaseResourceLimits phaseResourceLimits(const Client::Options& options,
+                                        const nighthawk::client::PhaseSpec* phase) {
+  if (phase == nullptr) {
+    return PhaseResourceLimits{options.connections(), options.maxPendingRequests(),
+                               options.maxActiveRequests()};
+  }
+  const uint32_t connections =
+      phase->has_connections() ? phase->connections().value() : options.connections();
+  const uint32_t max_pending_requests = phase->has_max_pending_requests()
+                                            ? phase->max_pending_requests().value()
+                                            : options.maxPendingRequests();
+  const uint32_t max_active_requests = phase->has_max_active_requests()
+                                           ? phase->max_active_requests().value()
+                                           : options.maxActiveRequests();
+  return PhaseResourceLimits{connections, max_pending_requests, max_active_requests};
+}
+
+PhaseResourceLimits maxPhaseResourceLimits(const Client::Options& options) {
+  if (!options.hasPhaseVector()) {
+    return phaseResourceLimits(options, /*phase=*/nullptr);
+  }
+  PhaseResourceLimits maxima{0, 0, 0};
+  for (const nighthawk::client::PhaseSpec& phase : options.phases()) {
+    const PhaseResourceLimits limits = phaseResourceLimits(options, &phase);
+    maxima.connections = std::max(maxima.connections, limits.connections);
+    maxima.max_pending_requests = std::max(maxima.max_pending_requests, limits.max_pending_requests);
+    maxima.max_active_requests = std::max(maxima.max_active_requests, limits.max_active_requests);
+  }
+  return maxima;
+}
+
+absl::node_hash_map<std::string, std::string>
+raiseOnlyBreakerOverrides(absl::string_view cluster_name,
+                          const PhaseResourceLimits& bootstrap_limits,
+                          const PhaseResourceLimits& desired_limits) {
+  absl::node_hash_map<std::string, std::string> overrides;
+  const auto add_raise_only = [&](absl::string_view key, uint32_t bootstrap_value,
+                                  uint32_t desired_value) {
+    if (desired_value > bootstrap_value) {
+      // FORK-ONLY (We-Amp): raise-only (M2 Task 1 gate verdict): the override
+      // replaces the effective value, so anything at or below the bootstrap
+      // max is omitted -- a lowering attempt is refused by omission and the
+      // bootstrapped breaker capacity is never undercut.
+      overrides[absl::StrCat("circuit_breakers.", cluster_name, ".default.", key)] =
+          absl::StrCat(desired_value);
+    }
+  };
+  add_raise_only("max_connections", bootstrap_limits.connections, desired_limits.connections);
+  add_raise_only("max_pending_requests", bootstrap_limits.max_pending_requests,
+                 desired_limits.max_pending_requests);
+  add_raise_only("max_requests", bootstrap_limits.max_active_requests,
+                 desired_limits.max_active_requests);
+  return overrides;
+}
+
 namespace {
 
 using ::envoy::config::bootstrap::v3::Bootstrap;
@@ -124,15 +182,25 @@ CircuitBreakers createCircuitBreakers(const Client::Options& options) {
   CircuitBreakers circuit_breakers;
   CircuitBreakers::Thresholds* thresholds = circuit_breakers.add_thresholds();
 
+  // FORK-ONLY (We-Amp): with a phase vector the breakers bootstrap at the max
+  // of each limit across the phases (M2 Task 5: limits without rebuilding
+  // clusters -- the clusters are built ONCE here and never touched again at
+  // phase boundaries; addOrUpdateCluster is forbidden for transitions). The
+  // per-phase ceilings below the bootstrap max are enforced by the client
+  // side gates instead.
+  const PhaseResourceLimits limits = options.hasPhaseVector()
+                                         ? maxPhaseResourceLimits(options)
+                                         : phaseResourceLimits(options, /*phase=*/nullptr);
+
   // We do not support any retrying.
   thresholds->mutable_max_retries()->set_value(0);
-  thresholds->mutable_max_connections()->set_value(options.connections());
+  thresholds->mutable_max_connections()->set_value(limits.connections);
 
   // We specialize on 0 below, as that is not supported natively. The benchmark client will track
   // in flight work and avoid creating pending requests in this case.
   thresholds->mutable_max_pending_requests()->set_value(
-      options.maxPendingRequests() == 0 ? 1 : options.maxPendingRequests());
-  thresholds->mutable_max_requests()->set_value(options.maxActiveRequests());
+      limits.max_pending_requests == 0 ? 1 : limits.max_pending_requests);
+  thresholds->mutable_max_requests()->set_value(limits.max_active_requests);
 
   return circuit_breakers;
 }

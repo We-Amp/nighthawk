@@ -225,6 +225,24 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
     drain_watch_->cancel();
     drain_watch_.reset();
   }
+  // FORK-ONLY (We-Amp): per-phase in-flight gates (M2 Task 5). The posted
+  // spec carries the phase's effective values (declared per-phase values,
+  // run-level values inherited when a field was absent); the clusters were
+  // bootstrapped once at the max across phases and are never touched again,
+  // so these client-side gates are what realize the per-phase ceiling. A
+  // start they refuse is shed and counted in tryStartRequest, never queued.
+  // The refusal-count snapshot lands before any of this phase's work runs
+  // (every prior phase's work completed at its boundary drain).
+  phase_gate_exceeded_starts_.push_back(benchmark_client_->gateExceededCount());
+  if (phase_spec.has_connections()) {
+    benchmark_client_->setConnectionLimit(phase_spec.connections().value());
+  }
+  if (phase_spec.has_max_pending_requests()) {
+    benchmark_client_->setMaxPendingRequests(phase_spec.max_pending_requests().value());
+  }
+  if (phase_spec.has_max_active_requests()) {
+    benchmark_client_->setMaxActiveRequests(phase_spec.max_active_requests().value());
+  }
   const Envoy::MonotonicTime phase_start = time_source_->monotonicTime();
   auto termination_predicate = termination_predicate_factory_.create(
       *time_source_, *worker_number_scope_, phase_start,
@@ -273,6 +291,22 @@ void ClientWorkerImpl::startDrainWatch(const int64_t stop_monotonic_ns) {
       *dispatcher_, [this]() { return benchmark_client_->inFlightRequests(); }, drain_promise_,
       stop_monotonic_ns);
   drain_watch_->start();
+}
+
+std::vector<uint64_t> ClientWorkerImpl::phaseGateExceededCounts() const {
+  // Valid to read after the workers have been joined; the cumulative counter
+  // only moves on this worker's dispatcher while a phase's sequencer runs.
+  const uint64_t current = benchmark_client_->gateExceededCount();
+  std::vector<uint64_t> counts;
+  counts.reserve(phase_gate_exceeded_starts_.size());
+  for (size_t i = 0; i < phase_gate_exceeded_starts_.size(); ++i) {
+    const uint64_t phase_end =
+        i + 1 < phase_gate_exceeded_starts_.size() ? phase_gate_exceeded_starts_[i + 1] : current;
+    counts.push_back(phase_end >= phase_gate_exceeded_starts_[i]
+                         ? phase_end - phase_gate_exceeded_starts_[i]
+                         : 0);
+  }
+  return counts;
 }
 
 StatisticPtrMap ClientWorkerImpl::statistics() const {

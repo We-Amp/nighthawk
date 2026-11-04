@@ -93,6 +93,15 @@ public:
                   bool final_phase) PURE;
 
   /**
+   * FORK-ONLY (We-Amp): per-phase counts of starts refused by the per-phase
+   * in-flight gates (M2 Task 5 refuse-and-count ruling: the refusal sheds the
+   * offered load and is counted, never queued). One entry per phase begun by
+   * this worker, in phase order. Valid to read after the workers have been
+   * joined.
+   */
+  virtual std::vector<uint64_t> phaseGateExceededCounts() const PURE;
+
+  /**
    * @return per-phase sequencer statistics retained across the run, one entry
    * per phase begun by this worker, in phase order. Valid to read after the
    * workers have been joined.

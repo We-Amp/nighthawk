@@ -113,13 +113,19 @@ public:
                           const bool provide_resource_backpressure,
                           absl::string_view latency_response_header_name,
                           std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins);
-  void setConnectionLimit(uint32_t connection_limit) { connection_limit_ = connection_limit; }
-  void setMaxPendingRequests(uint32_t max_pending_requests) {
+  void setConnectionLimit(uint32_t connection_limit) override {
+    connection_limit_ = connection_limit;
+  }
+  void setMaxPendingRequests(uint32_t max_pending_requests) override {
     max_pending_requests_ = max_pending_requests;
   }
-  void setMaxActiveRequests(uint32_t max_active_requests) {
+  void setMaxActiveRequests(uint32_t max_active_requests) override {
     max_active_requests_ = max_active_requests;
   }
+  void setCountGateExceeded(bool count_gate_exceeded) override {
+    count_gate_exceeded_ = count_gate_exceeded;
+  }
+  uint64_t gateExceededCount() const override { return requests_gate_exceeded_; }
   void setMaxRequestsPerConnection(uint32_t max_requests_per_connection) {
     max_requests_per_connection_ = max_requests_per_connection;
   }
@@ -174,6 +180,12 @@ private:
   Envoy::Random::RandomGeneratorImpl generator_;
   uint64_t requests_completed_{};
   uint64_t requests_initiated_{};
+  // FORK-ONLY (We-Amp): per-phase gate accounting (M2 Task 5). Started only
+  // for phase-driven runs (setCountGateExceeded); incremented on the worker
+  // dispatcher in tryStartRequest when a start is refused by the in-flight
+  // gates: refuse-and-count, never queue.
+  bool count_gate_exceeded_{false};
+  uint64_t requests_gate_exceeded_{};
   bool measure_latencies_{};
   BenchmarkClientCounters benchmark_client_counters_;
   Envoy::Upstream::ClusterManagerPtr& cluster_manager_;

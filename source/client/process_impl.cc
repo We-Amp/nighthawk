@@ -836,6 +836,35 @@ void ProcessImpl::emitPhaseEvent(const PhaseEvent& event) {
   }
 }
 
+// FORK-ONLY (We-Amp): the raise-only runtime breaker override arm (M2 Task 5,
+// per the M2 Task 1 gate verdict: FEASIBLE-WITH-CAVEATS). With the breakers
+// bootstrapped at the max across phases, a phase vector can never request a
+// ceiling above the bootstrap max, so from the option surface this merge is
+// structurally empty in M2 -- the seam is the verified-warm raise path that a
+// live knob drives from M3. The raise-only rule is enforced in
+// raiseOnlyBreakerOverrides: a lowering attempt is refused by omission, and
+// the bootstrapped breaker capacity is never undercut.
+void ProcessImpl::applyPhaseBreakerOverrides(const PhaseResourceLimits& desired_limits) {
+  if (runtime_loader_ == nullptr) {
+    return;
+  }
+  const PhaseResourceLimits bootstrap_limits = maxPhaseResourceLimits(options_);
+  absl::node_hash_map<std::string, std::string> overrides;
+  for (uint32_t worker_number = 0; worker_number < workers_.size(); ++worker_number) {
+    for (auto& [key, value] : raiseOnlyBreakerOverrides(fmt::format("{}", worker_number),
+                                                        bootstrap_limits, desired_limits)) {
+      overrides[key] = value;
+    }
+  }
+  if (overrides.empty()) {
+    return;
+  }
+  absl::Status status = runtime_loader_->mergeValues(overrides);
+  if (!status.ok()) {
+    ENVOY_LOG(warn, "phase breaker override merge failed: {}", status.message());
+  }
+}
+
 // FORK-ONLY (We-Amp): the multi-phase run loop. Threading contract (M2 A1):
 // this runs on the run-calling thread, adds no thread of its own. All
 // cross-thread traffic is one-way posts into worker dispatchers plus drain
@@ -860,12 +889,24 @@ void ProcessImpl::runPhases() {
 
   for (uint32_t phase_index = 0; phase_index < orchestrator.phaseCount(); ++phase_index) {
     const nighthawk::client::PhaseSpec& phase = orchestrator.phase(phase_index);
+    // FORK-ONLY (We-Amp): effective per-phase limits (M2 Task 5): declared
+    // values when present, run-level values inherited when absent. The posted
+    // spec carries the effective values so the worker's begin-phase applies
+    // the per-phase gates without re-deriving inheritance; the raise-only
+    // breaker override runs before any begin-phase post so every worker
+    // installs the new snapshot before its first phase work.
+    const PhaseResourceLimits limits = phaseResourceLimits(options_, &phase);
+    nighthawk::client::PhaseSpec effective_phase = phase;
+    effective_phase.mutable_connections()->set_value(limits.connections);
+    effective_phase.mutable_max_pending_requests()->set_value(limits.max_pending_requests);
+    effective_phase.mutable_max_active_requests()->set_value(limits.max_active_requests);
+    applyPhaseBreakerOverrides(limits);
     setCurrentPhaseId(phase.name());
     orchestrator.markNextPhaseStarted(phase_index);
     const bool final_phase = orchestrator.isFinalPhase(phase_index);
     std::vector<std::future<PhaseDrainAck>> drain_acks;
     for (auto& worker : workers_) {
-      drain_acks.push_back(worker->beginPhaseAsync(phase_index, phase, final_phase));
+      drain_acks.push_back(worker->beginPhaseAsync(phase_index, effective_phase, final_phase));
     }
     if (final_phase) {
       // The final phase keeps today's exact behavior: its sequencer stops
@@ -881,6 +922,17 @@ void ProcessImpl::runPhases() {
       // completion per worker. A deadline miss is censored and recorded;
       // the run continues into the next phase either way.
       orchestrator.collectDrainAcks(drain_acks, drain_budget, phase_index);
+    }
+  }
+
+  // FORK-ONLY (We-Amp): fold the per-phase gate-refusal counts over all
+  // workers (the workers are joined once the final phase completed; M2 Task
+  // 4's PhaseMetadata surfaces these as gate_exceeded).
+  phase_gate_exceeded_.assign(orchestrator.phaseCount(), 0);
+  for (auto& worker : workers_) {
+    const std::vector<uint64_t> worker_counts = worker->phaseGateExceededCounts();
+    for (size_t i = 0; i < worker_counts.size() && i < phase_gate_exceeded_.size(); ++i) {
+      phase_gate_exceeded_[i] += worker_counts[i];
     }
   }
 
@@ -1213,8 +1265,18 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
       tls_.registerThread(*dispatcher_, true);
       store_root_.initializeThreading(*dispatcher_, tls_);
 
+      // FORK-ONLY (We-Amp): M2 Task 5, per the M2 Task 1 gate verdict: the
+      // loader is created with an admin layer so raise-only breaker overrides
+      // can be merged mid-run via mergeValues (with empty layers the merge is
+      // refused with "No admin layer specified"). The layer starts empty, so
+      // every runtime read behaves exactly as before: the breaker config
+      // baked at bootstrap remains the getInteger fallback.
+      envoy::config::bootstrap::v3::LayeredRuntime runtime_config;
+      auto* admin_layer = runtime_config.add_layers();
+      admin_layer->set_name("nighthawk_admin_overrides");
+      admin_layer->mutable_admin_layer();
       absl::StatusOr<Envoy::Runtime::LoaderPtr> loader = Envoy::Runtime::LoaderImpl::create(
-          *dispatcher_, tls_, {}, *local_info_, store_root_, generator_,
+          *dispatcher_, tls_, runtime_config, *local_info_, store_root_, generator_,
           Envoy::ProtobufMessage::getStrictValidationVisitor(), *api_);
 
       if (!loader.ok()) {
