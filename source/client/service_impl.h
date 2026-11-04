@@ -11,12 +11,14 @@
 #endif
 
 #include <atomic>
+#include <functional>
 #include <future>
 #include <memory>
 #include <thread>
 
 #include "absl/synchronization/mutex.h"
 
+#include "source/client/live_update_orchestrator.h"
 #include "source/common/common/logger.h"
 #include "source/common/common/thread.h"
 #include "source/common/event/real_time_system.h"
@@ -64,6 +66,12 @@ private:
       grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
                                nighthawk::client::ExecutionRequest>* stream);
   grpc::Status finishGrpcStream(const bool success, absl::string_view description = "");
+  // FORK-ONLY (We-Amp): live steering (M3). Routes an update_request /
+  // cancellation_request arm to the in-flight run. Called on the reader
+  // thread. "No run in flight" tears the stream down (the only surviving
+  // teardown case); a run in flight keeps the stream up.
+  grpc::Status dispatchUpdateOrCancellation(
+      const nighthawk::client::ExecutionRequest& request);
 
   Envoy::Thread::MutexBasicLockable log_lock_;
   std::unique_ptr<Envoy::Logger::Context> logging_context_;
@@ -84,6 +92,33 @@ private:
   // responses). gRPC ServerReaderWriter::Write is not safe for concurrent
   // use, so every write must take this mutex.
   absl::Mutex stream_write_mutex_;
+  // FORK-ONLY (We-Amp): live steering (M3). False while the stream must not
+  // carry update acks: the run thread flips it to false under
+  // stream_write_mutex_ immediately before the final response is written,
+  // and on an accepted cancellation arm — both writes and both flips take
+  // the same mutex, so an ack can never land after the final output. Re-armed
+  // to true at the start of each run.
+  bool acks_allowed_ ABSL_GUARDED_BY(stream_write_mutex_) = false;
+  // FORK-ONLY (We-Amp): the in-flight run registry. The run thread registers
+  // its per-run orchestrator (owned by the run thread's scope, carrying the
+  // ProcessImpl handle via its cancel/phase closures) and clears the entry
+  // before process shutdown; the reader thread dispatches update/cancel arms
+  // while holding in_flight_mutex_, so a dispatched arm can never race
+  // process shutdown.
+  absl::Mutex in_flight_mutex_;
+  LiveUpdateOrchestrator* in_flight_orchestrator_ ABSL_GUARDED_BY(in_flight_mutex_) = nullptr;
+  // FORK-ONLY (We-Amp): test seam — replaces the default applier (which
+  // rejects every delta) with a test double. Must be set before the run
+  // starts; read once per run on the run thread.
+  std::function<std::unique_ptr<LiveUpdateOrchestrator::Applier>()> update_applier_factory_;
+
+public:
+  // Test-only: inject a LiveUpdateOrchestrator::Applier factory for the next
+  // and following runs of this service instance.
+  void SetUpdateApplierFactoryForTest(
+      std::function<std::unique_ptr<LiveUpdateOrchestrator::Applier>()> factory) {
+    update_applier_factory_ = std::move(factory);
+  }
 };
 
 /**

@@ -114,6 +114,14 @@ public:
 
   bool requestExecutionCancellation() override;
 
+  /**
+   * FORK-ONLY (We-Amp): the in-flight run's current phase id (empty for
+   * legacy single-phase runs). Mutex-guarded; safe to call concurrently with
+   * a running benchmark (the live-update path reads it for phase targeting
+   * validation, M3).
+   */
+  std::string currentPhaseId() const;
+
   // FORK-ONLY (We-Amp): multi-phase support (M2 A1). The callback fires on
   // the run-calling thread at each phase boundary the orchestrator marks;
   // the TUI's phase timeline and window alignment (M2 Task 7) consume these
@@ -202,7 +210,6 @@ private:
   void runPhases();
   void emitPhaseEvent(const PhaseEvent& event);
   void setCurrentPhaseId(absl::string_view phase_id);
-  std::string currentPhaseId() const;
   // FORK-ONLY (We-Amp): the raise-only runtime breaker override arm (M2
   // Task 5, per the M2 Task 1 gate verdict). Runs on the run-calling thread
   // (the main thread: loadNewSnapshot asserts it) and must complete before

@@ -1,6 +1,7 @@
 #include <grpc++/grpc++.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <thread>
@@ -13,6 +14,7 @@
 #include "nighthawk/common/exception.h"
 
 #include "absl/strings/match.h"
+#include "absl/time/time.h"
 
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
@@ -129,6 +131,33 @@ private:
   std::thread thread_;
 };
 
+// Test double for the update applier (injected via
+// ServiceImpl::SetUpdateApplierFactoryForTest): blocks until released or its
+// deadline — honoring the deadline is the applier contract the orchestrator's
+// bounded join relies on — then returns an applied=true result.
+class BlockingTestApplier : public LiveUpdateOrchestrator::Applier {
+public:
+  nighthawk::client::UpdateResult
+  ApplyDeltas(const nighthawk::client::UpdateRequest& /*request*/,
+              const std::string& epoch_id, const EngineInstant& bend_instant,
+              absl::Time deadline) override {
+    while (!released_.load() && absl::Now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    nighthawk::client::UpdateResult result;
+    result.set_applied(true);
+    result.set_epoch_id(epoch_id);
+    result.set_wall_time_unix_ns(bend_instant.wall_time_unix_ns);
+    result.set_monotonic_ns(bend_instant.monotonic_ns);
+    return result;
+  }
+  void Release() { released_.store(true); }
+  bool Released() const { return released_.load(); }
+
+private:
+  std::atomic<bool> released_{false};
+};
+
 class ServiceTest : public TestWithParam<Envoy::Network::Address::IpVersion> {
 public:
   void SetUp() override {
@@ -210,6 +239,11 @@ public:
     EXPECT_TRUE(status.ok());
   }
 
+  // Starts a run against `listener` (live snapshot streaming opted in) and
+  // returns the open stream; the run stays in flight until consumed.
+  std::unique_ptr<grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>>
+  startLiveRun(const TestHttpListener& listener, uint32_t seconds, uint32_t rps);
+
   std::unique_ptr<ServiceImpl> service_;
   std::unique_ptr<grpc::Server> server_;
   std::shared_ptr<grpc::Channel> channel_;
@@ -220,6 +254,30 @@ public:
   std::string loopback_address_;
   int grpc_server_port_{0};
 };
+
+ExecutionRequest makeLiveRequest(const std::string& uri, uint32_t duration_seconds, uint32_t rps,
+                                 uint32_t flush_interval_seconds, bool live_streaming,
+                                 uint32_t concurrency = 1) {
+  ExecutionRequest request;
+  auto* options = request.mutable_start_request()->mutable_options();
+  options->mutable_uri()->set_value(uri);
+  options->mutable_duration()->set_seconds(duration_seconds);
+  options->mutable_requests_per_second()->set_value(rps);
+  options->mutable_stats_flush_interval()->set_value(flush_interval_seconds);
+  options->mutable_concurrency()->set_value(fmt::format("{}", concurrency));
+  if (live_streaming) {
+    options->mutable_live_streaming();
+  }
+  return request;
+}
+
+std::unique_ptr<grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>>
+ServiceTest::startLiveRun(const TestHttpListener& listener, uint32_t seconds, uint32_t rps) {
+  request_ = makeLiveRequest(listener.uri(), seconds, rps, 1, /*live_streaming=*/true);
+  auto stream = stub_->ExecutionStream(&context_);
+  EXPECT_TRUE(stream->Write(request_, {}));
+  return stream;
+}
 
 class ServiceTestWithParameterizedConstructor : public ServiceTest {
 public:
@@ -315,21 +373,24 @@ TEST_P(ServiceTest, InvalidRps) {
   runWithFailingValidationExpectations(false, "value must be inside range");
 }
 
-// We didn't implement updates yet, ensure we indicate so.
-TEST_P(ServiceTest, UpdatesNotSupported) {
+// The reject-and-teardown behavior survives only for "no run in flight": an
+// update arm with no active run tears the stream down with a clear message.
+TEST_P(ServiceTest, UpdateWithoutRunInFlightTearsDown) {
   request_ = nighthawk::client::ExecutionRequest();
-  request_.mutable_update_request();
+  request_.mutable_update_request()->add_deltas()
+      ->mutable_requests_per_second()
+      ->set_value(5);
   auto r = stub_->ExecutionStream(&context_);
   r->Write(request_, {});
   r->WritesDone();
   EXPECT_FALSE(r->Read(&response_));
   auto status = r->Finish();
-  EXPECT_THAT(status.error_message(), HasSubstr("Request is not supported yet"));
   EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.error_message(), HasSubstr("No benchmark run is in flight"));
 }
 
-// We didn't implement cancellations yet, ensure we indicate so.
-TEST_P(ServiceTest, CancelNotSupported) {
+// Same for the cancellation arm.
+TEST_P(ServiceTest, CancellationWithoutRunInFlightTearsDown) {
   request_ = nighthawk::client::ExecutionRequest();
   request_.mutable_cancellation_request();
   auto r = stub_->ExecutionStream(&context_);
@@ -337,8 +398,147 @@ TEST_P(ServiceTest, CancelNotSupported) {
   r->WritesDone();
   EXPECT_FALSE(r->Read(&response_));
   auto status = r->Finish();
-  EXPECT_THAT(status.error_message(), HasSubstr("Request is not supported yet"));
   EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.error_message(), HasSubstr("No benchmark run is in flight"));
+}
+
+// Review Focus 5: an M2-shaped run with no update/cancel arm sent behaves
+// byte-identically to pre-M3: snapshots flow, the final output is the LAST
+// response on the stream, and the stream finishes OK.
+TEST_P(ServiceTest, NoArmsIsLegacyRun) {
+  TestHttpListener listener;
+  auto r = startLiveRun(listener, 2, 10);
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    EXPECT_FALSE(response_.has_update_result());
+    if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_output);
+  EXPECT_FALSE(response_.has_error_detail());
+  // Half-close BEFORE the final read: the server's handler stays in Read()
+  // until the client half-closes, so the reads must be ordered the other way.
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_FALSE(r->Read(&response_));
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// Review Focus 5: an UpdateRequest mid-run no longer tears the stream down —
+// it acks a structured result and the run keeps flowing snapshots to natural
+// completion.
+TEST_P(ServiceTest, UpdateArmDoesNotTearDownStream) {
+  TestHttpListener listener;
+  auto r = startLiveRun(listener, 4, 10);
+  std::this_thread::sleep_for(1s);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()
+      ->mutable_requests_per_second()
+      ->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  bool saw_ack = false;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      saw_ack = true;
+      EXPECT_FALSE(response_.update_result().applied());
+      EXPECT_FALSE(response_.update_result().rejection_reason().empty());
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    } else {
+      EXPECT_TRUE(response_.has_live_snapshot());
+    }
+  }
+  EXPECT_TRUE(saw_ack);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// Targeting validation at the routing layer: a mismatched execution_id acks a
+// structured rejection and the stream (and run) survive.
+TEST_P(ServiceTest, ExecutionIdMismatchRejected) {
+  TestHttpListener listener;
+  auto r = startLiveRun(listener, 3, 10);
+  std::this_thread::sleep_for(300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  auto* update = update_request.mutable_update_request();
+  update->set_execution_id("wrong-execution-id");
+  update->add_deltas()->mutable_requests_per_second()->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  bool saw_ack = false;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      saw_ack = true;
+      EXPECT_FALSE(response_.update_result().applied());
+      EXPECT_THAT(response_.update_result().rejection_reason(),
+                  HasSubstr("execution_id"));
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_ack);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// Same for a mismatched phase_id.
+TEST_P(ServiceTest, PhaseIdMismatchRejected) {
+  TestHttpListener listener;
+  auto r = startLiveRun(listener, 3, 10);
+  std::this_thread::sleep_for(300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  auto* update = update_request.mutable_update_request();
+  update->set_phase_id("no-such-phase");
+  update->add_deltas()->mutable_requests_per_second()->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  bool saw_ack = false;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      saw_ack = true;
+      EXPECT_FALSE(response_.update_result().applied());
+      EXPECT_THAT(response_.update_result().rejection_reason(), HasSubstr("phase_id"));
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_ack);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// An update with no deltas is rejected with a structured reason.
+TEST_P(ServiceTest, EmptyDeltasRejected) {
+  TestHttpListener listener;
+  auto r = startLiveRun(listener, 3, 10);
+  std::this_thread::sleep_for(300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request();
+  ASSERT_TRUE(r->Write(update_request, {}));
+  bool saw_ack = false;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      saw_ack = true;
+      EXPECT_FALSE(response_.update_result().applied());
+      EXPECT_THAT(response_.update_result().rejection_reason(), HasSubstr("no deltas"));
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_ack);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
 }
 
 // Cancelling the client's gRPC context must promptly stop an in-flight
@@ -407,6 +607,159 @@ TEST_P(ServiceTest, CancelViaContext) {
   auto followup_status = followup->Finish();
   EXPECT_TRUE(followup_status.ok());
   EXPECT_LT(std::chrono::steady_clock::now() - start_time, 30s);
+}
+
+// M4 (Review Focus 6): a cancellation queued behind an in-flight update ack
+// wait must complete promptly — the bounded ack wait runs OFF the reader
+// thread, so the cancellation is dispatched (and the 60s run winds down)
+// while the update's applier is still blocked. No update ack may appear on
+// the stream after the cancellation was accepted, and the final output stays
+// the last response.
+TEST_P(ServiceTest, CancellationRequestNotStalledBehindAckWait) {
+  TestHttpListener listener;
+  BlockingTestApplier* applier_ptr = nullptr;
+  service_->SetUpdateApplierFactoryForTest(
+      [&applier_ptr]() -> std::unique_ptr<LiveUpdateOrchestrator::Applier> {
+        auto applier = std::make_unique<BlockingTestApplier>();
+        applier_ptr = applier.get();
+        return applier;
+      });
+  auto r = startLiveRun(listener, 60, 10);
+  std::this_thread::sleep_for(500ms);
+  // Send an update; from here its ack wait is in flight (the test applier
+  // blocks until released or its deadline).
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()
+      ->mutable_requests_per_second()
+      ->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  std::this_thread::sleep_for(200ms);
+  ASSERT_NE(applier_ptr, nullptr);
+
+  const auto cancel_time = std::chrono::steady_clock::now();
+  nighthawk::client::ExecutionRequest cancel_request;
+  cancel_request.mutable_cancellation_request();
+  ASSERT_TRUE(r->Write(cancel_request, {}));
+
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    EXPECT_FALSE(response_.has_update_result())
+        << "update ack written after the cancellation was accepted";
+    if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_output);
+  // The 60s run ended promptly (cancelled, not naturally), and the update's
+  // applier was still blocked the whole time: the cancellation was dispatched
+  // while the ack wait was in flight.
+  const auto elapsed = std::chrono::steady_clock::now() - cancel_time;
+  EXPECT_LT(elapsed, 15s);
+  ASSERT_NE(applier_ptr, nullptr);
+  EXPECT_FALSE(applier_ptr->Released());
+  // The final output is the last response ever. Half-close before the final
+  // read: the server's handler stays in Read() until the client half-closes.
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_FALSE(r->Read(&response_));
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// M4 (Review Focus 6): a pending update whose run ends resolves WITHOUT any
+// stream write — the final output is the last response, and it is not delayed
+// behind the pending ack wait (the bounded join happens after the final
+// write).
+TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterRunEnd) {
+  TestHttpListener listener;
+  BlockingTestApplier* applier_ptr = nullptr;
+  service_->SetUpdateApplierFactoryForTest(
+      [&applier_ptr]() -> std::unique_ptr<LiveUpdateOrchestrator::Applier> {
+        auto applier = std::make_unique<BlockingTestApplier>();
+        applier_ptr = applier.get();
+        return applier;
+      });
+  const auto start_time = std::chrono::steady_clock::now();
+  auto r = startLiveRun(listener, 2, 10);
+  std::this_thread::sleep_for(300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()
+      ->mutable_requests_per_second()
+      ->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  ASSERT_NE(applier_ptr, nullptr);
+
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    EXPECT_FALSE(response_.has_update_result())
+        << "update ack written after the run ended";
+    if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_output);
+  // The 2s run's final output arrived while the applier was still blocked:
+  // the pending ack wait never delayed the final output.
+  EXPECT_LT(std::chrono::steady_clock::now() - start_time, 6s);
+  EXPECT_FALSE(applier_ptr->Released());
+  // Resolve the pending update (it would report applied=true); it must not
+  // produce any write after the final output.
+  applier_ptr->Release();
+  std::this_thread::sleep_for(200ms);
+  // Half-close before the final read: the server's handler stays in Read()
+  // until the client half-closes; a late ack written despite the gate would
+  // surface as a response on this read.
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_FALSE(r->Read(&response_));
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// M4 (Review Focus 6): after a cancellation is accepted, a pending update
+// resolves — even as applied=true — WITHOUT any further stream write.
+TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterCancellationAccepted) {
+  TestHttpListener listener;
+  BlockingTestApplier* applier_ptr = nullptr;
+  service_->SetUpdateApplierFactoryForTest(
+      [&applier_ptr]() -> std::unique_ptr<LiveUpdateOrchestrator::Applier> {
+        auto applier = std::make_unique<BlockingTestApplier>();
+        applier_ptr = applier.get();
+        return applier;
+      });
+  auto r = startLiveRun(listener, 60, 10);
+  std::this_thread::sleep_for(500ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()
+      ->mutable_requests_per_second()
+      ->set_value(5);
+  ASSERT_TRUE(r->Write(update_request, {}));
+  ASSERT_NE(applier_ptr, nullptr);
+  nighthawk::client::ExecutionRequest cancel_request;
+  cancel_request.mutable_cancellation_request();
+  ASSERT_TRUE(r->Write(cancel_request, {}));
+
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    EXPECT_FALSE(response_.has_update_result())
+        << "update ack written after the cancellation was accepted";
+    if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_output);
+  // The 60s run ended promptly: the cancellation took effect while the
+  // update's applier was still blocked.
+  EXPECT_FALSE(applier_ptr->Released());
+  // Let the pending update resolve as applied=true; after the cancellation
+  // was accepted it must not produce any stream write.
+  applier_ptr->Release();
+  std::this_thread::sleep_for(200ms);
+  // Half-close before the final read: the server's handler stays in Read()
+  // until the client half-closes; a late ack written despite the gate would
+  // surface as a response on this read.
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_FALSE(r->Read(&response_));
+  EXPECT_TRUE(r->Finish().ok());
 }
 
 TEST_P(ServiceTest, Unresolvable) {
@@ -478,22 +831,6 @@ readRunFromStream(grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>&
     }
   }
   return result;
-}
-
-ExecutionRequest makeLiveRequest(const std::string& uri, uint32_t duration_seconds, uint32_t rps,
-                                 uint32_t flush_interval_seconds, bool live_streaming,
-                                 uint32_t concurrency = 1) {
-  ExecutionRequest request;
-  auto* options = request.mutable_start_request()->mutable_options();
-  options->mutable_uri()->set_value(uri);
-  options->mutable_duration()->set_seconds(duration_seconds);
-  options->mutable_requests_per_second()->set_value(rps);
-  options->mutable_stats_flush_interval()->set_value(flush_interval_seconds);
-  options->mutable_concurrency()->set_value(fmt::format("{}", concurrency));
-  if (live_streaming) {
-    options->mutable_live_streaming();
-  }
-  return request;
 }
 
 } // namespace

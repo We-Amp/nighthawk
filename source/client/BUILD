@@ -237,10 +237,12 @@ envoy_cc_library(
 envoy_cc_library(
     name = "nighthawk_service_lib",
     srcs = [
+        "live_update_orchestrator.cc",
         "service_impl.cc",
         "service_main.cc",
     ],
     hdrs = [
+        "live_update_orchestrator.h",
         "service_impl.h",
         "service_main.h",
     ],
@@ -250,6 +252,7 @@ envoy_cc_library(
         "//api/client:grpc_service_lib",
         "//api/request_source:grpc_request_source_service_lib",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@envoy//source/common/common:thread_lib_with_external_headers",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],

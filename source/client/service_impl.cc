@@ -31,6 +31,14 @@ void ServiceImpl::handleExecutionRequest(
     busy_lock = std::make_unique<Envoy::Thread::LockGuard>(busy_lock_);
     accepted_event_.notifyOne();
   }
+  // FORK-ONLY (We-Amp): re-arm the stream's update-ack gate for this run (M3
+  // live steering). It was flipped false by this run's predecessor before its
+  // final response, or by an accepted cancellation; this run's updates may
+  // ack again from here on.
+  {
+    absl::MutexLock lock(&stream_write_mutex_);
+    acks_allowed_ = true;
+  }
 
   nighthawk::client::ExecutionResponse response;
   OptionsPtr options;
@@ -57,6 +65,38 @@ void ServiceImpl::handleExecutionRequest(
     return;
   }
   ProcessPtr process = std::move(*process_or_status);
+
+  // FORK-ONLY (We-Amp): live steering (M3). One update orchestrator per run,
+  // owned by this scope; the reader thread reaches it through the in-flight
+  // registry below. Its ack writer wraps the result into an ExecutionResponse
+  // and writes it under the stream write mutex — the acks_allowed_ gate
+  // checked under that same mutex is what keeps an ack from ever landing
+  // after the final output (M4's no-ack-after-final-output rule).
+  std::unique_ptr<LiveUpdateOrchestrator::Applier> update_applier =
+      update_applier_factory_ ? update_applier_factory_() : MakeDefaultUpdateApplier();
+  ProcessImpl* process_impl_ptr = static_cast<ProcessImpl*>(process.get());
+  LiveUpdateOrchestrator orchestrator(
+      update_applier.get(),
+      [this, stream](const nighthawk::client::UpdateResult& result) {
+        nighthawk::client::ExecutionResponse ack_response;
+        *ack_response.mutable_update_result() = result;
+        absl::MutexLock lock(&stream_write_mutex_);
+        if (!acks_allowed_) {
+          return false;
+        }
+        if (!stream->Write(ack_response)) {
+          ENVOY_LOG(warn, "Failed to write update ack to the stream");
+          return false;
+        }
+        return true;
+      },
+      [process_impl_ptr]() { process_impl_ptr->requestExecutionCancellation(); },
+      [process_impl_ptr]() { return process_impl_ptr->currentPhaseId(); },
+      options->executionId().value_or(""));
+  {
+    absl::MutexLock lock(&in_flight_mutex_);
+    in_flight_orchestrator_ = &orchestrator;
+  }
 
   // FORK-ONLY (We-Amp): stream-at-boundary phase events (M2 Task 7 wiring,
   // DQ-3 ruling: boundary events are METADATA, never synthetic metric
@@ -218,12 +258,35 @@ void ServiceImpl::handleExecutionRequest(
         "benchmark request.");
   }
   *(response.mutable_output()) = output_collector.toProto();
+  // FORK-ONLY (We-Amp): from here on the stream must not carry update acks —
+  // the final output stays the last response, ever (M4). Both gates flip
+  // before the final write: the run-side flag makes pending updates resolve
+  // without a write, and the acks_allowed_ flip under the stream write mutex
+  // closes the window for any ack already past its orchestrator-side gate.
+  orchestrator.OnRunEnded();
+  {
+    absl::MutexLock lock(&stream_write_mutex_);
+    acks_allowed_ = false;
+  }
+  {
+    // Unregister before shutdown: the reader thread dispatches arms while
+    // holding in_flight_mutex_, so no arm can be in flight against this
+    // process past this point.
+    absl::MutexLock lock(&in_flight_mutex_);
+    in_flight_orchestrator_ = nullptr;
+  }
   process->shutdown();
   // We release before writing the response to avoid a race with the client's follow up request
   // coming in before we release the lock, which would lead up to us declining service when
   // we should not.
   busy_lock.reset();
   writeResponse(response, stream);
+  // Join pending ack threads after the final response: they are gated off
+  // (orchestrator flags + acks_allowed_) and bounded by the applier deadline,
+  // and must be dead before this scope's applier/orchestrator go away. The
+  // join deliberately happens after the final write, so a still-pending
+  // update's bounded wait never delays the final output.
+  orchestrator.JoinPendingAcks();
 }
 
 void ServiceImpl::writeResponse(
@@ -251,6 +314,63 @@ grpc::Status ServiceImpl::finishGrpcStream(const bool success, absl::string_view
   }
   return success ? grpc::Status::OK
                  : grpc::Status(grpc::StatusCode::INTERNAL, std::string(description));
+}
+
+grpc::Status ServiceImpl::dispatchUpdateOrCancellation(
+    const nighthawk::client::ExecutionRequest& request) {
+  // FORK-ONLY (We-Amp): live steering (M3 Task 1). "Run in flight" is
+  // busy_lock_ being held: the run thread holds it from just after accepting
+  // a start request until it releases it before its final response. The
+  // teardown path below is the only surviving reject-and-teardown case.
+  if (busy_lock_.tryLock()) {
+    busy_lock_.unlock();
+    return finishGrpcStream(false,
+                            "No benchmark run is in flight; update and cancellation requests "
+                            "are only supported while a run is active.");
+  }
+  // The run thread registers the orchestrator shortly after acquiring
+  // busy_lock_ (process construction happens between the two); wait a
+  // bounded moment for the registration instead of failing the arm.
+  // in_flight_mutex_ is held across the whole dispatch below: the run
+  // thread's unregister-before-shutdown takes the same mutex, so a dispatched
+  // arm can never race process shutdown.
+  in_flight_mutex_.Lock();
+  const auto registration_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (in_flight_orchestrator_ == nullptr &&
+         std::chrono::steady_clock::now() < registration_deadline) {
+    in_flight_mutex_.Unlock();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    in_flight_mutex_.Lock();
+  }
+  if (in_flight_orchestrator_ == nullptr) {
+    in_flight_mutex_.Unlock();
+    return finishGrpcStream(false, "Run did not become dispatchable in time.");
+  }
+  LiveUpdateOrchestrator* orchestrator = in_flight_orchestrator_;
+  if (request.has_cancellation_request()) {
+    auto rejection = orchestrator->CheckCancellation(request.cancellation_request().execution_id());
+    if (rejection.has_value()) {
+      // Targeting mismatch: structured ack, the stream stays up. Return OK
+      // directly: finishGrpcStream would wait on future_, blocking the
+      // reader thread until the in-flight run ends.
+      orchestrator->WriteAckSync(*rejection);
+      in_flight_mutex_.Unlock();
+      return grpc::Status::OK;
+    }
+    // Flip the ack gate before accepting, so "cancellation accepted" and "no
+    // ack from here on" are ordered without a window (M4).
+    {
+      absl::MutexLock lock(&stream_write_mutex_);
+      acks_allowed_ = false;
+    }
+    orchestrator->AcceptCancellation();
+  } else {
+    orchestrator->HandleUpdate(request.update_request());
+  }
+  in_flight_mutex_.Unlock();
+  // OK without finishGrpcStream: the run is still in flight, and the reader
+  // loop must keep reading (ExecutionStream continues on OK).
+  return grpc::Status::OK;
 }
 
 // TODO(oschaaf): implement a way to cancel test runs, and update rps config on the fly.
@@ -281,7 +401,11 @@ grpc::Status ServiceImpl::ExecutionStream(
         return finishGrpcStream(false, "Only a single benchmark session is allowed at a time.");
       }
     } else if (request.has_update_request() || request.has_cancellation_request()) {
-      return finishGrpcStream(false, "Request is not supported yet.");
+      auto status = dispatchUpdateOrCancellation(request);
+      if (!status.ok()) {
+        return status;
+      }
+      // The arm was dispatched to the in-flight run; keep reading.
     } else {
       PANIC("not reached");
     }

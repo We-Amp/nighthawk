@@ -560,6 +560,16 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "live_update_test",
+    srcs = ["live_update_test.cc"],
+    deps = [
+        "//source/client:nighthawk_service_lib",
+        "//test/test_common:environment_lib",
+        "@envoy//test/test_common:network_utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "service_test",
     srcs = ["service_test.cc"],
     deps = [

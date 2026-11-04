@@ -3,6 +3,7 @@ syntax = "proto3";
 package nighthawk.client;
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
 import "google/rpc/status.proto";
 import "validate/validate.proto";
 
@@ -14,12 +15,45 @@ message StartRequest {
   CommandLineOptions options = 1;
 }
 
-// TODO(oschaaf): Not implemented yet.
-message UpdateRequest {
+// One knob re-shape of a live ramp (the bendable ramp vocabulary). Absent
+// fields keep their current value.
+message RampShapeDelta {
+  google.protobuf.Duration ramp_time = 1;     // new total ramp time
+  google.protobuf.UInt32Value target_rps = 2; // new post-ramp target
 }
 
-// TODO(oschaaf): Not implemented yet.
+// A single field-level knob delta.
+message KnobDelta {
+  oneof delta {
+    google.protobuf.UInt32Value requests_per_second = 1; // live rps
+    RampShapeDelta ramp = 2;                             // live ramp shape
+  }
+}
+
+// Update an in-flight benchmark run.
+message UpdateRequest {
+  string execution_id = 1; // optional; when present must match the in-flight
+                           // run, else the update is rejected
+  string phase_id = 2;     // optional; when present must match the CURRENT
+                           // phase, else the update is rejected
+  repeated KnobDelta deltas = 3; // field-level; empty deltas rejected
+}
+
+// Cancel an in-flight benchmark run. Unlike cancelling the RPC context, this
+// keeps the stream alive so the run's final response is still delivered.
 message CancellationRequest {
+  string execution_id = 1; // optional, same match rule as UpdateRequest
+}
+
+// The apply ack for an UpdateRequest: on success the engine has ALREADY
+// applied the deltas at the stated knob epoch and bend instant; on failure
+// nothing changed engine-side and rejection_reason names the offending field.
+message UpdateResult {
+  bool applied = 1;
+  string epoch_id = 2;         // set iff applied: the new knob epoch
+  int64 wall_time_unix_ns = 3; // engine clock pair at the bend instant
+  int64 monotonic_ns = 4;
+  string rejection_reason = 5; // set iff !applied; names the offending field
 }
 
 message ExecutionRequest {
@@ -38,6 +72,10 @@ message ExecutionResponse {
   // if it is not set there it will be auto-generated. The format used for auto-generated
   // identifiers may change at any time.
   string execution_id = 8;
+  // The apply ack for an update_request / cancellation_request arm. Also
+  // carries structured targeting rejections for either arm (applied=false
+  // with rejection_reason naming the offending field).
+  UpdateResult update_result = 9;
   // FORK-ONLY (We-Amp): rebase check - field number 911 is fork-specific and
   // free upstream. A live progress snapshot, streamed while the run is in
   // flight when the request opted in to live streaming.
