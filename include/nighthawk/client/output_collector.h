@@ -35,6 +35,18 @@ public:
       const std::chrono::nanoseconds execution_duration,
       const std::optional<Envoy::SystemTime>& first_acquisition_time,
       const std::vector<nighthawk::client::UserDefinedOutput>& user_defined_output_results) PURE;
+  // FORK-ONLY (We-Amp): per-phase result dimension (M2 A1, spec 8.1). Same as
+  // addResult, with the phase id stamped on the Result.
+  virtual void addResult(absl::string_view name, const std::vector<StatisticPtr>& statistics,
+                         const std::map<std::string, uint64_t>& counters,
+                         const std::chrono::nanoseconds execution_duration,
+                         const std::optional<Envoy::SystemTime>& first_acquisition_time,
+                         const std::vector<nighthawk::client::UserDefinedOutput>&
+                             user_defined_output_results,
+                         absl::string_view phase_id) PURE;
+  // FORK-ONLY (We-Amp): appends one phase's metadata (spec 8.2/8.4/8.6) to
+  // the output, in phase order.
+  virtual void addPhaseMetadata(nighthawk::client::PhaseMetadata metadata) PURE;
   /**
    * Directly sets the output value.
    *

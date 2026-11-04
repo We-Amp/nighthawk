@@ -86,6 +86,48 @@ namespace {
 using ::envoy::config::bootstrap::v3::Bootstrap;
 using ::envoy::config::core::v3::TypedExtensionConfig;
 
+// FORK-ONLY (We-Amp): folds one statistic into an id-keyed map of combined
+// per-phase statistics (M2 Task 4's per-phase output fold). Clones on first
+// sight so the map owns an instance of the right backend to combine into.
+void combineStatisticIntoMap(std::map<std::string, StatisticPtr>& merged, absl::string_view id,
+                             const Statistic& statistic) {
+  auto it = merged.find(std::string(id));
+  if (it == merged.end()) {
+    auto clone = statistic.createNewInstanceOfSameType()->combine(statistic);
+    clone->setId(id);
+    merged.emplace(std::string(id), std::move(clone));
+  } else {
+    auto combined = it->second->combine(statistic);
+    combined->setId(id);
+    it->second = std::move(combined);
+  }
+}
+
+// FORK-ONLY (We-Amp): per-worker pool health surfaced from the engine's own
+// pool counters into PhaseMetadata (M2 Task 4, spec 8.6: the multi-phase run
+// surfaces what its no-churn acceptance asserts). Created is the cluster's
+// cumulative upstream_cx_total counter; active is the upstream_cx_active
+// gauge, read after the workers have been joined.
+nighthawk::client::WorkerPoolHealth readWorkerPoolHealth(Envoy::Stats::Store& store,
+                                                         uint32_t worker_id) {
+  nighthawk::client::WorkerPoolHealth health;
+  health.set_worker_id(worker_id);
+  const std::string prefix = fmt::format("cluster.{}.", worker_id);
+  const std::string created_name = prefix + "upstream_cx_total";
+  const std::string active_name = prefix + "upstream_cx_active";
+  for (const auto& counter : store.counters()) {
+    if (counter->name() == created_name) {
+      health.set_connections_created(counter->value());
+    }
+  }
+  for (const auto& gauge : store.gauges()) {
+    if (gauge->name() == active_name) {
+      health.set_connections_active(gauge->value());
+    }
+  }
+  return health;
+}
+
 // Helps in generating a bootstrap for the process.
 // This is a class only to allow the use of the ENVOY_LOG macros.
 class BootstrapFactory : public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
@@ -940,68 +982,23 @@ void ProcessImpl::runPhases() {
 }
 
 nighthawk::client::LiveSnapshot ProcessImpl::toLiveSnapshot() {
-  nighthawk::client::LiveSnapshot snapshot;
   std::vector<nighthawk::client::WorkerLiveSnapshotPartial> partials;
   {
     std::lock_guard<std::mutex> lock(live_partials_mutex_);
     partials = std::move(live_partials_);
     live_partials_.clear();
   }
-  // Fold the new partials into the running per-worker state. Partial values
-  // are cumulative since run start, so the latest one per worker wins.
+  // FORK-ONLY (We-Amp): the fold lives in LivePartialAggregator, which honors
+  // the snapshot-acquisition-vs-slab-swap seam: every partial carries the
+  // phase id stamped on its worker dispatcher, statistics never fold across
+  // different stamps, and the snapshot is labeled with the newest stamp seen
+  // ("main" until a worker advanced). The worker stamp, not the orchestrator
+  // view, labels the snapshot: a partial is only ever read after it was
+  // fully computed and stamped.
   for (nighthawk::client::WorkerLiveSnapshotPartial& partial : partials) {
-    auto& counter_values = live_worker_counter_values_[partial.worker_id()];
-    for (const auto& [name, value] : partial.counters()) {
-      counter_values[name] = value;
-    }
-    auto& worker_statistics = live_worker_statistics_[partial.worker_id()];
-    for (const nighthawk::client::StatisticSnapshot& stat : partial.statistics()) {
-      worker_statistics[stat.id()] = stat;
-    }
+    live_aggregator_.addPartial(std::move(partial));
   }
-  // Aggregate the immutable partials. Counts are summed over the workers
-  // (they are cumulative since run start); percentiles take the per-worker
-  // maximum, as raw histograms cannot be merged without their samples. This
-  // makes percentile values an approximation of the global picture, which the
-  // counts alongside them let consumers interpret.
-  for (const auto& [worker_id, counter_values] : live_worker_counter_values_) {
-    for (const auto& [name, value] : counter_values) {
-      (*snapshot.mutable_counters())[name] += value;
-    }
-  }
-  absl::flat_hash_map<std::string, nighthawk::client::StatisticSnapshot*> statistics;
-  for (const auto& [worker_id, worker_statistics] : live_worker_statistics_) {
-    for (const auto& [id, stat] : worker_statistics) {
-      auto inserted = statistics.emplace(id, nullptr);
-      if (inserted.second) {
-        nighthawk::client::StatisticSnapshot* merged = snapshot.add_statistics();
-        *merged = stat;
-        inserted.first->second = merged;
-      } else {
-        nighthawk::client::StatisticSnapshot* merged = inserted.first->second;
-        merged->set_count(merged->count() + stat.count());
-        merged->set_p50_ns(std::max(merged->p50_ns(), stat.p50_ns()));
-        merged->set_p90_ns(std::max(merged->p90_ns(), stat.p90_ns()));
-        merged->set_p99_ns(std::max(merged->p99_ns(), stat.p99_ns()));
-      }
-    }
-  }
-  const auto now_ns = [](auto clock_now) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(clock_now.time_since_epoch())
-        .count();
-  };
-  snapshot.set_wall_time_unix_ns(now_ns(std::chrono::system_clock::now()));
-  // Snapshots are produced by a single collector thread, but enforce strictly
-  // increasing values anyway: the assertion is a contract consumers may rely on.
-  int64_t monotonic_ns = now_ns(std::chrono::steady_clock::now());
-  if (monotonic_ns <= last_live_snapshot_monotonic_ns_) {
-    monotonic_ns = last_live_snapshot_monotonic_ns_ + 1;
-  }
-  last_live_snapshot_monotonic_ns_ = monotonic_ns;
-  snapshot.set_monotonic_ns(monotonic_ns);
-  snapshot.set_phase_id(currentPhaseId());
-  snapshot.set_epoch_id(options_.executionId().value_or(""));
-  return snapshot;
+  return live_aggregator_.snapshot(options_.executionId().value_or(""));
 }
 
 void ProcessImpl::configureComponentLogLevels(spdlog::level::level_enum level) {
@@ -1442,30 +1439,45 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
                         global_user_defined_outputs);
   }
   if (options_.hasPhaseVector()) {
-    // FORK-ONLY (We-Amp): per-phase result groups. The full per-phase output
-    // dimension (phase ids on Result, PhaseMetadata, fresh per-phase
-    // benchmark-client statistics) is M2 Task 4; these groups already give a
-    // multi-phase run observable, phase-keyed sequencer results, merged over
-    // the workers.
+    // FORK-ONLY (We-Amp): the per-phase output dimension (M2 Task 4, spec
+    // 8.1/8.2/8.4/8.6). One Result group per phase, combining the sequencer
+    // statistics and the benchmark client's fresh per-phase statistic slabs
+    // across the workers, stamped with the phase id; plus PhaseMetadata with
+    // the claim-discipline counts (censoring counted, not hidden; the
+    // completion ratio computed here, not in the consumer), the boundary
+    // timing, and per-worker pool health surfaced from the engine's pool
+    // counters. Reads of worker state happen after the workers have been
+    // joined (same contract as the final counter snapshot above).
     for (uint32_t phase_index = 0; phase_index < options_.phases().size(); ++phase_index) {
-      std::vector<StatisticPtr> merged;
+      const nighthawk::client::PhaseSpec& phase = options_.phases()[phase_index];
+      std::map<std::string, StatisticPtr> merged_statistics;
       std::chrono::nanoseconds total_phase_duration = 0ns;
       uint32_t contributing_workers = 0;
+      uint64_t initiated = 0;
+      uint64_t completed = 0;
+      uint64_t stream_resets = 0;
       for (auto& worker : workers_) {
         const std::vector<StatisticPtrMap>& phase_statistics = worker->phaseStatistics();
         if (phase_index >= phase_statistics.size() ||
             phase_index >= worker->phaseExecutionDurations().size()) {
           continue;
         }
-        if (merged.empty()) {
-          merged = vectorizeStatisticPtrMap(phase_statistics[phase_index]);
-        } else {
-          uint32_t j = 0;
-          for (const auto& [id, statistic] : phase_statistics[phase_index]) {
-            merged[j] = merged[j]->combine(*statistic);
-            merged[j]->setId(id);
-            j++;
+        // Sequencer statistics of this phase.
+        for (const auto& [id, statistic] : phase_statistics[phase_index]) {
+          combineStatisticIntoMap(merged_statistics, id, *statistic);
+        }
+        // Benchmark-client slabs of this phase (matched by phase id; the
+        // slabs retain every phase's set, including the run's final one).
+        for (const PhaseStatisticSlab& slab : worker->benchmarkPhaseSlabs()) {
+          if (slab.phase_id != phase.name()) {
+            continue;
           }
+          for (const auto& [id, statistic] : slab.statistics) {
+            combineStatisticIntoMap(merged_statistics, id, *statistic);
+          }
+          initiated += slab.requests_initiated;
+          completed += slab.requests_completed;
+          stream_resets += slab.stream_resets;
         }
         total_phase_duration +=
             std::chrono::nanoseconds(worker->phaseExecutionDurations()[phase_index]);
@@ -1474,9 +1486,32 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
       if (contributing_workers == 0) {
         continue;
       }
-      collector.addResult(
-          fmt::format("phase_{}_{}", phase_index, options_.phases()[phase_index].name()), merged,
-          {}, total_phase_duration / contributing_workers, std::nullopt, {});
+      std::vector<StatisticPtr> merged;
+      for (auto& [id, statistic] : merged_statistics) {
+        merged.push_back(std::move(statistic));
+      }
+      collector.addResult(fmt::format("phase_{}_{}", phase_index, phase.name()), merged, {},
+                          total_phase_duration / contributing_workers, std::nullopt, {},
+                          phase.name());
+      // The boundary timing recorded when this phase ENDED (absent for the
+      // run's final phase, which ends at the run teardown).
+      const PhaseBoundaryTiming* boundary = nullptr;
+      for (const PhaseBoundaryTiming& timing : boundary_timings_) {
+        if (timing.phase_index == phase_index) {
+          boundary = &timing;
+          break;
+        }
+      }
+      nighthawk::client::PhaseMetadata metadata =
+          BuildPhaseMetadata(phase_index, phase, boundary, workers_.size(), initiated, completed,
+                             stream_resets,
+                             phase_index < phase_gate_exceeded_.size()
+                                 ? phase_gate_exceeded_[phase_index]
+                                 : 0);
+      for (uint32_t worker_number = 0; worker_number < workers_.size(); ++worker_number) {
+        *metadata.add_pool_health() = readWorkerPoolHealth(store_root_, worker_number);
+      }
+      collector.addPhaseMetadata(std::move(metadata));
     }
   }
   if (counters.find("sequencer.failed_terminations") == counters.end()) {

@@ -44,6 +44,9 @@ TEST_F(FactoriesTest, CreateBenchmarkClient) {
   EXPECT_CALL(options_, maxActiveRequests());
   EXPECT_CALL(options_, maxRequestsPerConnection());
   EXPECT_CALL(options_, openLoop());
+  // Called unconditionally by create() (the gate-refusal counting toggle,
+  // M2 Task 5); default false.
+  EXPECT_CALL(options_, hasPhaseVector());
   EXPECT_CALL(options_, responseHeaderWithLatencyInput());
   EXPECT_CALL(options_, timeout());
   StaticRequestSourceImpl request_generator(

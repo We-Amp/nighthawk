@@ -505,4 +505,34 @@ TYPED_TEST(SinkableStatisticTest, SimpleSinkableStatistic) {
   EXPECT_EQ(worker_id, stat.worker_id().value());
 }
 
+// FORK-ONLY (We-Amp): the end-of-run fold combines every phase's statistic
+// slab (M2 Task 4, spec 8.1). N-sample conservation must hold exactly at
+// every statistic id, across backends.
+TEST(StatisticTest, CombineAcrossPhaseSlabsConservesCounts) {
+  for (int backend = 0; backend < 2; backend++) {
+    std::vector<std::unique_ptr<Statistic>> slabs;
+    slabs.push_back(backend == 0 ? std::unique_ptr<Statistic>(std::make_unique<StreamingStatistic>())
+                                 : std::unique_ptr<Statistic>(std::make_unique<HdrStatistic>()));
+    slabs.push_back(backend == 0 ? std::unique_ptr<Statistic>(std::make_unique<StreamingStatistic>())
+                                 : std::unique_ptr<Statistic>(std::make_unique<HdrStatistic>()));
+    slabs.push_back(backend == 0 ? std::unique_ptr<Statistic>(std::make_unique<StreamingStatistic>())
+                                 : std::unique_ptr<Statistic>(std::make_unique<HdrStatistic>()));
+    const uint64_t samples_per_slab = 40;
+    uint64_t value = 1000;
+    for (auto& slab : slabs) {
+      for (uint64_t i = 0; i < samples_per_slab; i++) {
+        slab->addValue(value);
+        value += 100;
+      }
+    }
+    StatisticPtr total = slabs[0]->createNewInstanceOfSameType();
+    for (const auto& slab : slabs) {
+      total = total->combine(*slab);
+    }
+    EXPECT_EQ(samples_per_slab * slabs.size(), total->count());
+    // 120 samples spanning 1000..12900 step 100: overall mean 6950.
+    EXPECT_NEAR(6950, total->mean(), 2.0);
+  }
+}
+
 } // namespace Nighthawk

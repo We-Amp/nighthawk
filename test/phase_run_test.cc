@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -67,7 +69,8 @@ class CountingTestHttpListener {
 public:
   explicit CountingTestHttpListener(std::chrono::microseconds request_delay =
                                         std::chrono::microseconds::zero())
-      : request_delay_(request_delay) {
+      : request_delay_ns_(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(request_delay).count()) {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     EXPECT_NE(listen_fd_, -1);
     int one = 1;
@@ -97,6 +100,11 @@ public:
   CountingTestHttpListener& operator=(const CountingTestHttpListener&) = delete;
 
   std::string uri() const { return fmt::format("http://127.0.0.1:{}/", port_); }
+
+  // FORK-ONLY (We-Amp): per-response delay for the per-phase statistics tests
+  // (a phase-dependent latency profile). Flipping it in a phase-start event
+  // callback gives the phases distinct, deterministic latency distributions.
+  void setResponseDelayNs(int64_t delay_ns) { request_delay_ns_.store(delay_ns); }
 
   // Wall-clock ns timestamps of every accepted TCP connection.
   std::vector<int64_t> acceptTimestamps() const {
@@ -135,9 +143,10 @@ private:
       while ((request_end = buffer.find("\r\n\r\n")) != std::string::npos) {
         buffer.erase(0, request_end + 4);
         const int64_t start_ns = wallNowNs();
-        if (request_delay_ > std::chrono::microseconds::zero()) {
+        const int64_t delay_ns = request_delay_ns_.load();
+        if (delay_ns > 0) {
           // NO_CHECK_FORMAT(real_time)
-          std::this_thread::sleep_for(request_delay_);
+          std::this_thread::sleep_for(std::chrono::nanoseconds(delay_ns));
         }
         const bool sent = sendAll(fd, kResponse);
         {
@@ -172,7 +181,9 @@ private:
 
   int listen_fd_{-1};
   uint16_t port_{0};
-  std::chrono::microseconds request_delay_{std::chrono::microseconds::zero()};
+  // Atomic so a test can flip the SUT's service time mid-run (the per-phase
+  // statistics tests give phase 2 a slower profile from its start event).
+  std::atomic<int64_t> request_delay_ns_{0};
   std::thread thread_;
   std::vector<std::thread> connection_workers_;
   mutable std::mutex mutex_;
@@ -211,8 +222,12 @@ public:
     std::vector<uint64_t> phase_gate_exceeded;
   };
 
-  RunOutcome runPhases(const nighthawk::client::CommandLineOptions& cmd_proto,
-                       bool sample_live_snapshots = false) {
+  RunOutcome runPhases(
+      const nighthawk::client::CommandLineOptions& cmd_proto, bool sample_live_snapshots = false,
+      // FORK-ONLY (We-Amp): extra event hook for the per-phase statistics
+      // tests (invoked synchronously on the run-calling thread at each phase
+      // event, before the corresponding begin-phase posts).
+      const std::function<void(const PhaseEvent&)>& event_hook = {}) {
     auto options = std::make_unique<OptionsImpl>(cmd_proto);
     TypedExtensionConfig typed_dns_resolver_config;
     Envoy::Network::DnsResolverFactory& dns_resolver_factory =
@@ -227,9 +242,12 @@ public:
     auto& process_impl = static_cast<ProcessImpl&>(*process);
     RunOutcome outcome;
     std::mutex events_mutex;
-    process_impl.setPhaseEventCallback([&outcome, &events_mutex](const PhaseEvent& event) {
+    process_impl.setPhaseEventCallback([&outcome, &events_mutex, &event_hook](const PhaseEvent& event) {
       std::lock_guard<std::mutex> lock(events_mutex);
       outcome.events.push_back(event);
+      if (event_hook != nullptr) {
+        event_hook(event);
+      }
     });
 
     std::atomic<bool> stop_sampling{false};
@@ -716,6 +734,224 @@ TEST(PhaseOrchestratorTest, PartialAcksAreCensored) {
   EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(100));
   ASSERT_EQ(1, orchestrator.boundaryTimings().size());
   EXPECT_TRUE(orchestrator.boundaryTimings()[0].drain_censored);
+}
+
+// ---------------------------------------------------------------------------
+// FORK-ONLY (We-Amp): per-phase output dimension (M2 Task 4).
+// ---------------------------------------------------------------------------
+
+const nighthawk::client::Statistic* findStatistic(const nighthawk::client::Result& result,
+                                                  absl::string_view id) {
+  for (const nighthawk::client::Statistic& statistic : result.statistics()) {
+    if (statistic.id() == id) {
+      return &statistic;
+    }
+  }
+  return nullptr;
+}
+
+const nighthawk::client::Result* findPhaseResult(const nighthawk::client::Output& output,
+                                                 absl::string_view phase_id) {
+  for (const nighthawk::client::Result& result : output.results()) {
+    if (result.phase_id() == phase_id) {
+      return &result;
+    }
+  }
+  return nullptr;
+}
+
+// Latency statistics are serialized in the duration domain; return the raw
+// nanoseconds of the smallest emitted percentile that covers `fraction`
+// (HdrHistogram emits percentile steps at 1 - 1/2^n, not the literal value).
+uint64_t percentileNanos(const nighthawk::client::Statistic& statistic, double fraction) {
+  std::optional<uint64_t> best;
+  for (const nighthawk::client::Percentile& p : statistic.percentiles()) {
+    if (p.percentile() < fraction) {
+      continue;
+    }
+    const uint64_t value = p.has_duration()
+                               ? static_cast<uint64_t>(p.duration().seconds()) * 1000000000ull +
+                                     p.duration().nanos()
+                               : static_cast<uint64_t>(p.raw_value());
+    if (!best.has_value() || value < *best) {
+      best = value;
+    }
+  }
+  return best.value_or(0);
+}
+
+// The plan's freshness test, end to end: phase 2 runs against an SUT with a
+// 50 ms response delay (flipped in the phase-start event, before its first
+// request is scheduled), so the phase slabs carry distinct latency profiles.
+// Per-phase percentiles must differ correctly, and each phase's Result group
+// must reflect only its own slab.
+TEST_F(PhaseRunTest, PhaseStatisticsAreFreshPerBoundary) {
+  nighthawk::client::CommandLineOptions cmd = makeTwoPhaseOptions(listener().uri());
+  listener().setResponseDelayNs(0);
+  RunOutcome outcome = runPhases(cmd, /*sample_live_snapshots=*/false,
+                                 [this](const PhaseEvent& event) {
+                                   if (event.phase_id == "phase1") {
+                                     listener().setResponseDelayNs(50 * 1000 * 1000);
+                                   }
+                                 });
+  ASSERT_TRUE(outcome.success);
+  listener().setResponseDelayNs(0);
+
+  const nighthawk::client::Result* r0 = findPhaseResult(outcome.output, "phase0");
+  const nighthawk::client::Result* r1 = findPhaseResult(outcome.output, "phase1");
+  ASSERT_NE(r0, nullptr) << "no result group for phase0";
+  ASSERT_NE(r1, nullptr) << "no result group for phase1";
+  const nighthawk::client::Statistic* lat0 =
+      findStatistic(*r0, "benchmark_http_client.latency_2xx");
+  const nighthawk::client::Statistic* lat1 =
+      findStatistic(*r1, "benchmark_http_client.latency_2xx");
+  ASSERT_NE(lat0, nullptr) << "phase0 result carries no benchmark-client latency statistics";
+  ASSERT_NE(lat1, nullptr) << "phase1 result carries no benchmark-client latency statistics";
+  // Fresh slabs: each phase's samples are its own.
+  EXPECT_GT(lat0->count(), 0);
+  EXPECT_GT(lat1->count(), 0);
+  // Distinct profiles: the delayed phase's p99 sits near 50 ms, the warm
+  // phase's near the loopback floor.
+  EXPECT_GT(percentileNanos(*lat1, 0.99), 40 * 1000 * 1000);
+  EXPECT_LT(percentileNanos(*lat0, 0.99), 10 * 1000 * 1000);
+}
+
+// Per-phase Results carry their phase id, the metadata array aligns 1:1 with
+// the phase vector, and pool health has one entry per active worker with
+// created >= active (spec 8.6 surfacing).
+TEST_F(PhaseRunTest, PerPhaseResultsCarryPhaseId) {
+  RunOutcome outcome = runPhases(makeTwoPhaseOptions(listener().uri()));
+  ASSERT_TRUE(outcome.success);
+
+  ASSERT_NE(findPhaseResult(outcome.output, "phase0"), nullptr);
+  ASSERT_NE(findPhaseResult(outcome.output, "phase1"), nullptr);
+  // No result outside the phase groups claims a phase id.
+  for (const nighthawk::client::Result& result : outcome.output.results()) {
+    if (absl::StartsWith(result.name(), "phase_")) {
+      EXPECT_FALSE(result.phase_id().empty());
+    } else {
+      EXPECT_TRUE(result.phase_id().empty());
+    }
+  }
+
+  ASSERT_EQ(2, outcome.output.phase_metadata_size());
+  for (int i = 0; i < outcome.output.phase_metadata_size(); ++i) {
+    const nighthawk::client::PhaseMetadata& metadata = outcome.output.phase_metadata(i);
+    EXPECT_EQ(fmt::format("phase{}", i), metadata.phase_id());
+    EXPECT_EQ(static_cast<uint32_t>(i), metadata.phase_index());
+    EXPECT_EQ(1u, metadata.worker_count());
+    EXPECT_FALSE(metadata.workers_changed_vs_prior_phase());
+    EXPECT_FALSE(metadata.new_workers_cold_started());
+    ASSERT_EQ(1, metadata.pool_health_size());
+    EXPECT_EQ(0u, metadata.pool_health(0).worker_id());
+    EXPECT_GE(metadata.pool_health(0).connections_created(),
+              metadata.pool_health(0).connections_active());
+    // Claim discipline, uncensored run: everything initiated completed.
+    EXPECT_GT(metadata.initiated(), 0u);
+    EXPECT_EQ(metadata.initiated(), metadata.completed());
+    EXPECT_EQ(0u, metadata.reset_or_timed_out());
+    EXPECT_DOUBLE_EQ(1.0, metadata.completion_ratio());
+    EXPECT_EQ(0u, metadata.gate_exceeded());
+  }
+  // Phase 0's boundary drain timing is recorded; the final phase ends at the
+  // run teardown and carries no drain duration.
+  EXPECT_GE(outcome.output.phase_metadata(0).drain_duration().seconds() * 1000000000 +
+                outcome.output.phase_metadata(0).drain_duration().nanos(),
+            0);
+  EXPECT_GE(outcome.output.phase_metadata(0).idle_gap().seconds(), 0);
+  EXPECT_EQ(0, outcome.output.phase_metadata(1).drain_duration().seconds());
+  EXPECT_EQ(0, outcome.output.phase_metadata(1).drain_duration().nanos());
+}
+
+// A live snapshot after the boundary carries percentiles computed from the
+// NEW slab: the band resets at the boundary instead of mixing. The delay flip
+// makes the new slab's p99 an order of magnitude above the old one's.
+TEST_F(PhaseRunTest, LiveStreamResetsBandAtBoundary) {
+  nighthawk::client::CommandLineOptions cmd = makeTwoPhaseOptions(listener().uri());
+  cmd.mutable_live_streaming();
+  cmd.mutable_stats_flush_interval()->set_value(1);
+  listener().setResponseDelayNs(0);
+  RunOutcome outcome = runPhases(cmd, /*sample_live_snapshots=*/true,
+                                 [this](const PhaseEvent& event) {
+                                   if (event.phase_id == "phase1") {
+                                     listener().setResponseDelayNs(50 * 1000 * 1000);
+                                   }
+                                 });
+  ASSERT_TRUE(outcome.success);
+  listener().setResponseDelayNs(0);
+
+  uint64_t max_phase0_p99 = 0;
+  uint64_t min_phase1_p99 = std::numeric_limits<uint64_t>::max();
+  bool saw_phase1_statistic = false;
+  std::lock_guard<std::mutex> lock(outcome_mutex);
+  for (const nighthawk::client::LiveSnapshot& snapshot : outcome.live_snapshots) {
+    for (const nighthawk::client::StatisticSnapshot& statistic : snapshot.statistics()) {
+      if (statistic.id() != "benchmark_http_client.latency_2xx" || statistic.count() == 0) {
+        continue;
+      }
+      if (snapshot.phase_id() == "phase0") {
+        max_phase0_p99 = std::max(max_phase0_p99, statistic.p99_ns());
+      } else if (snapshot.phase_id() == "phase1") {
+        saw_phase1_statistic = true;
+        min_phase1_p99 = std::min(min_phase1_p99, statistic.p99_ns());
+      }
+    }
+  }
+  ASSERT_TRUE(saw_phase1_statistic) << "no live snapshot with phase1 latency statistics";
+  EXPECT_LT(max_phase0_p99, 10 * 1000 * 1000);
+  EXPECT_GT(min_phase1_p99, 40 * 1000 * 1000)
+      << "post-boundary snapshots carry the pre-boundary band (mixed slabs)";
+}
+
+// Claim discipline (spec 8.2): censoring is counted, not hidden. Unit seam:
+// BuildPhaseMetadata with a censored boundary turns the in-flight delta into
+// reset_or_timed_out and pushes completion_ratio below 1; an uncensored
+// boundary leaves the clean counts untouched.
+TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
+  nighthawk::client::PhaseSpec spec;
+  spec.set_name("phase0");
+
+  PhaseBoundaryTiming censored;
+  censored.phase_index = 0;
+  censored.phase_id = "phase0";
+  censored.drain_duration_ns = int64_t{5000} * 1000000; // the full 5 s deadline
+  censored.idle_gap_ns = 1000000;
+  censored.drain_censored = true;
+  const nighthawk::client::PhaseMetadata censored_metadata =
+      BuildPhaseMetadata(0, spec, &censored, /*worker_count=*/1, /*initiated=*/100,
+                         /*completed=*/97, /*stream_resets=*/1, /*gate_exceeded=*/3);
+  EXPECT_EQ(4u, censored_metadata.reset_or_timed_out()); // 1 reset + 3 hung in flight
+  EXPECT_EQ(100u, censored_metadata.initiated());
+  EXPECT_EQ(97u, censored_metadata.completed());
+  EXPECT_NEAR(0.97, censored_metadata.completion_ratio(), 1e-9);
+  EXPECT_EQ(3u, censored_metadata.gate_exceeded());
+  EXPECT_EQ(censored.drain_duration_ns,
+            censored_metadata.drain_duration().seconds() * 1000000000 +
+                censored_metadata.drain_duration().nanos());
+  EXPECT_EQ(censored.idle_gap_ns,
+            censored_metadata.idle_gap().seconds() * 1000000000 +
+                censored_metadata.idle_gap().nanos());
+
+  // Uncensored boundary: in-flight reached zero, nothing extra is counted.
+  PhaseBoundaryTiming clean;
+  clean.phase_index = 0;
+  clean.phase_id = "phase0";
+  clean.drain_duration_ns = 1000;
+  clean.idle_gap_ns = 2000;
+  clean.drain_censored = false;
+  const nighthawk::client::PhaseMetadata clean_metadata =
+      BuildPhaseMetadata(0, spec, &clean, 1, 100, 100, 1, /*gate_exceeded=*/2);
+  EXPECT_EQ(1u, clean_metadata.reset_or_timed_out());
+  EXPECT_EQ(2u, clean_metadata.gate_exceeded());
+  EXPECT_DOUBLE_EQ(1.0, clean_metadata.completion_ratio());
+
+  // The run's final phase has no boundary timing at all.
+  const nighthawk::client::PhaseMetadata final_metadata =
+      BuildPhaseMetadata(1, spec, /*boundary=*/nullptr, 1, 50, 50, 0, /*gate_exceeded=*/0);
+  EXPECT_EQ(0, final_metadata.drain_duration().seconds());
+  EXPECT_EQ(0, final_metadata.drain_duration().nanos());
+  EXPECT_EQ(0, final_metadata.idle_gap().seconds());
+  EXPECT_DOUBLE_EQ(1.0, final_metadata.completion_ratio());
 }
 
 } // namespace

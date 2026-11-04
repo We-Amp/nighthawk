@@ -113,6 +113,15 @@ public:
    * per phase begun by this worker, in phase order.
    */
   virtual const std::vector<int64_t>& phaseExecutionDurations() const PURE;
+
+  /**
+   * FORK-ONLY (We-Amp): fresh-per-phase benchmark-client statistics (M2 A1).
+   * @return the benchmark client's retained per-phase statistic slabs, in
+   * boundary order (the final phase's slab is included; the client retires it
+   * as the worker leaves its run loop). Valid to read after the workers have
+   * been joined.
+   */
+  virtual const std::vector<PhaseStatisticSlab>& benchmarkPhaseSlabs() const PURE;
 };
 
 using ClientWorkerPtr = std::unique_ptr<ClientWorker>;

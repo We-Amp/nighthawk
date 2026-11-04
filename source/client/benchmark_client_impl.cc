@@ -4,6 +4,7 @@
 #include "envoy/event/dispatcher.h"
 #include "envoy/thread_local/thread_local.h"
 
+#include "nighthawk/common/exception.h"
 #include "nighthawk/common/statistic.h"
 #include "nighthawk/user_defined_output/user_defined_output_plugin.h"
 
@@ -82,13 +83,32 @@ Http1PoolImpl::newStream(Envoy::Http::ResponseDecoder& response_decoder,
   return HttpConnPoolImplBase::newStream(response_decoder, callbacks, options);
 }
 
+// FORK-ONLY (We-Amp): the canonical statistic ids, in BenchmarkClientStatistic
+// member order. Shared by construction and by every phase-boundary swap, so a
+// slab's statistics carry exactly the ids the live set (and the run output)
+// uses.
+void BenchmarkClientHttpImpl::setBenchmarkClientStatisticIds(BenchmarkClientStatistic& statistic) {
+  statistic.connect_statistic->setId("benchmark_http_client.queue_to_connect");
+  statistic.response_statistic->setId("benchmark_http_client.request_to_response");
+  statistic.response_header_size_statistic->setId("benchmark_http_client.response_header_size");
+  statistic.response_body_size_statistic->setId("benchmark_http_client.response_body_size");
+  statistic.latency_1xx_statistic->setId("benchmark_http_client.latency_1xx");
+  statistic.latency_2xx_statistic->setId("benchmark_http_client.latency_2xx");
+  statistic.latency_3xx_statistic->setId("benchmark_http_client.latency_3xx");
+  statistic.latency_4xx_statistic->setId("benchmark_http_client.latency_4xx");
+  statistic.latency_5xx_statistic->setId("benchmark_http_client.latency_5xx");
+  statistic.latency_xxx_statistic->setId("benchmark_http_client.latency_xxx");
+  statistic.origin_latency_statistic->setId("benchmark_http_client.origin_latency_statistic");
+}
+
 BenchmarkClientHttpImpl::BenchmarkClientHttpImpl(
     Envoy::Api::Api& api, Envoy::Event::Dispatcher& dispatcher, Envoy::Stats::Scope& scope,
     BenchmarkClientStatistic& statistic, Envoy::Http::Protocol protocol,
     Envoy::Upstream::ClusterManagerPtr& cluster_manager, Envoy::Tracing::TracerSharedPtr& tracer,
     absl::string_view cluster_name, RequestGenerator request_generator,
     const bool provide_resource_backpressure, absl::string_view latency_response_header_name,
-    std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins)
+    std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins,
+    std::function<BenchmarkClientStatistic()> fresh_statistic_provider)
     : api_(api), dispatcher_(dispatcher), scope_(scope.createScope("benchmark.")),
       statistic_(std::move(statistic)), protocol_(protocol),
       benchmark_client_counters_({ALL_BENCHMARK_CLIENT_COUNTERS(POOL_COUNTER(*scope_))}),
@@ -96,18 +116,9 @@ BenchmarkClientHttpImpl::BenchmarkClientHttpImpl(
       request_generator_(std::move(request_generator)),
       provide_resource_backpressure_(provide_resource_backpressure),
       latency_response_header_name_(latency_response_header_name),
-      user_defined_output_plugins_(std::move(user_defined_output_plugins)) {
-  statistic_.connect_statistic->setId("benchmark_http_client.queue_to_connect");
-  statistic_.response_statistic->setId("benchmark_http_client.request_to_response");
-  statistic_.response_header_size_statistic->setId("benchmark_http_client.response_header_size");
-  statistic_.response_body_size_statistic->setId("benchmark_http_client.response_body_size");
-  statistic_.latency_1xx_statistic->setId("benchmark_http_client.latency_1xx");
-  statistic_.latency_2xx_statistic->setId("benchmark_http_client.latency_2xx");
-  statistic_.latency_3xx_statistic->setId("benchmark_http_client.latency_3xx");
-  statistic_.latency_4xx_statistic->setId("benchmark_http_client.latency_4xx");
-  statistic_.latency_5xx_statistic->setId("benchmark_http_client.latency_5xx");
-  statistic_.latency_xxx_statistic->setId("benchmark_http_client.latency_xxx");
-  statistic_.origin_latency_statistic->setId("benchmark_http_client.origin_latency_statistic");
+      user_defined_output_plugins_(std::move(user_defined_output_plugins)),
+      fresh_statistic_provider_(std::move(fresh_statistic_provider)) {
+  setBenchmarkClientStatisticIds(statistic_);
 }
 
 void BenchmarkClientHttpImpl::terminate() {
@@ -144,6 +155,77 @@ void BenchmarkClientHttpImpl::terminate() {
     });
     dispatcher_.run(Envoy::Event::Dispatcher::RunType::RunUntilExit);
   }
+}
+
+// FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 A1, spec 8.1/8.2).
+// beginPhaseStatistics() runs on this client's dispatcher: the swap is
+// serialized with every request start, completion and live partial
+// computation. An in-flight request at the boundary keeps writing into the
+// slab of the phase that initiated it (its decoder holds references into the
+// retired set, which the slab keeps alive); at an uncensored boundary the
+// drain has already waited for in-flight to reach zero, so the retired slab
+// is final when the swap runs. Samples lost to resets show up in the slab's
+// stream_resets delta, and requests still in flight at a censored drain in
+// the initiated-minus-completed delta (counted, not hidden; spec 8.2).
+void BenchmarkClientHttpImpl::beginPhaseStatistics(absl::string_view next_phase_id) {
+  if (!fresh_statistic_provider_) {
+    throw NighthawkException("phase statistic swap requested, but this benchmark client was "
+                             "constructed without a fresh statistic provider");
+  }
+  phase_slabs_.push_back(retireLiveSetIntoSlab());
+  installFreshStatisticSet();
+  current_phase_id_ = std::string(next_phase_id);
+}
+
+void BenchmarkClientHttpImpl::finalizePhaseStatistics() {
+  phase_slabs_.push_back(retireLiveSetIntoSlab());
+  // Leave a safe, sample-devouring set in place: no request may start after
+  // the final retire, but late shutdown completions must not dereference
+  // null statistics. Without a provider there is nothing to install; the
+  // legacy (no-provider) path never finalizes.
+  if (fresh_statistic_provider_) {
+    installFreshStatisticSet();
+  }
+}
+
+PhaseStatisticSlab BenchmarkClientHttpImpl::retireLiveSetIntoSlab() {
+  PhaseStatisticSlab slab;
+  slab.phase_id = current_phase_id_;
+  slab.statistics["benchmark_http_client.queue_to_connect"] =
+      std::move(statistic_.connect_statistic);
+  slab.statistics["benchmark_http_client.request_to_response"] =
+      std::move(statistic_.response_statistic);
+  slab.statistics["benchmark_http_client.response_header_size"] =
+      std::move(statistic_.response_header_size_statistic);
+  slab.statistics["benchmark_http_client.response_body_size"] =
+      std::move(statistic_.response_body_size_statistic);
+  slab.statistics["benchmark_http_client.latency_1xx"] =
+      std::move(statistic_.latency_1xx_statistic);
+  slab.statistics["benchmark_http_client.latency_2xx"] =
+      std::move(statistic_.latency_2xx_statistic);
+  slab.statistics["benchmark_http_client.latency_3xx"] =
+      std::move(statistic_.latency_3xx_statistic);
+  slab.statistics["benchmark_http_client.latency_4xx"] =
+      std::move(statistic_.latency_4xx_statistic);
+  slab.statistics["benchmark_http_client.latency_5xx"] =
+      std::move(statistic_.latency_5xx_statistic);
+  slab.statistics["benchmark_http_client.latency_xxx"] =
+      std::move(statistic_.latency_xxx_statistic);
+  slab.statistics["benchmark_http_client.origin_latency_statistic"] =
+      std::move(statistic_.origin_latency_statistic);
+  slab.requests_initiated = requests_initiated_ - phase_start_requests_initiated_;
+  slab.requests_completed = requests_completed_ - phase_start_requests_completed_;
+  slab.stream_resets = benchmark_client_counters_.stream_resets_.value() -
+                       phase_start_stream_resets_;
+  phase_start_requests_initiated_ = requests_initiated_;
+  phase_start_requests_completed_ = requests_completed_;
+  phase_start_stream_resets_ = benchmark_client_counters_.stream_resets_.value();
+  return slab;
+}
+
+void BenchmarkClientHttpImpl::installFreshStatisticSet() {
+  statistic_ = fresh_statistic_provider_();
+  setBenchmarkClientStatisticIds(statistic_);
 }
 
 StatisticPtrMap BenchmarkClientHttpImpl::statistics() const {

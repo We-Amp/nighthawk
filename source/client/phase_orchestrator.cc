@@ -103,5 +103,46 @@ void PhaseOrchestrator::markFinalPhaseComplete() {
   emit(last_index);
 }
 
+nighthawk::client::PhaseMetadata
+BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
+                   const PhaseBoundaryTiming* boundary, uint32_t worker_count, uint64_t initiated,
+                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded) {
+  nighthawk::client::PhaseMetadata metadata;
+  metadata.set_phase_id(phase_spec.name());
+  metadata.set_phase_index(phase_index);
+  if (boundary != nullptr) {
+    // Duration.nanos is int32; split the int64 nanosecond stamps into
+    // seconds + nanos so multi-second censored drains don't overflow.
+    metadata.mutable_drain_duration()->set_seconds(boundary->drain_duration_ns / 1000000000);
+    metadata.mutable_drain_duration()->set_nanos(boundary->drain_duration_ns % 1000000000);
+    // The idle gap is -1 when the phase has no successor; that is the final
+    // boundary and carries no gap.
+    if (boundary->idle_gap_ns >= 0) {
+      metadata.mutable_idle_gap()->set_seconds(boundary->idle_gap_ns / 1000000000);
+      metadata.mutable_idle_gap()->set_nanos(boundary->idle_gap_ns % 1000000000);
+    }
+  }
+  metadata.set_worker_count(worker_count);
+  // Worker-set deltas are Task 6's bookkeeping; a fixed worker set has
+  // neither changed members nor cold starts.
+  metadata.set_workers_changed_vs_prior_phase(false);
+  metadata.set_new_workers_cold_started(false);
+  metadata.set_initiated(initiated);
+  metadata.set_completed(completed);
+  uint64_t reset_or_timed_out = stream_resets;
+  if (boundary != nullptr && boundary->drain_censored) {
+    // Censored drain: the requests still in flight when the deadline fired
+    // are counted, not hidden (spec 8.2).
+    reset_or_timed_out += initiated - completed;
+  }
+  metadata.set_reset_or_timed_out(reset_or_timed_out);
+  // Task 5's per-phase gate refusals: starts shed by the client-side gates.
+  metadata.set_gate_exceeded(gate_exceeded);
+  metadata.set_completion_ratio(initiated > 0
+                                    ? static_cast<double>(completed) / static_cast<double>(initiated)
+                                    : 1.0);
+  return metadata;
+}
+
 } // namespace Client
 } // namespace Nighthawk

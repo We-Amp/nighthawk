@@ -29,8 +29,21 @@ void OutputCollectorImpl::addResult(
     const std::chrono::nanoseconds execution_duration,
     const std::optional<Envoy::SystemTime>& first_acquisition_time,
     const std::vector<nighthawk::client::UserDefinedOutput>& user_defined_output_results) {
+  addResult(name, statistics, counters, execution_duration, first_acquisition_time,
+            user_defined_output_results, /*phase_id=*/"");
+}
+
+void OutputCollectorImpl::addResult(
+    absl::string_view name, const std::vector<StatisticPtr>& statistics,
+    const std::map<std::string, uint64_t>& counters,
+    const std::chrono::nanoseconds execution_duration,
+    const std::optional<Envoy::SystemTime>& first_acquisition_time,
+    const std::vector<nighthawk::client::UserDefinedOutput>& user_defined_output_results,
+    absl::string_view phase_id) {
   auto result = output_.add_results();
   result->set_name(name.data(), name.size());
+  // FORK-ONLY (We-Amp): the per-phase result dimension (M2 A1).
+  result->set_phase_id(phase_id.data(), phase_id.size());
   if (first_acquisition_time.has_value()) {
     *(result->mutable_execution_start()) = Envoy::Protobuf::util::TimeUtil::NanosecondsToTimestamp(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -59,6 +72,11 @@ void OutputCollectorImpl::addResult(
        user_defined_output_results) {
     *result->add_user_defined_outputs() = user_defined_result;
   }
+}
+
+// FORK-ONLY (We-Amp): per-phase metadata (M2 A1, spec 8.2/8.4/8.6).
+void OutputCollectorImpl::addPhaseMetadata(nighthawk::client::PhaseMetadata metadata) {
+  *output_.add_phase_metadata() = std::move(metadata);
 }
 
 } // namespace Client

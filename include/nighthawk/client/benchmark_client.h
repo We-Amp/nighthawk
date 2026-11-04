@@ -1,7 +1,10 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "envoy/http/header_map.h"
 #include "envoy/runtime/runtime.h"
@@ -15,6 +18,29 @@ namespace Nighthawk {
 namespace Client {
 
 using CompletionCallback = OperationCallback;
+
+// FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 A1, spec 8.1/8.2). One
+// phase's retired benchmark-client statistic set, retained until end-of-run
+// so per-phase Results can be emitted from it, plus the per-phase claim
+// counts (boundary deltas of the client's cumulative counters). Keys of
+// `statistics` are the canonical statistic ids used in the run output (e.g.
+// "benchmark_http_client.latency_2xx").
+struct PhaseStatisticSlab {
+  // The phase the set measured, equal to the phase's PhaseSpec::name. The set
+  // installed at client construction (before any phase began) is retired
+  // under the id "main".
+  std::string phase_id;
+  std::map<std::string, StatisticPtr> statistics;
+  // Requests initiated in this phase.
+  uint64_t requests_initiated{0};
+  // Requests completed while this phase's set was live. Exact at every
+  // uncensored boundary (the drain waits for in-flight to reach zero before
+  // the next phase's set is installed); at a censored boundary, stragglers
+  // complete after the swap and land in the successor phase's count.
+  uint64_t requests_completed{0};
+  // Stream resets observed while this phase's set was live (spec 8.2).
+  uint64_t stream_resets{0};
+};
 
 class BenchmarkClient {
 public:
@@ -37,6 +63,38 @@ public:
    * @return StatisticPtrMap A map of Statistics keyed by id.
    */
   virtual StatisticPtrMap statistics() const PURE;
+
+  // FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 A1, spec 8.1/8.2).
+  // Retires the live statistic set into its phase's slab and installs a fresh
+  // set that `next_phase_id` names. Must run on the client's own dispatcher
+  // (the worker's): the swap is serialized with every request start (which
+  // binds the request's completion path to the current set's statistics), so
+  // an in-flight request keeps writing into the slab of the phase that
+  // initiated it, and with every live partial computation. The swap and the
+  // partial never race; the aggregator only reads completed, immutable
+  // partials stamped by the worker dispatcher.
+  virtual void beginPhaseStatistics(absl::string_view next_phase_id) PURE;
+
+  /**
+   * The phase id whose slab the live statistic set currently feeds. "main"
+   * until the first phase begins. May be called from any thread once the
+   * owning worker has signaled readiness.
+   */
+  virtual const std::string& currentPhaseId() const PURE;
+
+  /**
+   * Slabs retired so far, in boundary order. Read cross-thread only after the
+   * owning worker has been joined (same contract as the worker's final
+   * counter snapshot).
+   */
+  virtual const std::vector<PhaseStatisticSlab>& phaseSlabs() const PURE;
+
+  /**
+   * Retires the live statistic set (the run's final phase) into its slab.
+   * End-of-run only, on the worker dispatcher before the worker exits its run
+   * loop; no request may start afterwards.
+   */
+  virtual void finalizePhaseStatistics() PURE;
 
   /**
    * Tries to start a request. In open-loop mode this MUST always return true.

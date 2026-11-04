@@ -15,6 +15,11 @@ public:
   MOCK_METHOD(void, setShouldMeasureLatencies, (bool), (override));
   MOCK_METHOD(StatisticPtrMap, statistics, (), (const, override));
   MOCK_METHOD(bool, tryStartRequest, (Client::CompletionCallback), (override));
+  // FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 A1).
+  MOCK_METHOD(void, beginPhaseStatistics, (absl::string_view), (override));
+  MOCK_METHOD(const std::string&, currentPhaseId, (), (const, override));
+  MOCK_METHOD(const std::vector<PhaseStatisticSlab>&, phaseSlabs, (), (const, override));
+  MOCK_METHOD(void, finalizePhaseStatistics, (), (override));
   MOCK_METHOD(uint64_t, inFlightRequests, (), (const, override));
   MOCK_METHOD(void, setConnectionLimit, (uint32_t), (override));
   MOCK_METHOD(void, setMaxPendingRequests, (uint32_t), (override));

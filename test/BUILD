@@ -397,6 +397,15 @@ envoy_cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): snapshot-acquisition-vs-slab-swap seam tests (M2 Task 4).
+envoy_cc_test(
+    name = "live_partial_aggregator_test",
+    srcs = ["live_partial_aggregator_test.cc"],
+    deps = [
+        "//source/client:live_partial_aggregator_lib",
+    ],
+)
+
 envoy_cc_test(
     name = "output_formatter_test",
     srcs = ["output_formatter_test.cc"],

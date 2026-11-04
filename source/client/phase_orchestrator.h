@@ -106,5 +106,23 @@ private:
   int64_t last_drain_complete_monotonic_ns_{-1};
 };
 
+// FORK-ONLY (We-Amp): builds one phase's metadata record (M2 Task 4, spec
+// 8.2/8.4/8.6) from the orchestrator's boundary timing for the phase and the
+// phase's claim counts folded across the active workers. Pure bookkeeping,
+// unit-testable without a run. `boundary` is null for the run's final phase,
+// which ends at the run teardown rather than at a boundary drain. Pool
+// health is appended by the caller, which reads the engine's pool counters.
+//
+// Claim discipline (spec 8.2): reset_or_timed_out counts the phase's stream
+// resets, plus -- only when the boundary drain was censored -- the requests
+// still in flight when the deadline fired (initiated minus completed; at an
+// uncensored boundary in-flight reaches zero before the swap, so the delta
+// is zero). gate_exceeded is Task 5's per-phase gate-refusal count (starts
+// refused are shed and counted, never queued).
+nighthawk::client::PhaseMetadata
+BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
+                   const PhaseBoundaryTiming* boundary, uint32_t worker_count, uint64_t initiated,
+                   uint64_t completed, uint64_t stream_resets, uint64_t gate_exceeded);
+
 } // namespace Client
 } // namespace Nighthawk

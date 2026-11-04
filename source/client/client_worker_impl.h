@@ -133,6 +133,12 @@ public:
     return phase_execution_durations_;
   }
   std::vector<uint64_t> phaseGateExceededCounts() const override;
+  // Fresh-per-phase benchmark-client statistics (M2 A1); see the ClientWorker
+  // interface. Delegates to the benchmark client; the worker's run loop
+  // finalizes the last slab before exiting.
+  const std::vector<PhaseStatisticSlab>& benchmarkPhaseSlabs() const override {
+    return benchmark_client_->phaseSlabs();
+  }
 
 protected:
   void work() override;

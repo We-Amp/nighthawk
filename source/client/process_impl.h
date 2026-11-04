@@ -23,6 +23,8 @@
 #include "nighthawk/client/process.h"
 #include "nighthawk/common/statistic.h"
 
+#include "source/client/live_partial_aggregator.h"
+
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "source/common/access_log/access_log_manager_impl.h"
 #include "source/common/common/logger.h"
@@ -198,19 +200,11 @@ private:
   std::string current_phase_id_{"main"};
   std::mutex live_partials_mutex_;
   std::vector<nighthawk::client::WorkerLiveSnapshotPartial> live_partials_;
-  // Running latest per-worker counter values and statistic summaries. Each
-  // worker's partials are cumulative since run start, so the latest value per
-  // worker wins; the aggregated snapshot sums the per-worker latests over the
-  // workers (and takes the percentile maximum, see toLiveSnapshot()). This
-  // keeps snapshots cumulative from run start even when the collector drains
-  // partials one interval at a time.
-  absl::flat_hash_map<uint32_t, absl::flat_hash_map<std::string, uint64_t>>
-      live_worker_counter_values_;
-  absl::flat_hash_map<uint32_t,
-                      absl::flat_hash_map<std::string, nighthawk::client::StatisticSnapshot>>
-      live_worker_statistics_;
-  // Enforces strictly increasing monotonic_ns across snapshots.
-  int64_t last_live_snapshot_monotonic_ns_{0};
+  // FORK-ONLY (We-Amp): running fold of the drained partials. Honors the
+  // snapshot-acquisition-vs-slab-swap seam (M2 A1): statistics never fold
+  // across phase stamps; counters stay cumulative. See
+  // live_partial_aggregator.h.
+  LivePartialAggregator live_aggregator_;
   bool runInternal(OutputCollector& collector, const UriPtr& tracing_uri,
                    const Envoy::Network::DnsResolverSharedPtr& dns_resolver,
                    const std::optional<Envoy::SystemTime>& schedule);

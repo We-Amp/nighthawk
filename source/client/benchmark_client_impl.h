@@ -1,5 +1,9 @@
 #pragma once
 
+#include <functional>
+#include <string>
+#include <vector>
+
 #include "envoy/api/api.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/http/conn_pool.h"
@@ -54,6 +58,10 @@ struct BenchmarkClientCounters {
 // BenchmarkClientStatistic contains only histogram metrics.
 struct BenchmarkClientStatistic {
   BenchmarkClientStatistic(BenchmarkClientStatistic&& statistic) noexcept;
+  // FORK-ONLY (We-Amp): per-phase statistic swaps move-assign a fresh set
+  // over the retired one; the user-declared move constructor otherwise
+  // suppresses the implicit move assignment.
+  BenchmarkClientStatistic& operator=(BenchmarkClientStatistic&& statistic) noexcept = default;
   BenchmarkClientStatistic(StatisticPtr&& connect_stat, StatisticPtr&& response_stat,
                            StatisticPtr&& response_header_size_stat,
                            StatisticPtr&& response_body_size_stat, StatisticPtr&& latency_1xx_stat,
@@ -104,15 +112,17 @@ class BenchmarkClientHttpImpl : public BenchmarkClient,
                                 public StreamDecoderCompletionCallback,
                                 public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
-  BenchmarkClientHttpImpl(Envoy::Api::Api& api, Envoy::Event::Dispatcher& dispatcher,
-                          Envoy::Stats::Scope& scope, BenchmarkClientStatistic& statistic,
-                          Envoy::Http::Protocol protocol,
-                          Envoy::Upstream::ClusterManagerPtr& cluster_manager,
-                          Envoy::Tracing::TracerSharedPtr& tracer, absl::string_view cluster_name,
-                          RequestGenerator request_generator,
-                          const bool provide_resource_backpressure,
-                          absl::string_view latency_response_header_name,
-                          std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins);
+  BenchmarkClientHttpImpl(
+      Envoy::Api::Api& api, Envoy::Event::Dispatcher& dispatcher, Envoy::Stats::Scope& scope,
+      BenchmarkClientStatistic& statistic, Envoy::Http::Protocol protocol,
+      Envoy::Upstream::ClusterManagerPtr& cluster_manager, Envoy::Tracing::TracerSharedPtr& tracer,
+      absl::string_view cluster_name, RequestGenerator request_generator,
+      const bool provide_resource_backpressure, absl::string_view latency_response_header_name,
+      std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins,
+      // FORK-ONLY (We-Amp): provides a fresh statistic set at each phase
+      // boundary, with the same backends as the initial set (the factory that
+      // built the initial set, per spec 8.1). Empty: begin-phase swaps throw.
+      std::function<BenchmarkClientStatistic()> fresh_statistic_provider = {});
   void setConnectionLimit(uint32_t connection_limit) override {
     connection_limit_ = connection_limit;
   }
@@ -144,6 +154,12 @@ public:
   }
   Envoy::Stats::Scope& scope() const override { return *scope_; }
 
+  // BenchmarkClient, fork-only fresh-per-phase statistics (M2 A1).
+  void beginPhaseStatistics(absl::string_view next_phase_id) override;
+  const std::string& currentPhaseId() const override { return current_phase_id_; }
+  const std::vector<PhaseStatisticSlab>& phaseSlabs() const override { return phase_slabs_; }
+  void finalizePhaseStatistics() override;
+
   /**
    * Returns additional output from any specified User Defined Output plugins.
    */
@@ -166,6 +182,15 @@ public:
   }
 
 private:
+  // FORK-ONLY (We-Amp): sets the canonical statistic ids on a set, in
+  // BenchmarkClientStatistic member order (shared by construction and swaps).
+  static void setBenchmarkClientStatisticIds(BenchmarkClientStatistic& statistic);
+  // Moves the live statistic set and this phase's claim-count deltas into a
+  // slab. Runs on this client's dispatcher only.
+  PhaseStatisticSlab retireLiveSetIntoSlab();
+  // Installs a fresh statistic set (via fresh_statistic_provider_) with the
+  // canonical ids set.
+  void installFreshStatisticSet();
   Envoy::Api::Api& api_;
   Envoy::Event::Dispatcher& dispatcher_;
   Envoy::Stats::ScopeSharedPtr scope_;
@@ -196,6 +221,22 @@ private:
   const std::string latency_response_header_name_;
   Envoy::Event::TimerPtr drain_timer_;
   std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins_;
+  // FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 A1). All state below
+  // is touched on this client's dispatcher only, except phase_slabs_ (read
+  // cross-thread after the owning worker has been joined).
+  // Provides a fresh statistic set per boundary; empty when the client was
+  // constructed without phase support.
+  const std::function<BenchmarkClientStatistic()> fresh_statistic_provider_;
+  // Slabs retired at boundaries so far, in boundary order.
+  std::vector<PhaseStatisticSlab> phase_slabs_;
+  // The phase id whose slab the live set feeds; "main" until the first
+  // begin-phase swap.
+  std::string current_phase_id_{"main"};
+  // Cumulative counter values when the live set's phase began; per-phase
+  // deltas are taken against these at the boundary.
+  uint64_t phase_start_requests_completed_{0};
+  uint64_t phase_start_requests_initiated_{0};
+  uint64_t phase_start_stream_resets_{0};
 };
 
 } // namespace Client

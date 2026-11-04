@@ -49,16 +49,24 @@ BenchmarkClientPtr BenchmarkClientFactoryImpl::create(
   // NullStatistic).
   // TODO(#292): Create options and have the StatisticFactory consider those when instantiating
   // statistics.
-  BenchmarkClientStatistic statistic(statistic_factory.create(), statistic_factory.create(),
-                                     std::make_unique<StreamingStatistic>(),
-                                     std::make_unique<StreamingStatistic>(),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id),
-                                     std::make_unique<SinkableHdrStatistic>(scope, worker_id));
+  // FORK-ONLY (We-Amp): the same construction is captured as the fresh-set
+  // provider the benchmark client uses at each phase boundary (spec 8.1:
+  // fresh-per-phase statistics come from the same factory), so every phase's
+  // set has the same backends as the initial one.
+  const auto build_statistic_set = [statistic_factory, &scope,
+                                    worker_id]() -> BenchmarkClientStatistic {
+    return BenchmarkClientStatistic(
+        statistic_factory.create(), statistic_factory.create(),
+        std::make_unique<StreamingStatistic>(), std::make_unique<StreamingStatistic>(),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id),
+        std::make_unique<SinkableHdrStatistic>(scope, worker_id));
+  };
+  BenchmarkClientStatistic statistic = build_statistic_set();
   auto benchmark_client = std::make_unique<BenchmarkClientHttpImpl>(
       api, dispatcher, scope, statistic, options_.protocol(), cluster_manager, tracer, cluster_name,
       request_generator.get(),
@@ -66,7 +74,8 @@ BenchmarkClientPtr BenchmarkClientFactoryImpl::create(
       // active regardless of open-loop mode (M2 Task 5: phase boundaries are
       // not live turns -- the gates enforce the phase's declared ceiling).
       !options_.openLoop() || options_.hasPhaseVector(),
-      options_.responseHeaderWithLatencyInput(), std::move(user_defined_output_plugins));
+      options_.responseHeaderWithLatencyInput(), std::move(user_defined_output_plugins),
+      build_statistic_set);
   benchmark_client->setConnectionLimit(options_.connections());
   benchmark_client->setMaxPendingRequests(options_.maxPendingRequests());
   benchmark_client->setMaxActiveRequests(options_.maxActiveRequests());

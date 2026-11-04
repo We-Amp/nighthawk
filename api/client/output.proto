@@ -71,6 +71,61 @@ message Result {
   // returned in the same order the user_defined_plugin_configs are provided in the request.
   // To determine which plugin each output goes to, use the UserDefinedOutput's plugin_name field.
   repeated UserDefinedOutput user_defined_outputs = 6;
+  // The phase of a multi-phase run whose statistic slab this result was built
+  // from. Empty for results that are not phase-scoped (the run-level aggregate
+  // and per-worker groups), and for legacy single-phase runs.
+  string phase_id = 7;
+}
+
+// FORK-ONLY (We-Amp): rebase check. Pool health for one worker, surfaced from
+// the engine's own pool counters (spec 8.6: warm-pool neutrality must be
+// observable, so multi-phase runs surface what the acceptance asserts).
+message WorkerPoolHealth {
+  // The worker these counters belong to.
+  uint32 worker_id = 1;
+  // Connections created on this worker (cumulative, engine pool counter).
+  uint64 connections_created = 2;
+  // Connections live on this worker at the end of the phase.
+  uint64 connections_active = 3;
+}
+
+// FORK-ONLY (We-Amp): rebase check. Metadata for one phase of a multi-phase
+// run: boundary timing (spec 8.6), worker-set identity (spec 8.4), and the
+// claim-discipline counts (spec 8.2: censoring and gate refusals are counted,
+// not hidden; the completion ratio is computed in the output, not the
+// consumer).
+message PhaseMetadata {
+  // The phase id, equal to the phase's PhaseSpec::name.
+  string phase_id = 1;
+  // The phase's zero-based position in the run's phase vector.
+  uint32 phase_index = 2;
+  // Duration of the non-destructive boundary drain that ended this phase.
+  // Zero for the run's final phase, which ends at the run teardown rather
+  // than at a boundary drain.
+  google.protobuf.Duration drain_duration = 3;
+  // Last drain completion of this phase -> next phase's first scheduled work.
+  google.protobuf.Duration idle_gap = 4;
+  // Number of workers active in this phase (spec 8.4 non-comparability key).
+  uint32 worker_count = 5;
+  // True iff the active worker set differs from the prior phase's.
+  bool workers_changed_vs_prior_phase = 6;
+  // True iff workers that were idle in the prior phase cold-started here.
+  bool new_workers_cold_started = 7;
+  // Requests initiated in this phase.
+  uint64 initiated = 8;
+  // Requests completed in this phase (attributed via the phase's statistic
+  // slab; completions of phase-initiated requests that straggle past a
+  // censored boundary land in the successor phase's completion count).
+  uint64 completed = 9;
+  // Samples not counted as clean completions in this phase: stream resets
+  // plus the requests still in flight when a censored drain gave up waiting.
+  uint64 reset_or_timed_out = 10;
+  // Starts refused by the per-phase client-side gates (counted, not queued).
+  uint64 gate_exceeded = 11;
+  // completed / initiated; 1 when nothing was initiated.
+  double completion_ratio = 12;
+  // Pool health for every worker active in this phase.
+  repeated WorkerPoolHealth pool_health = 13;
 }
 
 // The full set of output returned by a Nighthawk run, including the Results from every worker.
@@ -79,4 +134,7 @@ message Output {
   nighthawk.client.CommandLineOptions options = 2;
   repeated Result results = 3;
   envoy.config.core.v3.BuildVersion version = 4;
+  // FORK-ONLY (We-Amp): rebase check (fork-only fields >= 911). One entry per
+  // phase, in phase order; empty for legacy single-phase runs.
+  repeated PhaseMetadata phase_metadata = 911;
 }

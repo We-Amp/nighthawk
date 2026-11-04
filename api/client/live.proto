@@ -65,4 +65,9 @@ message WorkerLiveSnapshotPartial {
   uint32 worker_id = 1;
   repeated StatisticSnapshot statistics = 2;
   map<string, uint64> counters = 3;
+  // The phase id whose statistic slab this partial was computed from, stamped
+  // at computation time on the worker dispatcher. A partial never mixes
+  // slabs; the aggregator groups/labels by this stamp and never folds
+  // statistics across different stamps.
+  string phase_id = 4;
 }

@@ -1,4 +1,7 @@
+#include <map>
 #include <vector>
+
+#include "api/client/live.pb.h"
 
 #include "source/common/common/random_generator.h"
 #include "source/common/config/utility.h"
@@ -58,6 +61,20 @@ struct ClientSetupParameters {
 };
 
 ACTION(ReturnNewHostSelectionResponse) { return Envoy::Upstream::HostSelectionResponse(nullptr); }
+
+// FORK-ONLY (We-Amp): a fresh statistic set with percentile-capable backends
+// for the latency statistics, matching the production factory's shape
+// (HdrStatistic latencies, StreamingStatistic sizes). The per-phase tests use
+// it as both the initial set and the fresh-set provider.
+Client::BenchmarkClientStatistic makeHdrStatisticSet() {
+  return Client::BenchmarkClientStatistic(
+      std::make_unique<HdrStatistic>(), std::make_unique<HdrStatistic>(),
+      std::make_unique<StreamingStatistic>(), std::make_unique<StreamingStatistic>(),
+      std::make_unique<HdrStatistic>(), std::make_unique<HdrStatistic>(),
+      std::make_unique<HdrStatistic>(), std::make_unique<HdrStatistic>(),
+      std::make_unique<HdrStatistic>(), std::make_unique<HdrStatistic>(),
+      std::make_unique<HdrStatistic>());
+}
 } // namespace
 
 class BenchmarkClientHttpTest : public Test {
@@ -203,6 +220,68 @@ public:
   uint64_t getCounter(absl::string_view name) {
     return client_->scope().counterFromString(std::string(name)).value();
   }
+
+  // FORK-ONLY (We-Amp): minimal pool wiring plus a traffic burst for the
+  // per-phase statistic tests: n requests started and completed against the
+  // mock pool, all answered with a 200.
+  void setupPoolForTraffic() {
+    if (pool_traffic_ready_) {
+      return;
+    }
+    pool_traffic_ready_ = true;
+    EXPECT_CALL(pool_, newStream(_, _, _))
+        .WillRepeatedly([this](Envoy::Http::ResponseDecoder& decoder,
+                               Envoy::Http::ConnectionPool::Callbacks& callbacks,
+                               const Envoy::Http::ConnectionPool::Instance::StreamOptions&)
+                           -> Envoy::Http::ConnectionPool::Cancellable* {
+          decoders_.push_back(&decoder);
+          NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+          callbacks.onPoolReady(stream_encoder_, Envoy::Upstream::HostDescriptionConstSharedPtr{},
+                                stream_info, {});
+          return nullptr;
+        });
+  }
+
+  void runTraffic(uint64_t n, absl::string_view response_status = "200") {
+    setupPoolForTraffic();
+    uint64_t inflight = 0;
+    Client::CompletionCallback cb = [this, &inflight](bool, bool) {
+      if (--inflight == 0) {
+        dispatcher_->exit();
+      }
+    };
+    for (uint64_t i = 0; i < n; i++) {
+      ASSERT_TRUE(client_->tryStartRequest(cb));
+      inflight++;
+    }
+    dispatcher_->run(Envoy::Event::Dispatcher::RunType::Block);
+    for (Envoy::Http::ResponseDecoder* decoder : decoders_) {
+      Envoy::Http::ResponseHeaderMapPtr response_headers{
+          new Envoy::Http::TestResponseHeaderMapImpl{{":status", std::string(response_status)}}};
+      decoder->decodeHeaders(std::move(response_headers), false);
+      Envoy::Buffer::OwnedImpl buffer(std::string(8, 'a'));
+      decoder->decodeData(buffer, true);
+    }
+    decoders_.clear();
+    dispatcher_->run(Envoy::Event::Dispatcher::RunType::Block);
+  }
+
+  // Creates a phase-aware client: fresh HdrStatistic-based sets per boundary
+  // (percentile-capable, for the freshness assertions). Backpressure off, so
+  // every start succeeds regardless of resource limits.
+  void setupPhaseClient() {
+    // The initial set AND every fresh set must come from the same builder, or
+    // cross-slab combines hit a std::bad_cast (spec 8.1's same-factory rule).
+    Client::BenchmarkClientStatistic initial = makeHdrStatisticSet();
+    client_ = std::make_unique<Client::BenchmarkClientHttpImpl>(
+        *api_, *dispatcher_, *store_.rootScope(), initial, Envoy::Http::Protocol::Http11,
+        cluster_manager_, tracer_, "benchmark", getDefaultRequestGenerator(),
+        /*provide_resource_backpressure=*/false,
+        /*response_header_with_latency_input=*/"", std::move(user_defined_output_plugins_),
+        [] { return makeHdrStatisticSet(); });
+  }
+
+  bool pool_traffic_ready_{false};
 
   Envoy::Upstream::MockClusterManager& cluster_manager() {
     return dynamic_cast<Envoy::Upstream::MockClusterManager&>(*cluster_manager_);
@@ -767,6 +846,165 @@ TEST_F(BenchmarkClientHttpTest, GetUserDefinedOutputResultsIncludesErrorsWhenPlu
   *expected_output.mutable_error_message() =
       "INTERNAL: Intentional FakeUserDefinedOutputPlugin failure on getting PerWorkerOutput";
   EXPECT_THAT(outputs[0], EqualsProto(expected_output));
+}
+
+// ---------------------------------------------------------------------------
+// FORK-ONLY (We-Amp): fresh-per-phase statistics (M2 Task 4, spec 8.1/8.2).
+// ---------------------------------------------------------------------------
+
+// A begin-phase swap retires the live set into a slab and installs a fresh,
+// empty set: every later sample lands in the new phase's slab only.
+TEST_F(BenchmarkClientHttpTest, PhaseStatisticsBeginFreshAtBoundary) {
+  setupPhaseClient();
+  for (int i = 0; i < 3; i++) {
+    client_->exportLatency(200, 1000);
+  }
+  ASSERT_EQ(3, client_->statistics()["benchmark_http_client.latency_2xx"]->count());
+  ASSERT_EQ("main", client_->currentPhaseId());
+
+  client_->beginPhaseStatistics("phase0");
+
+  EXPECT_EQ("phase0", client_->currentPhaseId());
+  EXPECT_EQ(0, client_->statistics()["benchmark_http_client.latency_2xx"]->count());
+  ASSERT_EQ(1, client_->phaseSlabs().size());
+  EXPECT_EQ("main", client_->phaseSlabs()[0].phase_id);
+  ASSERT_NE(client_->phaseSlabs()[0].statistics.find("benchmark_http_client.latency_2xx"),
+            client_->phaseSlabs()[0].statistics.end());
+  EXPECT_EQ(3, client_->phaseSlabs()[0]
+                   .statistics
+                   .at("benchmark_http_client.latency_2xx")
+                   ->count());
+}
+
+// The plan's freshness test: distinct per-phase latency profiles stay
+// separated across the boundary. Phase 2's slab percentiles reflect only
+// phase 2's samples; the retired slab keeps phase 1's.
+TEST_F(BenchmarkClientHttpTest, PhaseStatisticsAreFreshPerBoundary) {
+  setupPhaseClient();
+  for (int i = 0; i < 50; i++) {
+    client_->exportLatency(200, 1000);
+  }
+  client_->beginPhaseStatistics("phase1");
+  for (int i = 0; i < 50; i++) {
+    client_->exportLatency(200, 100000);
+  }
+
+  ASSERT_EQ(1, client_->phaseSlabs().size());
+  const Statistic& slab1 =
+      *client_->phaseSlabs()[0].statistics.at("benchmark_http_client.latency_2xx");
+  const Statistic& phase2 =
+      *client_->statistics().at("benchmark_http_client.latency_2xx");
+  EXPECT_EQ(50, slab1.count());
+  EXPECT_EQ(50, phase2.count()); // not 100: the live set knows nothing of phase 1.
+  EXPECT_NEAR(slab1.rawPercentileValueAt(99), 1000, 100);
+  EXPECT_NEAR(phase2.rawPercentileValueAt(99), 100000, 10000);
+  EXPECT_NEAR(slab1.mean(), 1000, 100);
+  EXPECT_NEAR(phase2.mean(), 100000, 10000);
+}
+
+// Run-level totals equal the combine of all phase slabs exactly: count
+// conservation at every statistic id.
+TEST_F(BenchmarkClientHttpTest, CombineConservesTotalsAcrossPhases) {
+  setupPhaseClient();
+  for (int i = 0; i < 40; i++) {
+    client_->exportLatency(200, 1000);
+  }
+  client_->beginPhaseStatistics("phase2");
+  for (int i = 0; i < 40; i++) {
+    client_->exportLatency(200, 2000);
+  }
+  client_->finalizePhaseStatistics();
+
+  ASSERT_EQ(2, client_->phaseSlabs().size());
+  std::map<std::string, StatisticPtr> totals;
+  for (const Client::PhaseStatisticSlab& slab : client_->phaseSlabs()) {
+    for (const auto& [id, statistic] : slab.statistics) {
+      auto it = totals.find(id);
+      if (it == totals.end()) {
+        auto clone = statistic->createNewInstanceOfSameType()->combine(*statistic);
+        totals.emplace(id, std::move(clone));
+      } else {
+        auto merged = it->second->combine(*statistic);
+        totals[id] = std::move(merged);
+      }
+    }
+  }
+  ASSERT_NE(totals.find("benchmark_http_client.latency_2xx"), totals.end());
+  EXPECT_EQ(80, totals["benchmark_http_client.latency_2xx"]->count());
+  EXPECT_NEAR(totals["benchmark_http_client.latency_2xx"]->mean(), 1500, 1000);
+}
+
+// Claim discipline (spec 8.2): per-phase initiated/completed/reset counts are
+// boundary deltas of the cumulative counters, and the final phase's set is
+// retired by finalize.
+TEST_F(BenchmarkClientHttpTest, PhaseSlabClaimCountsAreBoundaryDeltas) {
+  setupPhaseClient();
+  client_->setConnectionLimit(4);
+  client_->setMaxPendingRequests(4);
+  cluster_info().resetResourceManager(4, 4, 1024, 0, 1024);
+  runTraffic(6);
+  client_->beginPhaseStatistics("phase1");
+  runTraffic(4);
+  // Non-success completions increment stream_resets (spec 8.2's reset
+  // counter); they count as completions for the in-flight accounting too.
+  Envoy::Http::ResponseHeaderMapPtr failure_headers{
+      new Envoy::Http::TestResponseHeaderMapImpl{{":status", "503"}}};
+  client_->onComplete(false, *failure_headers);
+  client_->onComplete(false, *failure_headers);
+  client_->finalizePhaseStatistics();
+
+  ASSERT_EQ(2, client_->phaseSlabs().size());
+  EXPECT_EQ(6, client_->phaseSlabs()[0].requests_initiated);
+  EXPECT_EQ(6, client_->phaseSlabs()[0].requests_completed);
+  EXPECT_EQ(0, client_->phaseSlabs()[0].stream_resets);
+  EXPECT_EQ(4, client_->phaseSlabs()[1].requests_initiated);
+  EXPECT_EQ(6, client_->phaseSlabs()[1].requests_completed);
+  EXPECT_EQ(2, client_->phaseSlabs()[1].stream_resets);
+}
+
+// The swap seam: a live partial computed before the swap carries exactly the
+// pre-boundary stamp and the pre-boundary slab's counts; one computed after
+// the swap carries exactly the post-boundary stamp and counts. This mirrors
+// the worker's emitLiveSnapshotPartial() (computed on the worker dispatcher,
+// serialized with the swap); the end-to-end stamping is covered by the
+// phase-run live-stream tests.
+TEST_F(BenchmarkClientHttpTest, LivePartialInterleavedWithSwapCarriesSinglePhaseId) {
+  setupPhaseClient();
+  const auto emitPartial = [this]() {
+    nighthawk::client::WorkerLiveSnapshotPartial partial;
+    partial.set_worker_id(0);
+    partial.set_phase_id(client_->currentPhaseId());
+    for (const auto& [id, statistic] : client_->statistics()) {
+      nighthawk::client::StatisticSnapshot* snapshot = partial.add_statistics();
+      snapshot->set_id(id);
+      snapshot->set_count(statistic->count());
+      snapshot->set_p99_ns(statistic->rawPercentileValueAt(99));
+    }
+    return partial;
+  };
+
+  for (int i = 0; i < 10; i++) {
+    client_->exportLatency(200, 1000);
+  }
+  const nighthawk::client::WorkerLiveSnapshotPartial pre = emitPartial();
+  client_->beginPhaseStatistics("phase1");
+  for (int i = 0; i < 4; i++) {
+    client_->exportLatency(200, 100000);
+  }
+  const nighthawk::client::WorkerLiveSnapshotPartial post = emitPartial();
+
+  EXPECT_EQ("main", pre.phase_id());
+  EXPECT_EQ("phase1", post.phase_id());
+  const auto findCount = [](const nighthawk::client::WorkerLiveSnapshotPartial& partial) {
+    for (const auto& stat : partial.statistics()) {
+      if (stat.id() == "benchmark_http_client.latency_2xx") {
+        return stat.count();
+      }
+    }
+    return static_cast<uint64_t>(0);
+  };
+  EXPECT_EQ(10, findCount(pre));
+  EXPECT_EQ(4, findCount(post)); // no torn read: never 14, never the mixed slab.
 }
 
 } // namespace Nighthawk

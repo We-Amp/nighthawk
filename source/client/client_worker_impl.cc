@@ -112,6 +112,14 @@ void ClientWorkerImpl::work() {
     live_snapshot_timer_->disableTimer();
     live_snapshot_timer_.reset();
   }
+  if (phase_driven_run_) {
+    // Fresh-per-phase statistics (M2 A1): retire the final phase's live set
+    // into its slab, on this dispatcher, so the end-of-run fold can emit
+    // per-phase Results for every phase including the last one. The legacy
+    // run keeps its live set untouched (the global fold reads it below via
+    // statistics()).
+    benchmark_client_->finalizePhaseStatistics();
+  }
 
   // Save a final snapshot of the worker-specific counter accumulations before
   // we exit the thread.
@@ -150,6 +158,13 @@ void ClientWorkerImpl::emitLiveSnapshotPartial() {
   }
   nighthawk::client::WorkerLiveSnapshotPartial partial;
   partial.set_worker_id(worker_number_);
+  // Stamp the partial with the phase id of the slab its statistics came from,
+  // computed here on this dispatcher: the same dispatcher the benchmark
+  // client swaps slabs on, so within this worker the stamp is always in sync
+  // with the slab the loop above just read. The aggregator never folds
+  // statistics across different stamps (snapshot-acquisition-vs-slab-swap
+  // seam, M2 A1).
+  partial.set_phase_id(benchmark_client_->currentPhaseId());
   // These statistics are confined to this worker's thread; we are running on
   // that very dispatcher, so reading them here is race-free without locking.
   for (const auto& statistic : statistics()) {
@@ -276,6 +291,12 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   });
   ENVOY_LOG(debug, "worker {}: begin phase {} ('{}'), final: {}", worker_number_, phase_index,
             phase_spec.name(), final_phase);
+  // Fresh-per-phase statistics (M2 A1): retire the previous phase's
+  // benchmark-client statistic set into its slab and install this phase's
+  // fresh set before the sequencer starts the first request of the phase.
+  // On this dispatcher, so the swap is serialized with request starts,
+  // completions and live partials.
+  benchmark_client_->beginPhaseStatistics(phase_spec.name());
   sequencer_impl.start();
 
 }

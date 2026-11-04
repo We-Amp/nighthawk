@@ -87,6 +87,19 @@ envoy_cc_library(
     ],
 )
 
+# FORK-ONLY (We-Amp): phase-aware fold of per-worker live snapshot partials
+# (M2 A1 snapshot-acquisition-vs-slab-swap seam).
+envoy_cc_library(
+    name = "live_partial_aggregator_lib",
+    srcs = ["live_partial_aggregator.cc"],
+    hdrs = ["live_partial_aggregator.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "@com_google_absl//absl/container:flat_hash_map",
+    ],
+)
+
 envoy_cc_library(
     name = "nighthawk_client_lib",
     srcs = [
@@ -105,6 +118,7 @@ envoy_cc_library(
         "client_worker_impl.h",
         "factories_impl.h",
         "flush_worker_impl.h",
+        "live_partial_aggregator.h",
         "process_impl.h",
         "remote_process_impl.h",
         "stream_decoder.h",
@@ -115,6 +129,7 @@ envoy_cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = [
+        ":live_partial_aggregator_lib",
         ":options_impl_lib",
         ":output_collector_impl_lib",
         ":phase_orchestrator_lib",
