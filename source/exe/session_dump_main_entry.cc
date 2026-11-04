@@ -47,6 +47,12 @@ int runSessionDump(int argc, const char* const* argv, std::ostream& err) {
     }
     std::string json;
     google::protobuf::util::JsonPrintOptions options;
+    // Print default-valued fields too (M1 final fixes): a profileWindow's
+    // interval_source = FETCH_ORCHESTRATION and clock_offset_uncertainty_ns
+    // = 0 are exactly the values a reader needs to see — proto3 JSON would
+    // omit them, and the record's whole point is to say which clock domain
+    // it is in.
+    options.always_print_fields_with_no_presence = true;
     auto status = google::protobuf::util::MessageToJsonString(**next, &json, options);
     if (!status.ok()) {
       err << status.ToString() << "\n";
