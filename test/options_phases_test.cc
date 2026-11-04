@@ -199,6 +199,38 @@ TEST(OptionsPhasesTest, SinglePhaseVectorIsLegacyEquivalent) {
   EXPECT_FALSE(serialized->has_concurrency());
 }
 
+// The duration/rps/concurrency-parse checks apply at any vector size: a
+// malformed single-phase vector must fail fast instead of silently running
+// with a zero duration or zero rps.
+TEST(OptionsPhasesTest, SinglePhaseVectorRejectsInvalidDurationOrRps) {
+  nighthawk::client::CommandLineOptions short_duration = makeOptionsWithPhases(1);
+  short_duration.mutable_phases(0)->mutable_duration()->set_seconds(0);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(short_duration),
+                          MalformedArgvException, "phase\\[0\\].*duration");
+
+  nighthawk::client::CommandLineOptions unset_duration = makeOptionsWithPhases(1);
+  unset_duration.mutable_phases(0)->clear_duration();
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(unset_duration),
+                          MalformedArgvException, "phase\\[0\\].*duration");
+
+  nighthawk::client::CommandLineOptions zero_rps = makeOptionsWithPhases(1);
+  zero_rps.mutable_phases(0)->set_requests_per_second(0);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(zero_rps), MalformedArgvException,
+                          "phase\\[0\\].*requests_per_second");
+}
+
+TEST(OptionsPhasesTest, SinglePhaseVectorRejectsInvalidOrAutoConcurrency) {
+  nighthawk::client::CommandLineOptions auto_concurrency = makeOptionsWithPhases(1);
+  auto_concurrency.mutable_phases(0)->mutable_concurrency()->set_value("auto");
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(auto_concurrency),
+                          MalformedArgvException, "phase\\[0\\].*concurrency");
+
+  nighthawk::client::CommandLineOptions garbage_concurrency = makeOptionsWithPhases(1);
+  garbage_concurrency.mutable_phases(0)->mutable_concurrency()->set_value("foo");
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(garbage_concurrency),
+                          MalformedArgvException, "phase\\[0\\].*concurrency");
+}
+
 // The pure validation entry point agrees with the OptionsImpl-level behavior.
 TEST(OptionsPhasesTest, PureValidationEntry) {
   EXPECT_TRUE(validatePhaseVector(nighthawk::client::CommandLineOptions{}).ok());
