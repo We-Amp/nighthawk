@@ -202,11 +202,16 @@ std::string CellBody(int w, const std::string& label, const Mark& mark) {
   }
   std::string content = label;
   if (content.size() > static_cast<size_t>(inner)) {
-    content = content.substr(0, static_cast<size_t>(inner) - 3) + "...";
-  }
-  const int pad = inner - static_cast<int>(content.size());
-  for (int p = 0; p < pad; ++p) {
-    content.push_back(DensityAt(mark.band, p) ? glyph : ' ');
+    // Truncated: "..." plus ONE RESERVED TRAILING CELL for the band's
+    // density glyph — a fully-truncated diff cell still carries its
+    // non-color hue/band signal (the monochrome-paste promise).
+    content = content.substr(0, static_cast<size_t>(inner) - 4) + "...";
+    content.push_back(DensityAt(mark.band, 0) ? glyph : ' ');
+  } else {
+    const int pad = inner - static_cast<int>(content.size());
+    for (int p = 0; p < pad; ++p) {
+      content.push_back(DensityAt(mark.band, p) ? glyph : ' ');
+    }
   }
   return "[" + content + "]";
 }
@@ -301,6 +306,42 @@ FoldedTree CollapseBelowThreshold(const FoldedTree& tree, double threshold) {
   return out;
 }
 
+std::optional<FramePath> CollapseTranslatePath(const FoldedTree& uncollapsed,
+                                               const FoldedTree& collapsed,
+                                               const FramePath& path) {
+  FramePath out;
+  out.reserve(path.size());
+  const std::vector<FoldedFrame>* u = &uncollapsed.root;
+  const std::vector<FoldedFrame>* c = &collapsed.root;
+  for (int k : path) {
+    if (k < 0 || static_cast<size_t>(k) >= u->size()) {
+      return std::nullopt;
+    }
+    // Rank k among the survivors: the collapsed children are a subsequence
+    // of the uncollapsed children, order preserved (a folded tree has no
+    // same-name siblings, so function identity positions the two-pointer
+    // walk). An index whose frame was pruned never matches -> nullopt.
+    size_t p = 0;
+    int post = -1;
+    for (size_t j = 0; j < u->size(); ++j) {
+      if (p < c->size() && (*u)[j].function == (*c)[p].function) {
+        if (j == static_cast<size_t>(k)) {
+          post = static_cast<int>(p);
+          break;
+        }
+        ++p;
+      }
+    }
+    if (post < 0) {
+      return std::nullopt;  // this level of the path was pruned away
+    }
+    out.push_back(post);
+    u = &(*u)[static_cast<size_t>(k)].children;
+    c = &(*c)[static_cast<size_t>(post)].children;
+  }
+  return out;
+}
+
 std::vector<FramePath> SearchMatches(const FoldedTree& tree, absl::string_view query) {
   std::vector<FramePath> hits;
   if (query.empty()) {
@@ -358,59 +399,54 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
     return ftxui::emptyElement();
   }
 
-  // The displayed tree: zoom re-roots, collapse prunes. Every path below
-  // (selection, search hits, overlay marks) addresses THIS tree.
-  const FoldedTree displayed = CollapseBelowThreshold(
-      ZoomToFrame(tree, state.zoom_path.value_or(FramePath{})), state.collapse_threshold_ratio);
+  // The displayed tree: zoom re-roots, then collapse prunes. Every path is
+  // carried into displayed coordinates through the same two translations:
+  // the zoom prefix strip (MapDiffPathToDisplayed) for diff marks, and the
+  // collapse re-index (CollapseTranslatePath) for diff marks AND the view
+  // state's selection — pruning shifts sibling indices, so un-translated
+  // paths would land on the wrong frames.
+  const FoldedTree uncollapsed =
+      ZoomToFrame(tree, state.zoom_path.value_or(FramePath{}));
+  const FoldedTree displayed =
+      CollapseBelowThreshold(uncollapsed, state.collapse_threshold_ratio);
 
-  // Overlay marks, keyed by displayed-tree path (zoom prefix stripped).
+  // The selection, translated into displayed coordinates (nullopt: its frame
+  // was pruned away — no selected row this frame).
+  FlamegraphViewState render_state = state;
+  if (render_state.selected.has_value()) {
+    render_state.selected =
+        CollapseTranslatePath(uncollapsed, displayed, *render_state.selected);
+  }
+
+  // Overlay marks, keyed by displayed-tree path.
   std::map<FramePath, const DifferentialNodeDiff*> marks;
   if (state.diff_mode && diff != nullptr) {
     for (const DifferentialNodeDiff& node : diff->diffs) {
       auto mapped = MapDiffPathToDisplayed(node.child_path, state.zoom_path);
+      if (mapped.has_value()) {
+        mapped = CollapseTranslatePath(uncollapsed, displayed, *mapped);
+      }
       if (mapped.has_value()) {
         marks[*mapped] = &node;
       }
     }
   }
 
-  // Header rows.
-  std::vector<ftxui::Element> lines;
-  if (!tree.symbolized) {
-    lines.push_back(ftxui::text(TruncateToWidth(
-        "unsymbolized profile - addresses only (no symbol names)", width)));
-  }
-  std::string header =
-      absl::StrCat("flamegraph total ", tree.total_value, " ", tree.value_unit);
-  if (state.zoom_path.has_value()) {
-    const FoldedFrame* zoom_frame = FrameAt(tree.root, *state.zoom_path);
-    if (zoom_frame != nullptr) {
-      absl::StrAppend(&header, " zoom:", zoom_frame->function);
+  const int total_rows = DepthOf(displayed);
+  const size_t legend_rows = [&]() -> size_t {
+    if (!state.diff_mode) {
+      return 0;
     }
-  }
-  if (!state.search.empty()) {
-    absl::StrAppend(&header, " search:", state.search,
-                    " hits:", SearchMatches(displayed, state.search).size());
-  }
-  lines.push_back(ftxui::text(TruncateToWidth(header, width)));
-
-  if (state.diff_mode) {
-    if (diff == nullptr) {
-      lines.push_back(ftxui::text(TruncateToWidth("diff: no differential loaded", width)));
-    } else if (!diff->comparable) {
-      lines.push_back(ftxui::text(
-          TruncateToWidth("non-comparable: " + diff->incomparable_reason, width)));
-    } else {
-      // The two-row legend, one row per hue (glyphs survive a monochrome
-      // paste; the color is additive).
-      lines.push_back(ftxui::text(TruncateToWidth(
-          "[###] hotter (per-request; +new = absent in base)", width)));
-      lines.push_back(ftxui::text(TruncateToWidth("[~~~] cooler (per-request)", width)));
+    if (diff == nullptr || !diff->comparable) {
+      return 1;
     }
-  }
-
-  const int header_rows = static_cast<int>(lines.size());
+    return 2;
+  }();
+  const int header_rows =
+      (tree.symbolized ? 0 : 1) + 1 + static_cast<int>(legend_rows);
   const int viewport_rows = height - header_rows;
+  const int scroll =
+      viewport_rows > 0 ? DeriveScrollRow(displayed, render_state, viewport_rows) : 0;
 
   // Rectangle layout: iterative DFS (deep stacks from real profiles).
   // Children stack left-to-right inside the parent's rectangle; every width
@@ -455,6 +491,9 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
       x += w;
     }
   }
+  // Overflow honesty cue: roots pushed past the right edge are counted, and
+  // the header says how many never made it into a rectangle.
+  const size_t hidden_roots = displayed.root.size() - queue.size();
   for (size_t head = 0; head < queue.size(); ++head) {
     const Item item = queue[head];
     const int w = std::min(width_for(item.frame->total_value), item.max_x - item.x);
@@ -477,8 +516,49 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
     }
   }
 
+  // Header rows.
+  std::vector<ftxui::Element> lines;
+  if (!tree.symbolized) {
+    lines.push_back(ftxui::text(TruncateToWidth(
+        "unsymbolized profile - addresses only (no symbol names)", width)));
+  }
+  std::string header =
+      absl::StrCat("flamegraph total ", tree.total_value, " ", tree.value_unit);
+  if (state.zoom_path.has_value()) {
+    const FoldedFrame* zoom_frame = FrameAt(tree.root, *state.zoom_path);
+    if (zoom_frame != nullptr) {
+      absl::StrAppend(&header, " zoom:", zoom_frame->function);
+    }
+  }
+  if (!state.search.empty()) {
+    absl::StrAppend(&header, " search:", state.search,
+                    " hits:", SearchMatches(displayed, state.search).size());
+  }
+  if (hidden_roots > 0) {
+    absl::StrAppend(&header, " +", hidden_roots, " roots hidden");
+  }
+  if (viewport_rows > 0 && total_rows > viewport_rows) {
+    const int last = std::min(total_rows, scroll + viewport_rows);
+    absl::StrAppend(&header, " rows ", scroll, "-", last - 1, " of ", total_rows);
+  }
+  lines.push_back(ftxui::text(TruncateToWidth(header, width)));
+
+  if (state.diff_mode) {
+    if (diff == nullptr) {
+      lines.push_back(ftxui::text(TruncateToWidth("diff: no differential loaded", width)));
+    } else if (!diff->comparable) {
+      lines.push_back(ftxui::text(
+          TruncateToWidth("non-comparable: " + diff->incomparable_reason, width)));
+    } else {
+      // The two-row legend, one row per hue (glyphs survive a monochrome
+      // paste; the color is additive).
+      lines.push_back(ftxui::text(TruncateToWidth(
+          "[###] hotter (per-request; +new = absent in base)", width)));
+      lines.push_back(ftxui::text(TruncateToWidth("[~~~] cooler (per-request)", width)));
+    }
+  }
+
   // Cell runs per depth row.
-  const int total_rows = DepthOf(displayed);
   std::vector<std::vector<Seg>> rows(static_cast<size_t>(std::max(0, total_rows)));
   std::vector<std::vector<const Placed*>> by_row(rows.size());
   for (const Placed& p : placed) {
@@ -507,7 +587,7 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
         }
       }
       const bool selected =
-          state.selected.has_value() && *state.selected == p->path;
+          render_state.selected.has_value() && *render_state.selected == p->path;
       const bool match =
           !state.search.empty() &&
           ContainsCaseInsensitive(p->frame->function, state.search);
@@ -540,7 +620,6 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
     if (total_rows == 0) {
       lines.push_back(ftxui::text("empty profile"));
     } else {
-      const int scroll = DeriveScrollRow(displayed, state, viewport_rows);
       const int last = std::min(total_rows, scroll + viewport_rows);
       for (int d = scroll; d < last; ++d) {
         std::vector<ftxui::Element> cells;
@@ -555,7 +634,8 @@ ftxui::Element RenderFlamegraph(const FoldedTree& tree, const FlamegraphViewStat
   return ftxui::vbox(std::move(lines));
 }
 
-absl::StatusOr<DiffOverlay> PairDiffOverlay(
+// static
+absl::StatusOr<DiffOverlay> DiffOverlay::Pair(
     std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot,
     DifferentialResult result) {
   if (owning_snapshot == nullptr) {
@@ -563,8 +643,19 @@ absl::StatusOr<DiffOverlay> PairDiffOverlay(
         "a differential cannot be held without the ProfileWindowStore "
         "snapshot that owns its frame pointers");
   }
-  return DiffOverlay{std::move(owning_snapshot), std::move(result)};
+  return DiffOverlay(std::move(owning_snapshot), std::move(result));
 }
+
+DiffOverlay::DiffOverlay(
+    std::shared_ptr<const std::vector<ProfileWindow>> owning_snapshot,
+    DifferentialResult result)
+    : owning_snapshot_(std::move(owning_snapshot)), result_(std::move(result)) {}
+
+const std::shared_ptr<const std::vector<ProfileWindow>>& DiffOverlay::snapshot() const {
+  return owning_snapshot_;
+}
+
+const DifferentialResult& DiffOverlay::result() const { return result_; }
 
 }  // namespace Tui
 }  // namespace Client

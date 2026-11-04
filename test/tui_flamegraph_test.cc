@@ -235,9 +235,71 @@ TEST(FlameRenderTest, ScrollKeepsSelectionVisible) {
   // The selected leaf renders on screen row 9 = 1 (header) + 29 - 21, marked.
   EXPECT_EQ(frame.at(1, 9), '>');  // the selection marker
   EXPECT_EQ(frame.at(2, 9), 'f');
-  // The visible window holds levels 21..29; the top of the chain scrolled out.
+  // The visible window holds levels 21..29; the top of the chain scrolled
+  // out — and the header says so (overflow honesty cue, review minor 5).
   EXPECT_NE(frame.text.find("f21"), std::string::npos);
   EXPECT_TRUE(frame.lacks("f0"));
+  EXPECT_NE(frame.text.find("rows 21-29 of 30"), std::string::npos);
+
+  // No selection: no scroll, and the window starts at the top.
+  Frame plain_frame = RenderFrame(tree, FlamegraphViewState{}, nullptr, 60, 10);
+  EXPECT_NE(plain_frame.text.find("rows 0-8 of 30"), std::string::npos);
+}
+
+// Root rectangles wider than the terminal are counted in the header, never
+// silently clipped away (overflow honesty cue, review minor 5).
+TEST(FlameRenderTest, RootsPastTheRightEdgeAreCounted) {
+  // Two roots fill the width exactly (lround(500/1001*100) = 50 each); the
+  // third root's rectangle gets zero columns -> hidden. Its share (~0.1%) is
+  // BELOW the default collapse threshold, so the threshold is lowered: the
+  // root must survive collapse and then be counted as width-hidden — the two
+  // honesty mechanisms must not paper over each other.
+  FoldedTree tree = MakeTree({MakeFrame("r1", 500), MakeFrame("r2", 500), MakeFrame("r3", 1)});
+  FlamegraphViewState state;
+  state.collapse_threshold_ratio = 0.0005;
+  Frame frame = RenderFrame(tree, state, nullptr, 100, 10);
+  EXPECT_NE(frame.text.find("+1 roots hidden"), std::string::npos);
+  EXPECT_TRUE(frame.contains("r1"));
+  EXPECT_TRUE(frame.contains("r2"));
+  EXPECT_TRUE(frame.lacks("r3"));
+}
+
+// Review Important 2: a truncated diff cell must keep a NON-COLOR band
+// signal — truncation reserves one trailing cell for the density glyph, so
+// hue and band survive a monochrome paste even when the label fills the cell.
+TEST(FlameDiffTest, TruncatedDiffCellsCarryANonColorSignal) {
+  const std::string kLong = "TruncateMeSomeVeryLongCppFunctionName";  // 37 chars
+  FoldedTree base_tree =
+      MakeTree({MakeFrame("main", 0, {MakeFrame(kLong, 20), MakeFrame("m", 20),  //
+                                      MakeFrame("t", 20)})});
+  FoldedTree cur_tree =
+      MakeTree({MakeFrame("main", 0, {MakeFrame(kLong, 40), MakeFrame("m", 30),  //
+                                      MakeFrame("t", 30)})});
+  ProfileWindow base = WindowWith(base_tree, 60);
+  ProfileWindow cur = WindowWith(cur_tree, 100);
+  auto diff = ComputeDifferential(base, cur);
+  ASSERT_TRUE(diff.ok()) << diff.status();
+
+  FlamegraphViewState state;
+  state.diff_mode = true;
+  Frame frame = RenderFrame(cur_tree, state, &*diff, 100, 24);
+
+  // Rows: header 0, legend 1-2, depth 0 on row 3, depth 1 on row 4.
+  // The long frame spans lround(40/100*100) = 40 columns -> inner 38 < the
+  // 41-char label -> truncated: "..." + the reserved band glyph.
+  // Ratio: (0.40 - 0.333)/0.333 = +0.2 -> weak hot: dim Red, '#' every 4th.
+  EXPECT_EQ(frame.at(0, 4), '[');
+  EXPECT_EQ(frame.at(39, 4), ']');  // the 40-column cell's close
+  EXPECT_EQ(frame.at(38, 4), '#');  // the reserved density cell (after "...")
+  EXPECT_EQ(frame.fg(38, 4), ftxui::Color::Red);
+
+  // And the neighbor: weak cool, untruncated label, sparse '~' fill.
+  EXPECT_EQ(frame.at(40, 4), '[');
+  EXPECT_EQ(frame.at(46, 4), '~');  // first padding cell of "m 30%"
+  EXPECT_EQ(frame.fg(46, 4), ftxui::Color::Green);
+
+  // Ratio values never print — the delta rides glyphs and color only.
+  EXPECT_TRUE(frame.lacks("0.2"));
 }
 
 // --- zoom / navigation ----------------------------------------------------
@@ -318,6 +380,104 @@ TEST(FlameCollapseTest, CollapsePrunesBelowThreshold) {
   Frame frame = RenderFrame(collapsed, FlamegraphViewState{}, nullptr, 100, 20);
   EXPECT_TRUE(frame.contains("big"));
   EXPECT_TRUE(frame.lacks("tiny"));
+}
+
+// Collapse ADDRESSING (review Important 1): pruning shifts sibling indices,
+// so pre-collapse paths must re-rank through CollapseTranslatePath. The
+// review's exact shape: children [A(pruned), B, C] — C's address must become
+// B's old slot, and B's must become A's; a pruned path translates to
+// nullopt. (Well-formed total-sorted trees only ever prune a suffix — the
+// map is the identity there — but nothing may depend on that invariant.)
+TEST(FlameCollapseTest, CollapseTranslateKeepsSurvivorAddresses) {
+  // Deliberately NOT total-sorted: pruned child FIRST.
+  FoldedFrame a = MakeFrame("a", 5);
+  FoldedFrame b = MakeFrame("b", 45, {MakeFrame("b1", 45)});
+  FoldedFrame c = MakeFrame("c", 50, {MakeFrame("c1", 50)});
+  FoldedTree uncollapsed = MakeTree({std::move(a), std::move(b), std::move(c)});
+  FoldedTree collapsed = CollapseBelowThreshold(uncollapsed, 0.2);
+  // a holds ~2.6% of 195 -> pruned; survivors keep order: b(0), c(1).
+  ASSERT_EQ(collapsed.root.size(), 2u);
+  EXPECT_EQ(collapsed.root[0].function, "b");
+  EXPECT_EQ(collapsed.root[1].function, "c");
+  EXPECT_EQ(collapsed.total_value, 195u);  // total conserved
+
+  // Survivor addresses re-rank; the pruned path drops.
+  EXPECT_EQ(CollapseTranslatePath(uncollapsed, collapsed, FramePath({1})),
+            FramePath({0}));  // b: index 1 -> post-collapse 0
+  EXPECT_EQ(CollapseTranslatePath(uncollapsed, collapsed, FramePath({1, 0})),
+            FramePath({0, 0}));  // b1 under its re-ranked parent
+  EXPECT_EQ(CollapseTranslatePath(uncollapsed, collapsed, FramePath({2})),
+            FramePath({1}));  // C -> B's old slot
+  EXPECT_EQ(CollapseTranslatePath(uncollapsed, collapsed, FramePath({2, 0})),
+            FramePath({1, 0}));
+  EXPECT_FALSE(CollapseTranslatePath(uncollapsed, collapsed, FramePath({0}))
+                   .has_value());  // a itself: pruned
+  EXPECT_FALSE(CollapseTranslatePath(uncollapsed, collapsed, FramePath({3}))
+                   .has_value());  // invalid against the uncollapsed tree
+  // The root path translates to itself.
+  EXPECT_EQ(CollapseTranslatePath(uncollapsed, collapsed, FramePath({})), FramePath({}));
+}
+
+// The renderer must carry diff mark keys AND the selection through the
+// collapse re-index: with children [a(pruned), b, c], b's delta must paint b
+// and c's delta must paint c (not each other's slot).
+TEST(FlameCollapseTest, CollapseReindexesDiffOverlayAndSelection) {
+  FoldedTree base_tree =
+      MakeTree({MakeFrame("main", 0, {MakeFrame("a", 5), MakeFrame("b", 25),  //
+                                      MakeFrame("c", 70)})});
+  FoldedTree cur_tree =
+      MakeTree({MakeFrame("main", 0, {MakeFrame("a", 5), MakeFrame("b", 50),  //
+                                      MakeFrame("c", 65)})});
+  ProfileWindow base = WindowWith(base_tree, 100);
+  ProfileWindow cur = WindowWith(cur_tree, 100);
+  auto diff = ComputeDifferential(base, cur);
+  ASSERT_TRUE(diff.ok()) << diff.status();
+
+  FlamegraphViewState state;
+  state.diff_mode = true;
+  state.collapse_threshold_ratio = 0.10;  // "a" holds ~4% -> pruned
+  state.selected = FramePath({0, 1});     // b, in pre-collapse coordinates
+  Frame frame = RenderFrame(cur_tree, state, &*diff, 100, 24);
+
+  // Rows: header 0, legend 1-2, depth 0 on row 3, depth 1 on row 4.
+  // Displayed children [b, c]: b w = lround(50/120*100) = 42 (x 0..41),
+  // c w = lround(65/120*100) = 54 (x 42..95).
+  //   b: +1.0 -> strong hot (RedLight, full '#')
+  //   c: 65->70 per 100 base... (0.65-0.70)/0.70 = -0.071 -> weak cool
+  EXPECT_EQ(frame.at(0, 4), '[');
+  EXPECT_EQ(frame.at(1, 4), '>');  // b is the selection: ">" prefix
+  EXPECT_EQ(frame.at(2, 4), 'b');
+  EXPECT_EQ(frame.fg(10, 4), ftxui::Color::RedLight);  // b paints its OWN delta
+  EXPECT_EQ(frame.at(10, 4), '#');
+
+  EXPECT_EQ(frame.at(42, 4), '[');
+  EXPECT_EQ(frame.at(43, 4), 'c');
+  // Weak cool: green + '~' on every fourth padding cell (never b's red).
+  EXPECT_EQ(frame.fg(48, 4), ftxui::Color::Green);
+  EXPECT_EQ(frame.at(48, 4), '~');  // first padding cell of c
+
+  // The selection (b, pre-collapse {0,1}) survives the re-index: b renders
+  // selected, c does not.
+  EXPECT_TRUE(frame.inverted(10, 4));
+  EXPECT_FALSE(frame.inverted(60, 4));
+}
+
+// The collapse re-index must not break the well-formed case: total-sorted
+// trees only prune a suffix, so surviving addresses are stable, and the
+// selection identity holds across collapse.
+TEST(FlameCollapseTest, SelectionIdentityPreservedThroughCollapse) {
+  FoldedTree tree = MakeTree({MakeFrame("big", 99, {MakeFrame("big1", 99)}),
+                              MakeFrame("tiny", 1)});
+  FoldedTree collapsed = CollapseBelowThreshold(tree, 0.05);
+  ASSERT_EQ(collapsed.root.size(), 1u);
+
+  // big: same address on both sides (suffix pruning).
+  EXPECT_EQ(CollapseTranslatePath(tree, collapsed, FramePath({0})), FramePath({0}));
+  // tiny: pruned -> the cursor drops rather than silently re-pointing.
+  EXPECT_FALSE(CollapseTranslatePath(tree, collapsed, FramePath({1})).has_value());
+  // Nested identity: big's subtree addresses carry over unchanged.
+  EXPECT_EQ(CollapseTranslatePath(tree, collapsed, FramePath({0, 0})),
+            FramePath({0, 0}));
 }
 
 // --- search ---------------------------------------------------------------
@@ -419,9 +579,10 @@ TEST(FlameDiffTest, DiffOverlayRendersTwoHueDelta) {
   EXPECT_TRUE(frame.lacks("1e+12"));
 }
 
-// The hard lifetime rule (Task 4 review) is enforced in the pane's data
-// model: a DifferentialResult carrying diffs cannot be stored without the
-// ProfileWindowStore snapshot that owns its frame pointers.
+// The hard lifetime rule (Task 4 review) is enforced at the TYPE level: a
+// DifferentialResult carrying diffs cannot be held without the
+// ProfileWindowStore snapshot that owns its frame pointers — the constructor
+// is private and the factory is the only way in.
 TEST(FlameDiffTest, DiffOverlayRequiresOwningSnapshot) {
   FoldedTree tree = MakeTree({MakeFrame("main", 100)});
   ProfileWindow base = WindowWith(tree, 100);
@@ -430,17 +591,17 @@ TEST(FlameDiffTest, DiffOverlayRequiresOwningSnapshot) {
   ASSERT_TRUE(diff.ok());
 
   // Null snapshot: rejected outright — the frames would dangle.
-  auto unowned = PairDiffOverlay(/*owning_snapshot=*/nullptr, *diff);
+  auto unowned = DiffOverlay::Pair(/*owning_snapshot=*/nullptr, *diff);
   EXPECT_EQ(unowned.status().code(), absl::StatusCode::kInvalidArgument);
 
   ProfileWindowStore store;
   std::vector<ProfileWindow> windows;
   windows.push_back(cur);
   store.store(windows);
-  auto owned = PairDiffOverlay(store.load(), *diff);
+  auto owned = DiffOverlay::Pair(store.load(), *diff);
   ASSERT_TRUE(owned.ok()) << owned.status();
-  EXPECT_EQ(owned->owning_snapshot, store.load());
-  EXPECT_EQ(owned->result.diffs.size(), diff->diffs.size());
+  EXPECT_EQ(owned->snapshot(), store.load());
+  EXPECT_EQ(owned->result().diffs.size(), diff->diffs.size());
 }
 
 // 8.4's marked-non-comparable path renders as a mark, never as a delta.
@@ -507,14 +668,21 @@ TEST(FlameFixtureTest, FixtureTreeRendersAtMinimumSize) {
   EXPECT_GT(frame.extent(first_frame_row + 2), 0);
 
   // Search active: a real symbol from the go-tool ground truth. The key-nav
-  // cursor follows the first hit (task 6's wiring), and DeriveScrollRow
-  // scrolls the (deep) tree so that hit's row is on screen — the highlight
-  // must actually be visible, not scrolled off.
+  // cursor follows the first hit (task 6's wiring) and must address a frame
+  // that SURVIVES the default collapse (the fixture's tiny address-only
+  // roots prune at 1%): translate onto the collapsed tree and resolve there
+  // — a selection that silently re-pointed at another frame would fail here.
   FlamegraphViewState searching;
   searching.search = "operator";
   const std::vector<FramePath> hits = SearchMatches(tree, "operator");
   ASSERT_FALSE(hits.empty());
   searching.selected = hits.front();
+  const FoldedTree collapsed_fixture =
+      CollapseBelowThreshold(tree, searching.collapse_threshold_ratio);
+  auto on_collapsed =
+      CollapseTranslatePath(tree, collapsed_fixture, *searching.selected);
+  ASSERT_TRUE(on_collapsed.has_value()) << "cursor frame must survive collapse";
+  EXPECT_TRUE(ResolveSelection(collapsed_fixture, *on_collapsed).has_value());
   Frame searched = RenderFrame(tree, searching, nullptr, 100, 30);
   EXPECT_NE(searched.text.find("search:operator"), std::string::npos);
   bool any_inverted = false;
