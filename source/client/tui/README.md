@@ -109,7 +109,10 @@ Everything else in the TUI's dependency graph is out:
   `--pprof-tool` flag plumbs the argv prefix into the symbolizer constructor,
   the fetch→fold→render pipeline (`tui_app.cc`) invokes it only from pool
   jobs, and no new linked dependency entered through that path (the cquery
-  intersection check below still runs empty over every TUI target).
+  intersection check below still runs empty over every TUI target). Known
+  limit, documented rather than built (M1 final fixes): a tool that hangs
+  (instead of exiting) has NO kill path — the pool job waits for it and the
+  window state stays "folding..." until it returns; there is no watchdog.
 
 Notably NOT allowed: `//source/common` (its `Utility::parseCommand` helper is
 re-implemented inline in `tui_app.cc` for exactly this reason), Envoy test

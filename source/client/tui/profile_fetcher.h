@@ -2,13 +2,20 @@
 // over the SUT admin endpoint. See admin_client.h for the live-verified
 // admin contract (POST-only mutators, Date-header clock source).
 //
-// Threading (spec §4): ProfileFetcher is SYNCHRONOUS and owns no thread —
-// the blocking work (StopWindowAndFetch) belongs in a PprofWorkerPool job.
-// window_open()/StartWindow are single-caller (the orchestrating job).
+// Threading (spec §4; M1 final-fix ruling): the ADMIN calls are
+// STEERING-THREAD-ONLY — StartWindow and StopWindow are the p-key's two
+// single small POSTs, so pool latency can never extend the SUT profiler
+// window (or the purity interval) past the p-press. FetchProfile is the
+// blocking retrieval and belongs in a PprofWorkerPool job. The sequencing is
+// strict: StartWindow -> StopWindow -> FetchProfile; window_open_ is atomic
+// (spec-lens minor: unsynchronized access), and the requested_* stamps are
+// written by the steering calls and read by the pool job with the Submit
+// happens-before edge.
 
 #ifndef SOURCE_CLIENT_TUI_PROFILE_FETCHER_H_
 #define SOURCE_CLIENT_TUI_PROFILE_FETCHER_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -81,42 +88,57 @@ struct FetchedProfile {
   int64_t requested_end_unix_ns = 0;
 };
 
-// Drives one profile window: enable the profiler, then stop-and-fetch.
+// Drives one profile window: enable (p-press), disable (close-press), then
+// retrieve out-of-band (pool job).
 class ProfileFetcher {
 public:
   ProfileFetcher(AdminClient admin, std::unique_ptr<ProfileRetriever> retriever,
                  std::string sut_profile_path, std::string staging_dir);
 
-  // Enables the CPU profiler in the SUT. Fails (kFailedPrecondition) if a
-  // window is already open. `window_seconds` is advisory bookkeeping for the
-  // caller only — the admin mutator takes no duration; the window ends at
-  // StopWindowAndFetch.
+  // Enables the CPU profiler in the SUT. STEERING-THREAD-ONLY (a single
+  // small POST). Fails (kFailedPrecondition) if a window is already open.
+  // `window_seconds` is advisory bookkeeping for the caller only — the admin
+  // mutator takes no duration; the window ends at StopWindow.
   absl::Status StartWindow(int window_seconds);
 
-  // Disables the profiler (ALWAYS before retrieval — a fetch racing a live
-  // profiler would read a partial file), retrieves the profile, stages it
-  // under staging_dir as <type>-<unix_ns>.pprof and returns the metadata.
-  // Blocking — call from a PprofWorkerPool job (Task 6). Fails
-  // (kFailedPrecondition) if no window is open; the window is closed even
-  // when disable or retrieval fails, so a wedged state never persists.
-  //
-  // Post-failed-disable recovery: the failure surfaces here and the window
-  // is already closed, so the SUT profiler may still be RUNNING. Recovery is
-  // the caller's job with its own AdminClient — call
-  // AdminClient::EnableCpuProfiler(false) directly (and optionally fetch via
-  // Retrieve()) — never by re-entering StopWindowAndFetch, which would fail
-  // kFailedPrecondition again.
-  absl::StatusOr<FetchedProfile> StopWindowAndFetch();
+  // Disables the profiler NOW. STEERING-THREAD-ONLY (a single small POST):
+  // this is the deferred-close fix (M1 final fixes) — the SUT profiler
+  // window and the purity interval both end at THIS call, never when a pool
+  // job gets around to fetching. Stamps requested_end_unix_ns_ (the honest
+  // interval end) and closes the window even when the disable fails, so a
+  // wedged state never persists. Post-failed-disable recovery: the failure
+  // surfaces to the caller and the SUT profiler may still be RUNNING —
+  // recovery is the caller's job with its own AdminClient
+  // (AdminClient::EnableCpuProfiler(false)), never by re-entering
+  // StopWindow, which would fail kFailedPrecondition again.
+  absl::Status StopWindow();
 
-  bool window_open() const { return window_open_; }
+  // Retrieves the profile left by the last window and stages it under
+  // staging_dir as <type>-<unix_ns>.pprof. BLOCKING — call from a
+  // PprofWorkerPool job. Fails (kFailedPrecondition) if a window is still
+  // open: a fetch racing a live profiler would read a partial file
+  // (StopWindow must run first — the ordering is the disable-before-retrieve
+  // contract, observable against a recording admin stub).
+  absl::StatusOr<FetchedProfile> FetchProfile();
+
+  bool window_open() const { return window_open_.load(std::memory_order_relaxed); }
+
+  // The last window's requested-end stamp (the p-press time StopWindow
+  // recorded; 0 before the first StopWindow). The controller's conservative
+  // phase bound reads this: an unverifiable run end is bounded strictly
+  // BEFORE the window end, excluding the tail — never fabricating purity.
+  int64_t requested_end_unix_ns() const { return requested_end_unix_ns_; }
 
 private:
   AdminClient admin_;
   std::unique_ptr<ProfileRetriever> retriever_;
   std::string sut_profile_path_;
   std::string staging_dir_;
-  bool window_open_ = false;
+  std::atomic<bool> window_open_{false};
+  // Requested-window stamps: written by the steering calls, read by the pool
+  // job (happens-before via the pool Submit). METADATA only (spec §8.5).
   int64_t requested_start_unix_ns_ = 0;
+  int64_t requested_end_unix_ns_ = 0;
 };
 
 } // namespace Tui

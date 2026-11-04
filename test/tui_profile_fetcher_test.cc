@@ -426,7 +426,14 @@ TEST(ProfileFetcherTest, StopWindowDisablesThenRetrieves) {
   ASSERT_TRUE(start.ok()) << start;
   EXPECT_TRUE(fetcher.window_open());
 
-  absl::StatusOr<FetchedProfile> fetched = fetcher.StopWindowAndFetch();
+  // The close is two steering-thread calls now (M1 final fixes): StopWindow
+  // disables + stamps the interval end; FetchProfile retrieves (the pool
+  // job's half).
+  absl::Status stopped = fetcher.StopWindow();
+  ASSERT_TRUE(stopped.ok()) << stopped;
+  EXPECT_FALSE(fetcher.window_open());
+
+  absl::StatusOr<FetchedProfile> fetched = fetcher.FetchProfile();
   ASSERT_TRUE(fetched.ok()) << fetched.status();
 
   // Ordering: by the time retrieval ran, the stub had already seen the
@@ -481,7 +488,7 @@ TEST(ProfileFetcherTest, SecondStartWhileOpenFails) {
   absl::Status second = fetcher.StartWindow(5);
   EXPECT_FALSE(second.ok());
   EXPECT_TRUE(absl::IsFailedPrecondition(second)) << second;
-  static_cast<void>(fetcher.StopWindowAndFetch());
+  static_cast<void>(fetcher.StopWindow());
 }
 
 TEST(ProfileFetcherTest, StopWithoutStartFails) {
@@ -491,9 +498,30 @@ TEST(ProfileFetcherTest, StopWithoutStartFails) {
                          std::make_unique<RecordingRetriever>([]() { return ""; }, nullptr),
                          "/var/local/profiling/envoy.prof", harness.staging_root());
   EXPECT_FALSE(fetcher.window_open());
-  absl::StatusOr<FetchedProfile> fetched = fetcher.StopWindowAndFetch();
+  absl::Status stopped = fetcher.StopWindow();
+  EXPECT_FALSE(stopped.ok());
+  EXPECT_TRUE(absl::IsFailedPrecondition(stopped)) << stopped;
+}
+
+// The ordering contract's job-side half: FetchProfile refuses while a window
+// is still open — a retrieval racing a live profiler would read a partial
+// file. StopWindow must run first.
+TEST(ProfileFetcherTest, FetchProfileWithOpenWindowRefuses) {
+  StubAdminServer server([](const std::string& request_line) {
+    if (request_line == "POST /cpuprofiler?enable=y HTTP/1.1") {
+      return MakeResponse(200, "OK\n");
+    }
+    return MakeResponse(404, "not found");
+  });
+  VolumeMountTestHarness harness;
+  ProfileFetcher fetcher(AdminClient(AdminEndpoints{server.admin_base()}),
+                         std::make_unique<RecordingRetriever>([]() { return ""; }, nullptr),
+                         "/var/local/profiling/envoy.prof", harness.staging_root());
+  ASSERT_TRUE(fetcher.StartWindow(5).ok());
+  absl::StatusOr<FetchedProfile> fetched = fetcher.FetchProfile();
   EXPECT_FALSE(fetched.ok());
   EXPECT_TRUE(absl::IsFailedPrecondition(fetched.status())) << fetched.status();
+  EXPECT_TRUE(fetcher.window_open());
 }
 
 TEST(ProfileFetcherTest, RetrievalFailurePropagates) {
@@ -511,7 +539,8 @@ TEST(ProfileFetcherTest, RetrievalFailurePropagates) {
                          std::move(retriever), "/var/local/profiling/envoy.prof",
                          harness.staging_root());
   ASSERT_TRUE(fetcher.StartWindow(5).ok());
-  absl::StatusOr<FetchedProfile> fetched = fetcher.StopWindowAndFetch();
+  ASSERT_TRUE(fetcher.StopWindow().ok());
+  absl::StatusOr<FetchedProfile> fetched = fetcher.FetchProfile();
   EXPECT_FALSE(fetched.ok());
   // The window is closed even when retrieval failed, and the stub saw the
   // disable before the failed retrieve attempt.

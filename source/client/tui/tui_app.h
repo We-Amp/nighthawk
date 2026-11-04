@@ -76,6 +76,10 @@ struct ProfilePipelineConfig {
   // the plan sketch was collapsed into this fixed default + flag — see the
   // task report).
   int window_seconds = 5;
+  // TEST-ONLY seam (M1 final fixes): delays FetchProfile's retrieval inside
+  // the pool job so a test can land the run's end inside the retrieval
+  // window (the straddle-belt case). Production keeps 0.
+  int test_retriever_delay_ms = 0;
 };
 
 // The completed-work series for the §8.4 per-unit-of-work denominator: the
@@ -213,7 +217,7 @@ public:
 
   // 'p' open: enables the SUT CPU profiler for a window of the configured
   // length (the admin mutator itself takes no duration; the window ends at
-  // StopWindowAndFetch). Requires a run — live or already finished — whose
+  // StopWindow). Requires a run — live or already finished — whose
   // stamps the window will align against. kFailedPrecondition when profiling
   // is unconfigured, no run stamps exist, or a window is already open; the
   // underlying admin failure otherwise.
