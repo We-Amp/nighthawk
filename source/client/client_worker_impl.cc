@@ -1,9 +1,12 @@
 #include "source/client/client_worker_impl.h"
 
+#include "nighthawk/common/exception.h"
+
 #include "source/common/stats/symbol_table.h"
 
 #include "source/common/cached_time_source_impl.h"
 #include "source/common/phase_impl.h"
+#include "source/common/sequencer_impl.h"
 #include "source/common/termination_predicate_impl.h"
 #include "source/common/utility.h"
 
@@ -24,8 +27,8 @@ ClientWorkerImpl::ClientWorkerImpl(
     std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins,
     const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)>&
         live_snapshot_partial_cb,
-    std::chrono::milliseconds live_snapshot_interval)
-    : WorkerImpl(api, tls, store),
+    std::chrono::milliseconds live_snapshot_interval, bool phase_driven_run)
+    : WorkerImpl(api, tls, store), api_(api),
       time_source_(std::make_unique<CachedTimeSourceImpl>(*dispatcher_)),
       termination_predicate_factory_(termination_predicate_factory),
       sequencer_factory_(sequencer_factory), worker_scope_(store_.createScope("cluster.")),
@@ -38,20 +41,24 @@ ClientWorkerImpl::ClientWorkerImpl(
           api, *dispatcher_, *worker_number_scope_, cluster_manager, tracer_,
           fmt::format("{}", worker_number), worker_number, *request_generator_,
           std::move(user_defined_output_plugins))),
+      sequencer_target_([this](CompletionCallback f) -> bool {
+        return benchmark_client_->tryStartRequest(std::move(f));
+      }),
       phase_(
-          std::make_unique<PhaseImpl>("main",
-                                      sequencer_factory_.create(
-                                          *time_source_, *dispatcher_,
-                                          [this](CompletionCallback f) -> bool {
-                                            return benchmark_client_->tryStartRequest(std::move(f));
-                                          },
-                                          termination_predicate_factory_.create(
-                                              *time_source_, *worker_number_scope_, starting_time),
-                                          *worker_number_scope_, starting_time, api),
-                                      true)),
+          phase_driven_run
+              ? nullptr
+              : std::make_unique<PhaseImpl>(
+                    "main",
+                    sequencer_factory_.create(
+                        *time_source_, *dispatcher_, sequencer_target_,
+                        termination_predicate_factory_.create(*time_source_, *worker_number_scope_,
+                                                              starting_time),
+                        *worker_number_scope_, starting_time, api),
+                    true)),
       hardcoded_warmup_style_(hardcoded_warmup_style),
       live_snapshot_partial_cb_(live_snapshot_partial_cb),
-      live_snapshot_interval_(live_snapshot_interval) {}
+      live_snapshot_interval_(live_snapshot_interval), phase_driven_run_(phase_driven_run),
+      ready_future_(ready_promise_.get_future()) {}
 
 void ClientWorkerImpl::simpleWarmup() {
   ENVOY_LOG(debug, "> worker {}: warmup start.", worker_number_);
@@ -69,9 +76,34 @@ void ClientWorkerImpl::work() {
   if (hardcoded_warmup_style_ == HardCodedWarmupStyle::ON) {
     simpleWarmup();
   }
-  benchmark_client_->setShouldMeasureLatencies(phase_->shouldMeasureLatencies());
+  if (phase_driven_run_) {
+    // Multi-phase run: every phase measures latencies (fresh per-phase
+    // statistics are M2 Task 4's dimension; the per-phase sequencers already
+    // measure per phase).
+    benchmark_client_->setShouldMeasureLatencies(true);
+  } else {
+    benchmark_client_->setShouldMeasureLatencies(phase_->shouldMeasureLatencies());
+  }
   setupLiveSnapshotTimer();
-  phase_->run();
+  if (phase_driven_run_) {
+    // Thread-local initialization and warmup are done: the orchestrator (the
+    // run-calling thread) may now post begin-phase onto this dispatcher.
+    // This thread drives the event loop until the FINAL phase's sequencer
+    // stops with the legacy exit-at-stop; the boundary stops of the earlier
+    // phases do not exit the dispatcher.
+
+    // The event loop only keeps running while it has something to wait on:
+    // arm a long no-op timer BEFORE entering the blocking run, otherwise the
+    // loop returns immediately when no event is registered yet (the first
+    // begin-phase post arrives only after this thread signals readiness).
+    dispatcher_loop_timer_ = dispatcher_->createTimer([]() {});
+    dispatcher_loop_timer_->enableTimer(std::chrono::hours(24));
+    ready_promise_.set_value();
+    dispatcher_->run(Envoy::Event::Dispatcher::RunType::Block);
+
+  } else {
+    phase_->run();
+  }
   // Stop the live snapshot timer before we leave the run: no partials may be
   // produced after the run's end, and the worker's dispatcher is not driven
   // again in a way that would fire it, but disabling explicitly keeps that
@@ -159,13 +191,100 @@ void ClientWorkerImpl::requestExecutionCancellation() {
       [this]() { worker_number_scope_->counterFromString("graceful_stop_requested").inc(); });
 }
 
+const Phase& ClientWorkerImpl::phase() const {
+  // Legacy runs keep their eager "main" phase; a phase-driven run reports the
+  // phase begun most recently (the run's final phase once the workers have
+  // been joined).
+  return phase_ != nullptr ? *phase_ : *current_phase_;
+}
+
+std::future<PhaseDrainAck> ClientWorkerImpl::beginPhaseAsync(
+    uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec, bool final_phase) {
+  drain_promise_ = std::make_shared<std::promise<PhaseDrainAck>>();
+  std::future<PhaseDrainAck> future = drain_promise_->get_future();
+  dispatcher_->post([this, phase_index, phase_spec, final_phase]() {
+    beginPhase(phase_index, phase_spec, final_phase);
+  });
+  return future;
+}
+
+void ClientWorkerImpl::beginPhase(uint32_t phase_index,
+                                  const nighthawk::client::PhaseSpec& phase_spec,
+                                  bool final_phase) {
+  // Cancel a drain watch still running for the previous boundary (e.g. a
+  // censored drain whose hung request never completed).
+  if (drain_watch_timer_ != nullptr) {
+    drain_watch_timer_->disableTimer();
+    drain_watch_timer_.reset();
+  }
+  const Envoy::MonotonicTime phase_start = time_source_->monotonicTime();
+  auto termination_predicate = termination_predicate_factory_.create(
+      *time_source_, *worker_number_scope_, phase_start,
+      std::chrono::seconds(phase_spec.duration().seconds()));
+  auto sequencer =
+      sequencer_factory_.create(*time_source_, *dispatcher_, sequencer_target_,
+                                std::move(termination_predicate), *worker_number_scope_,
+                                phase_start, api_, phase_spec.requests_per_second());
+  SequencerImpl& sequencer_impl = static_cast<SequencerImpl&>(*sequencer);
+  // The sequencer factory only ever produces SequencerImpl instances; the
+  // multi-phase stop-mode surface is SequencerImpl-only (the Sequencer
+  // interface is untouched).
+  auto phase =
+      std::make_unique<PhaseImpl>(phase_spec.name(), std::move(sequencer), /*measure=*/true);
+  current_phase_ = phase.get();
+  phases_history_.push_back(std::move(phase));
+  phase_statistics_.push_back(sequencer_impl.statistics());
+  phase_execution_durations_.push_back(0);
+  sequencer_impl.setExitDispatcherOnStop(final_phase);
+  sequencer_impl.setStopHook([this, final_phase, phase_index](bool /*timed_out*/) {
+    // On this dispatcher, inside the sequencer's stop.
+    dispatcher_->updateApproximateMonotonicTime();
+    phase_execution_durations_[phase_index] =
+        static_cast<SequencerImpl&>(current_phase_->sequencer()).executionDuration().count();
+    if (final_phase) {
+      // The final phase keeps today's exact behavior: the dispatcher exits
+      // and work()'s event loop returns into the worker teardown.
+      return;
+    }
+    drain_watch_stop_ns_ = time_source_->monotonicTime().time_since_epoch().count();
+    startDrainWatch();
+  });
+  ENVOY_LOG(debug, "worker {}: begin phase {} ('{}'), final: {}", worker_number_, phase_index,
+            phase_spec.name(), final_phase);
+  sequencer_impl.start();
+
+}
+
+void ClientWorkerImpl::startDrainWatch() {
+  // The drain observable is the benchmark client's own in-flight tracking
+  // (the same accounting the client-side gates consult). No connection
+  // operations of any kind: this watch only waits for in-flight to reach
+  // zero, and the orchestrator's deadline bounds the wait (a hung request
+  // leaves the future unsent and is censored by the orchestrator).
+  drain_watch_timer_ = dispatcher_->createTimer([this]() -> void {
+    dispatcher_->updateApproximateMonotonicTime();
+    if (benchmark_client_->inFlightRequests() == 0) {
+      PhaseDrainAck ack;
+      ack.sequencer_stop_monotonic_ns = drain_watch_stop_ns_;
+      ack.drain_complete_monotonic_ns = time_source_->monotonicTime().time_since_epoch().count();
+      drain_promise_->set_value(ack);
+      drain_watch_timer_->disableTimer();
+    } else {
+      drain_watch_timer_->enableHRTimer(std::chrono::milliseconds(5));
+    }
+  });
+  drain_watch_timer_->enableHRTimer(std::chrono::milliseconds(1));
+}
+
 StatisticPtrMap ClientWorkerImpl::statistics() const {
   StatisticPtrMap statistics;
   StatisticPtrMap s1 = benchmark_client_->statistics();
-  Sequencer& sequencer = phase_->sequencer();
-  StatisticPtrMap s2 = sequencer.statistics();
   statistics.insert(s1.begin(), s1.end());
-  statistics.insert(s2.begin(), s2.end());
+  const Phase* phase = phase_ != nullptr ? phase_.get() : current_phase_;
+  if (phase != nullptr) {
+    StatisticPtrMap s2 = phase->sequencer().statistics();
+    statistics.insert(s2.begin(), s2.end());
+  }
   return statistics;
 }
 

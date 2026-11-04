@@ -75,13 +75,11 @@ BenchmarkClientPtr BenchmarkClientFactoryImpl::create(
 SequencerFactoryImpl::SequencerFactoryImpl(const Options& options)
     : OptionBasedFactoryImpl(options) {}
 
-SequencerPtr SequencerFactoryImpl::create(Envoy::TimeSource& time_source,
-                                          Envoy::Event::Dispatcher& dispatcher,
-                                          const SequencerTarget& sequencer_target,
-                                          TerminationPredicatePtr&& termination_predicate,
-                                          Envoy::Stats::Scope& scope,
-                                          const Envoy::MonotonicTime scheduled_starting_time,
-                                          Envoy::Api::Api& api) const {
+SequencerPtr SequencerFactoryImpl::create(
+    Envoy::TimeSource& time_source, Envoy::Event::Dispatcher& dispatcher,
+    const SequencerTarget& sequencer_target, TerminationPredicatePtr&& termination_predicate,
+    Envoy::Stats::Scope& scope, const Envoy::MonotonicTime scheduled_starting_time,
+    Envoy::Api::Api& api, std::optional<uint32_t> requests_per_second_override) const {
   StatisticFactoryImpl statistic_factory(options_);
   RateLimiterPtr rate_limiter;
 
@@ -99,7 +97,9 @@ SequencerPtr SequencerFactoryImpl::create(Envoy::TimeSource& time_source,
 
     // If no rate limiter plugin is set, use the default linear rate limiter.
   } else {
-    Frequency frequency(options_.requestsPerSecond());
+    // FORK-ONLY (We-Amp): a multi-phase run builds its per-phase sequencer at
+    // the phase's declared rate; unset, the run-level option applies.
+    Frequency frequency(requests_per_second_override.value_or(options_.requestsPerSecond()));
     rate_limiter = std::make_unique<ScheduledStartingRateLimiter>(
         std::make_unique<LinearRateLimiter>(time_source, frequency), scheduled_starting_time);
     const uint64_t burst_size = options_.burstSize();
@@ -262,9 +262,10 @@ absl::StatusOr<RequestSourcePtr> RequestSourceFactoryImpl::LoadRequestSourcePlug
 TerminationPredicateFactoryImpl::TerminationPredicateFactoryImpl(const Options& options)
     : OptionBasedFactoryImpl(options) {}
 
-TerminationPredicatePtr
-TerminationPredicateFactoryImpl::create(Envoy::TimeSource& time_source, Envoy::Stats::Scope& scope,
-                                        const Envoy::MonotonicTime scheduled_starting_time) const {
+TerminationPredicatePtr TerminationPredicateFactoryImpl::create(
+    Envoy::TimeSource& time_source, Envoy::Stats::Scope& scope,
+    const Envoy::MonotonicTime scheduled_starting_time,
+    std::optional<std::chrono::seconds> duration_override) const {
   // We'll always link a predicate which checks for requests to cancel.
   TerminationPredicatePtr root_predicate =
       std::make_unique<StatsCounterAbsoluteThresholdTerminationPredicateImpl>(
@@ -273,8 +274,12 @@ TerminationPredicateFactoryImpl::create(Envoy::TimeSource& time_source, Envoy::S
 
   TerminationPredicate* current_predicate = root_predicate.get();
   if (!options_.noDuration()) {
+    // FORK-ONLY (We-Amp): a multi-phase run builds its per-phase termination
+    // predicate from the phase's declared duration; unset, the run-level
+    // option applies.
+    const std::chrono::seconds duration = duration_override.value_or(options_.duration());
     current_predicate = &current_predicate->link(std::make_unique<DurationTerminationPredicateImpl>(
-        time_source, options_.duration(), scheduled_starting_time));
+        time_source, duration, scheduled_starting_time));
   }
 
   current_predicate = linkConfiguredPredicates(*current_predicate, options_.failurePredicates(),

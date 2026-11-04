@@ -43,7 +43,16 @@ void SequencerImpl::start() {
 void SequencerImpl::scheduleRun() { periodic_timer_->enableHRTimer(NighthawkTimerResolution); }
 
 void SequencerImpl::stop(bool failed) {
+  // Legacy one-arg stop: today's exit-at-stop behavior. The final phase of a
+  // multi-phase run and every legacy run keep exactly this path.
+  stop(failed, /*exit_dispatcher=*/true);
+}
+
+void SequencerImpl::stop(bool failed, bool exit_dispatcher) {
   ASSERT(running_);
+  if (stop_hook_ != nullptr) {
+    stop_hook_(failed);
+  }
   const double rate = completionsPerSecond();
   if (failed) {
     ENVOY_LOG(error, "Exiting due to failing termination predicate");
@@ -54,7 +63,9 @@ void SequencerImpl::stop(bool failed) {
   spin_timer_->disableTimer();
   periodic_timer_.reset();
   spin_timer_.reset();
-  dispatcher_.exit();
+  if (exit_dispatcher) {
+    dispatcher_.exit();
+  }
   unblockAndUpdateStatisticIfNeeded(time_source_.monotonicTime());
   const auto ran_for = std::chrono::duration_cast<std::chrono::milliseconds>(executionDuration());
   ENVOY_LOG(info,
@@ -99,7 +110,7 @@ void SequencerImpl::run(bool from_periodic_timer) {
 
   // If we should stop according to termination conditions.
   if (last_termination_status_ != TerminationPredicate::Status::PROCEED) {
-    stop(last_termination_status_ == TerminationPredicate::Status::FAIL);
+    stop(last_termination_status_ == TerminationPredicate::Status::FAIL, exit_dispatcher_on_stop_);
     return;
   }
 

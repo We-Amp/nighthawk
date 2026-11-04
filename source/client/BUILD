@@ -9,6 +9,17 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "phase_orchestrator_lib",
+    srcs = ["phase_orchestrator.cc"],
+    hdrs = ["phase_orchestrator.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//include/nighthawk/client:client_includes",
+    ],
+)
+
+envoy_cc_library(
     name = "options_validation_phases_lib",
     srcs = [
         "options_validation_phases.cc",
@@ -106,6 +117,7 @@ envoy_cc_library(
     deps = [
         ":options_impl_lib",
         ":output_collector_impl_lib",
+        ":phase_orchestrator_lib",
         ":output_formatter_impl_lib",
         ":process_bootstrap",
         "//api/client:base_cc_proto",

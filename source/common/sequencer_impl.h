@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "envoy/common/pure.h"
 #include "envoy/common/time.h"
 #include "envoy/event/dispatcher.h"
@@ -76,6 +78,19 @@ public:
   const Statistic& blockedStatistic() const { return *blocked_statistic_; }
   const Statistic& latencyStatistic() const { return *latency_statistic_; }
 
+  // FORK-ONLY (We-Amp): multi-phase support (M2 A1). The Sequencer interface
+  // above is untouched. A phase boundary needs the sequencer to stop without
+  // taking the worker dispatcher down with it: the phase path calls
+  // setExitDispatcherOnStop(false) so stop() leaves the dispatcher's event
+  // loop running across the boundary, while the final phase and every legacy
+  // run keep today's exact exit-at-stop behavior (the default).
+  void setExitDispatcherOnStop(bool exit_dispatcher) { exit_dispatcher_on_stop_ = exit_dispatcher; }
+
+  // FORK-ONLY (We-Amp): invoked on the dispatcher thread at the top of stop(),
+  // before the dispatcher is (conditionally) exited. The phase path uses this
+  // to chain the boundary drain watch; legacy runs leave it unset.
+  void setStopHook(std::function<void(bool timed_out)> hook) { stop_hook_ = std::move(hook); }
+
 protected:
   /**
    * Run is called initially by start() and thereafter by two timers:
@@ -104,7 +119,11 @@ protected:
    */
   void run(bool from_periodic_timer);
   void scheduleRun();
+  // Legacy one-arg stop: delegates with the dispatcher exit today's behavior
+  // is built on. The phase path configures exit_dispatcher_on_stop_ (run()
+  // passes it through) so boundaries stop without exiting.
   void stop(bool timed_out);
+  void stop(bool timed_out, bool exit_dispatcher);
   void unblockAndUpdateStatisticIfNeeded(const Envoy::MonotonicTime& now);
   void updateStartBlockingTimeIfNeeded();
 
@@ -128,6 +147,9 @@ private:
   TerminationPredicate::Status last_termination_status_;
   Envoy::Stats::ScopeSharedPtr scope_;
   SequencerStats sequencer_stats_;
+  // FORK-ONLY (We-Amp): multi-phase stop-mode state, see setExitDispatcherOnStop().
+  bool exit_dispatcher_on_stop_{true};
+  std::function<void(bool timed_out)> stop_hook_;
 };
 
 } // namespace Nighthawk

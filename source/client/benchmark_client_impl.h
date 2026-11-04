@@ -133,6 +133,9 @@ public:
     measure_latencies_ = measure_latencies;
   }
   bool tryStartRequest(CompletionCallback caller_completion_callback) override;
+  uint64_t inFlightRequests() const override {
+    return requests_initiated_ - requests_completed_;
+  }
   Envoy::Stats::Scope& scope() const override { return *scope_; }
 
   /**

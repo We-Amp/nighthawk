@@ -50,6 +50,16 @@ public:
   virtual bool tryStartRequest(CompletionCallback caller_completion_callback) PURE;
 
   /**
+   * FORK-ONLY (We-Amp): the number of requests initiated but not yet
+   * completed: the same in-flight accounting the client-side gates consult in
+   * tryStartRequest. The phase-boundary drain waits for this to reach zero
+   * (bounded); it never closes connections to get there.
+   *
+   * @return uint64_t the in-flight request count.
+   */
+  virtual uint64_t inFlightRequests() const PURE;
+
+  /**
    * @return const Envoy::Stats::Scope& the statistics scope associated the benchmark client.
    */
   virtual Envoy::Stats::Scope& scope() const PURE;

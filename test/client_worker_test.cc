@@ -56,7 +56,7 @@ public:
         .Times(1)
         .WillOnce(Return(ByMove(std::unique_ptr<BenchmarkClient>(benchmark_client_))));
 
-    EXPECT_CALL(sequencer_factory_, create(_, _, _, _, _, _, _))
+    EXPECT_CALL(sequencer_factory_, create(_, _, _, _, _, _, _, _))
         .Times(1)
         .WillOnce(Return(ByMove(std::unique_ptr<Sequencer>(sequencer_))));
 
@@ -66,7 +66,7 @@ public:
     EXPECT_CALL(*request_generator_, initOnThread());
     EXPECT_CALL(*request_generator_, destroyOnThread());
 
-    EXPECT_CALL(termination_predicate_factory_, create(_, _, _))
+    EXPECT_CALL(termination_predicate_factory_, create(_, _, _, _))
         .WillOnce(Return(ByMove(createMockTerminationPredicate())));
   }
 

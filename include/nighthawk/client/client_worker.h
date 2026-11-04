@@ -1,6 +1,11 @@
 #pragma once
 
+#include <chrono>
+#include <future>
+#include <map>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "envoy/common/pure.h"
 #include "envoy/stats/store.h"
@@ -10,8 +15,21 @@
 #include "nighthawk/common/statistic.h"
 #include "nighthawk/common/worker.h"
 
+#include "api/client/options.pb.h"
+
 namespace Nighthawk {
 namespace Client {
+
+// FORK-ONLY (We-Amp): worker -> orchestrator drain acknowledgement for a
+// phase boundary (M2 A1). The promise is completed on the worker's own
+// dispatcher, once the phase's in-flight requests have drained (or, in the
+// censored case, the orchestrator stops waiting at its deadline and the
+// promise is left unsent). Both stamps are monotonic nanoseconds read from
+// the worker's dispatcher time source.
+struct PhaseDrainAck {
+  int64_t sequencer_stop_monotonic_ns{0};
+  int64_t drain_complete_monotonic_ns{0};
+};
 
 /**
  * Interface for a threaded benchmark client worker.
@@ -48,6 +66,44 @@ public:
    */
   virtual std::vector<nighthawk::client::UserDefinedOutput>
   getUserDefinedOutputResults() const PURE;
+
+  // FORK-ONLY (We-Amp): multi-phase run support (M2 A1). With a phase vector,
+  // the process-side orchestrator (the run-calling thread) drives the phase
+  // boundaries: it posts begin-phase onto the worker's own dispatcher and
+  // collects the drain acknowledgement future below. The worker's dispatcher
+  // never blocks on the orchestrator; the orchestrator's bounded future
+  // collection is the only blocking wait in the system.
+  //
+  // @return std::shared_future<void> future completed by the worker once it
+  // has finished thread-local initialization and entered its dispatcher loop;
+  // begin-phase posts must not land before that (they would otherwise be
+  // picked up by the warmup's nested dispatcher run).
+  virtual std::shared_future<void> readyFuture() const PURE;
+
+  /**
+   * Starts phase `phase_index` on this worker's dispatcher. The returned
+   * future is completed with the drain ack when the phase's sequencer has
+   * stopped (without exiting the dispatcher) and its in-flight requests have
+   * all completed. For the final phase the future is never completed: the
+   * final phase keeps the legacy stop (dispatcher exits) and the orchestrator
+   * joins the worker instead.
+   */
+  virtual std::future<PhaseDrainAck>
+  beginPhaseAsync(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase,
+                  bool final_phase) PURE;
+
+  /**
+   * @return per-phase sequencer statistics retained across the run, one entry
+   * per phase begun by this worker, in phase order. Valid to read after the
+   * workers have been joined.
+   */
+  virtual const std::vector<StatisticPtrMap>& phaseStatistics() const PURE;
+
+  /**
+   * @return per-phase sequencer execution durations (nanoseconds), one entry
+   * per phase begun by this worker, in phase order.
+   */
+  virtual const std::vector<int64_t>& phaseExecutionDurations() const PURE;
 };
 
 using ClientWorkerPtr = std::unique_ptr<ClientWorker>;
