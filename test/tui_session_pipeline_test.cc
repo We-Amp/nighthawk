@@ -3,12 +3,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -62,6 +64,27 @@ using nighthawk::client::StartRequest;
 std::string tempPath(const std::string& name) {
   const char* dir = ::getenv("TEST_TMPDIR");
   return absl::StrCat(dir == nullptr ? "/tmp" : dir, "/", name);
+}
+
+// A fresh, empty directory unique to the caller, under TEST_TMPDIR (a /tmp
+// fallback keeps direct-binary runs working). Tests that create files with a
+// name PREFIX must scan only their own directory: SessionWriter pairs every
+// session file with a "<path>.jsonl" sidecar, and a scan over the shared
+// TEST_TMPDIR both races other files and can match the sidecar by prefix.
+std::string uniqueTempDir(const std::string& name) {
+  std::string tmpl = tempPath(name) + "-XXXXXX";
+  // mkdtemp mutates the template in place; the returned directory exists and
+  // is empty.
+  const char* made = ::mkdtemp(tmpl.data());
+  if (made != nullptr) {
+    return std::string(made);
+  }
+  // mkdtemp failed; fall back to a created (not guaranteed-unique) directory
+  // rather than failing the test on directory creation alone.
+  const std::string fallback = tempPath(name);
+  std::error_code ec;
+  std::filesystem::create_directories(fallback, ec);
+  return fallback;
 }
 
 int64_t nowUnixNs() {
@@ -1006,7 +1029,11 @@ TEST_F(SessionPipelineTest, FailedStartLeavesNoHeaderOnlySession) {
 
   auto channel = grpc::CreateChannel(fmt::format("127.0.0.1:{}", port),
                                      grpc::InsecureChannelCredentials());
-  const std::string prefix = tempPath("tui-pipeline-failed-start");
+  // The writer opens "<prefix>-<unix_ns>.nhsession" plus a "<...>.jsonl"
+  // sidecar; isolate both in a directory of this test's own so the scan below
+  // cannot see any other test's files (or a previous repeat's leftovers).
+  const std::string dir = uniqueTempDir("tui-pipeline-failed-start");
+  const std::string prefix = absl::StrCat(dir, "/session");
   auto controller = std::make_unique<RunController>(channel, prefix);
 
   const StartRequest request = makeStartRequest("http://127.0.0.1:9/", /*rps=*/10,
@@ -1019,14 +1046,18 @@ TEST_F(SessionPipelineTest, FailedStartLeavesNoHeaderOnlySession) {
 
   // The session file the start opened before failing: it must exist AND carry
   // the run end record — never a header-only orphan. It sits at
-  // "<prefix>-<unix_ns>.nhsession"; find it by prefix.
-  const std::string dir = tempPath("");
+  // "<prefix>-<unix_ns>.nhsession"; find it by prefix. The name must END in
+  // ".nhsession": a bare substring match would also take the writer's
+  // "<...>.nhsession.jsonl" sidecar, and directory order between the pair is
+  // unspecified (the sidecar can enumerate first, and reading it as a session
+  // file fails).
+  static constexpr absl::string_view kSuffix = ".nhsession";
   std::string session_path;
   for (auto it = std::filesystem::directory_iterator(dir);
        it != std::filesystem::directory_iterator(); ++it) {
     const std::string name = it->path().filename().string();
-    if (name.rfind("tui-pipeline-failed-start", 0) == 0 &&
-        name.find(".nhsession") != std::string::npos) {
+    if (name.rfind("session-", 0) == 0 && name.size() >= kSuffix.size() &&
+        name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0) {
       session_path = it->path().string();
       break;
     }
@@ -1070,6 +1101,11 @@ TEST_F(SessionPipelineTest, FailedStartLeavesNoHeaderOnlySession) {
   ASSERT_TRUE(have_run_end) << "header-only session orphan (finding F3)";
   EXPECT_FALSE(run_end.completed());
   EXPECT_EQ(series_count, 0u);
+
+  // Leave nothing behind: the isolated directory holds only this test's
+  // session pair, and the test owns its lifetime.
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
 }
 
 } // namespace
