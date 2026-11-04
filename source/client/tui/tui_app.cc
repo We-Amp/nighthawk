@@ -339,7 +339,9 @@ FlamePaneState BuildFlamePane(std::shared_ptr<const std::vector<ProfileWindow>> 
       "window #", windows->size(), ": ", window.profile_type,
       " | purity ", absl::StrFormat("%.2f", window.purity_fraction),
       " | work units ", window.work_units,
-      window.symbolized ? "" : " | UNSYMBOLIZED (no working --pprof-tool)",
+      window.symbolized ? ""
+                        : " | UNSYMBOLIZED (some/all frames unresolved; check --pprof-tool and "
+                          "the PPROF_BINARY_PATH layout)",
       window.interval_source == WindowIntervalSource::kProfileTimestamps
           ? " | interval: profile timestamps"
           : " | interval: fetch orchestration");
