@@ -808,10 +808,15 @@ RunController::RunController(const std::shared_ptr<grpc::ChannelInterface>& chan
       // pool_ after it joins any in-flight M1 job first of all members.
       scrape_admin_(AdminEndpoints{}),
       feed_(channel,
-            RunFeedCallbacks{std::bind(&RunController::onSnapshot, this, std::placeholders::_1),
-                             std::bind(&RunController::onPhaseEvent, this, std::placeholders::_1),
-                             std::bind(&RunController::onCompleted, this, std::placeholders::_1),
-                             std::bind(&RunController::onFinished, this, std::placeholders::_1)}) {}
+            RunFeedCallbacks{.on_snapshot =
+                                 std::bind(&RunController::onSnapshot, this, std::placeholders::_1),
+                             .on_phase_event = std::bind(&RunController::onPhaseEvent, this,
+                                                         std::placeholders::_1),
+                             .on_completed =
+                                 std::bind(&RunController::onCompleted, this, std::placeholders::_1),
+                             .on_update_result = nullptr,
+                             .on_finished =
+                                 std::bind(&RunController::onFinished, this, std::placeholders::_1)}) {}
 
 RunController::~RunController() {
   // Stop the scrape cadence and join it before any member it touches goes

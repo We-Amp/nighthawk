@@ -133,6 +133,7 @@ struct FeedRecorder {
     callbacks.on_snapshot = [this](const nighthawk::client::LiveSnapshot& snapshot) {
       std::lock_guard<std::mutex> lock(mutex);
       events.push_back("snapshot");
+      snapshot_thread = std::this_thread::get_id();
       snapshots.push_back(snapshot);
       cv.notify_all();
     };
@@ -141,6 +142,13 @@ struct FeedRecorder {
       events.push_back("completed");
       completed = true;
       final_output = output;
+      cv.notify_all();
+    };
+    callbacks.on_update_result = [this](const nighthawk::client::UpdateResult& result) {
+      std::lock_guard<std::mutex> lock(mutex);
+      events.push_back("update_result");
+      update_results.push_back(result);
+      update_thread = std::this_thread::get_id();
       cv.notify_all();
     };
     callbacks.on_finished = [this](const absl::Status& status) {
@@ -187,6 +195,9 @@ struct FeedRecorder {
   std::condition_variable cv;
   std::vector<std::string> events;
   std::vector<nighthawk::client::LiveSnapshot> snapshots;
+  std::vector<nighthawk::client::UpdateResult> update_results;
+  std::thread::id snapshot_thread;
+  std::thread::id update_thread;
   bool completed = false;
   nighthawk::client::Output final_output;
   int finished_count = 0;
@@ -210,6 +221,9 @@ public:
   void TearDown() override { server_->Shutdown(); }
 
   std::string serviceAddress() const { return fmt::format("127.0.0.1:{}", grpc_server_port_); }
+
+  // Test-only access to the fixture's in-proc service (seam injection).
+  ServiceImpl& service() { return *service_; }
 
   const std::shared_ptr<grpc::ChannelInterface>& channel() const { return channel_; }
 
@@ -456,6 +470,168 @@ TEST_F(RunFeedTest, StopFromFinishedDoesNotDeadlockConcurrentStart) {
   std::lock_guard<std::mutex> lock(recorder.mutex);
   EXPECT_GE(recorder.finished_count, 2);
   EXPECT_TRUE(recorder.completed);
+}
+
+// A test double for the update applier (injected via
+// ServiceImpl::SetUpdateApplierFactoryForTest): waits out its full deadline
+// (honoring the deadline is the applier contract) without ever releasing
+// early, so the run always ends — and the pending update resolves inside the
+// late-rejection drop window — BEFORE the ack could ever be written.
+class DeadlineHoggingApplier : public LiveUpdateOrchestrator::Applier {
+public:
+  nighthawk::client::UpdateResult
+  ApplyDeltas(const nighthawk::client::UpdateRequest& /*request*/, const std::string& epoch_id,
+              const EngineInstant& /*bend_instant*/, absl::Time deadline) override {
+    while (absl::Now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    nighthawk::client::UpdateResult result;
+    result.set_applied(true);
+    result.set_epoch_id(epoch_id);
+    return result;
+  }
+};
+
+// M3 Task 7: an update written mid-run is acked by the service, the ack is
+// dispatched to on_update_result on the feed's read thread, and the snapshot
+// flow continues uninterrupted around it.
+TEST_F(RunFeedTest, RunFeedDeliversUpdateAck) {
+  FeedRecorder recorder;
+  recorder.arm();
+  RunFeed feed(channel(), recorder.callbacks());
+
+  EXPECT_EQ(feed.start(makeStartRequest(listener().uri(), /*rps=*/10, /*duration_seconds=*/4,
+                                        /*stats_flush_interval=*/1)),
+            absl::OkStatus());
+
+  // Let the run get demonstrably in flight, then steer it.
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(10), [&recorder]() { return !recorder.snapshots.empty(); }));
+  nighthawk::client::UpdateRequest update;
+  update.mutable_deltas()->Add()->mutable_requests_per_second()->set_value(20);
+  EXPECT_EQ(feed.SendUpdate(update), absl::OkStatus());
+
+  ASSERT_TRUE(recorder.waitFor(absl::Seconds(10), [&recorder]() {
+    return !recorder.update_results.empty();
+  }));
+
+  // The ack carries the applied verdict and the first knob epoch.
+  {
+    std::lock_guard<std::mutex> lock(recorder.mutex);
+    ASSERT_GE(recorder.update_results.size(), 1);
+    EXPECT_TRUE(recorder.update_results[0].applied());
+    EXPECT_EQ(recorder.update_results[0].epoch_id(), "epoch-1");
+    // The ack fired on the feed's read thread, like every callback.
+    EXPECT_EQ(recorder.update_thread, recorder.snapshot_thread);
+    EXPECT_EQ(recorder.events[0], "snapshot");
+  }
+
+  // The run completes naturally afterwards: more snapshots may follow, then
+  // completed, then finished last.
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(30), [&recorder]() { return recorder.finished_count > 0; }));
+  std::lock_guard<std::mutex> lock(recorder.mutex);
+  EXPECT_TRUE(recorder.finished_status.ok()) << recorder.finished_status.ToString();
+  EXPECT_TRUE(recorder.completed);
+  EXPECT_EQ(recorder.events.back(), "finished");
+  EXPECT_EQ(recorder.events[recorder.events.size() - 2], "completed");
+  EXPECT_GT(recorder.final_output.results_size(), 0);
+}
+
+// Sending an update (or a cancellation) with no run in flight is rejected with
+// kFailedPrecondition — before the run starts and after one completed.
+TEST_F(RunFeedTest, RunFeedRejectsUpdateWhenNotRunning) {
+  FeedRecorder recorder;
+  recorder.arm();
+  RunFeed feed(channel(), recorder.callbacks());
+
+  nighthawk::client::UpdateRequest update;
+  update.mutable_deltas()->Add()->mutable_requests_per_second()->set_value(20);
+  absl::Status status = feed.SendUpdate(update);
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition) << status.ToString();
+
+  absl::Status cancel_status = feed.SendCancellation();
+  EXPECT_EQ(cancel_status.code(), absl::StatusCode::kFailedPrecondition)
+      << cancel_status.ToString();
+
+  // After a full run completes, the arms are rejected again.
+  EXPECT_EQ(feed.start(makeStartRequest(listener().uri(), 10, 1, 1)), absl::OkStatus());
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(15), [&recorder]() { return recorder.finished_count > 0; }));
+  status = feed.SendUpdate(update);
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition) << status.ToString();
+}
+
+// The late-rejection drop window surfaced honestly: with an applier that
+// hogs its deadline, the run ends before the update could be acked. The feed
+// must NOT fabricate an engine ack; it surfaces the pending state once, as a
+// feed-generated result (rejection_reason prefixed "run-feed: "), immediately
+// before on_finished.
+TEST_F(RunFeedTest, RunFeedUpdateTimeoutSurfacesPending) {
+  service().SetUpdateApplierFactoryForTest(
+      []() { return std::make_unique<DeadlineHoggingApplier>(); });
+
+  FeedRecorder recorder;
+  recorder.arm();
+  RunFeed feed(channel(), recorder.callbacks());
+
+  EXPECT_EQ(feed.start(makeStartRequest(listener().uri(), /*rps=*/10, /*duration_seconds=*/2,
+                                        /*stats_flush_interval=*/1)),
+            absl::OkStatus());
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(10), [&recorder]() { return !recorder.snapshots.empty(); }));
+
+  nighthawk::client::UpdateRequest update;
+  update.mutable_deltas()->Add()->mutable_requests_per_second()->set_value(20);
+  EXPECT_EQ(feed.SendUpdate(update), absl::OkStatus());
+
+  // No engine ack may arrive; the run still completes naturally.
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(30), [&recorder]() { return recorder.finished_count > 0; }));
+  std::lock_guard<std::mutex> lock(recorder.mutex);
+  ASSERT_GE(recorder.update_results.size(), 1);
+  const nighthawk::client::UpdateResult& surfaced = recorder.update_results.back();
+  EXPECT_FALSE(surfaced.applied());
+  EXPECT_TRUE(absl::StartsWith(surfaced.rejection_reason(), "run-feed: "))
+        << surfaced.rejection_reason();
+  // Surfaced on the read thread, immediately before on_finished, never after.
+  EXPECT_EQ(recorder.update_thread, recorder.snapshot_thread);
+  ASSERT_GE(recorder.events.size(), 2);
+  EXPECT_EQ(recorder.events[recorder.events.size() - 1], "finished");
+  EXPECT_EQ(recorder.events[recorder.events.size() - 2], "update_result");
+  EXPECT_TRUE(recorder.completed);
+}
+
+// The explicit cancellation arm keeps the stream alive: the run ends promptly
+// AND its final output still arrives (on_completed), then on_finished OK —
+// unlike stop(), which yields no responses after the cancel.
+TEST_F(RunFeedTest, RunFeedSendCancellationCompletesWithOutput) {
+  FeedRecorder recorder;
+  recorder.arm();
+  RunFeed feed(channel(), recorder.callbacks());
+
+  EXPECT_EQ(feed.start(makeStartRequest(listener().uri(), /*rps=*/10, /*duration_seconds=*/60,
+                                        /*stats_flush_interval=*/1)),
+            absl::OkStatus());
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(10), [&recorder]() { return !recorder.snapshots.empty(); }));
+
+  const auto cancel_time = std::chrono::steady_clock::now();
+  EXPECT_EQ(feed.SendCancellation(), absl::OkStatus());
+
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(10), [&recorder]() { return recorder.finished_count > 0; }));
+  const auto elapsed = std::chrono::steady_clock::now() - cancel_time;
+  EXPECT_LT(elapsed, 5s);
+
+  std::lock_guard<std::mutex> lock(recorder.mutex);
+  EXPECT_EQ(recorder.finished_count, 1);
+  // The arm keeps the stream alive: the output arrives, and the stream ends OK.
+  EXPECT_TRUE(recorder.completed);
+  EXPECT_TRUE(recorder.finished_status.ok()) << recorder.finished_status.ToString();
+  EXPECT_EQ(recorder.events.back(), "finished");
+  EXPECT_EQ(recorder.events[recorder.events.size() - 2], "completed");
+  EXPECT_GT(recorder.final_output.results_size(), 0);
 }
 
 } // namespace

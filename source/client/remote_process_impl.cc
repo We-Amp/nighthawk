@@ -31,8 +31,15 @@ bool RemoteProcessImpl::run(OutputCollector& collector) {
   // choke point in NighthawkServiceClientImpl::PerformNighthawkBenchmark does
   // that for every legacy remote consumer, including this one.
 
+  // FORK-ONLY (We-Amp): arm the cancellation handle for the duration of the
+  // blocking execution (M3 Task 7, #380) so requestExecutionCancellation()
+  // can write the CancellationRequest arm from another thread. The arm keeps
+  // the stream alive, so the run's final response still arrives below.
+  cancellation_handle_ = std::make_unique<NighthawkServiceCancellationHandle>();
   const absl::StatusOr<const nighthawk::client::ExecutionResponse> result =
-      service_client_->PerformNighthawkBenchmark(&stub_, *options);
+      service_client_->PerformNighthawkBenchmarkWithCancellation(&stub_, *options,
+                                                                cancellation_handle_.get());
+  cancellation_handle_.reset();
   if (result.ok()) {
     collector.setOutput(result.value().output());
     return true;
@@ -42,9 +49,12 @@ bool RemoteProcessImpl::run(OutputCollector& collector) {
 }
 
 bool RemoteProcessImpl::requestExecutionCancellation() {
-  ENVOY_LOG(error, "Remote process cancellation not supported yet");
-  // TODO(#380): Send a cancel request to the gRPC service.
-  return false;
+  if (cancellation_handle_ == nullptr) {
+    // No remote run is in flight on this process (never started, or already
+    // finished); there is nothing to cancel.
+    return false;
+  }
+  return cancellation_handle_->RequestCancellation();
 }
 
 } // namespace Client
