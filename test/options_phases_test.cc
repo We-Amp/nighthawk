@@ -130,6 +130,30 @@ TEST(OptionsPhasesTest, PhaseVectorRejectsTopLevelDurationConcurrencyConflict) {
                           MalformedArgvException, "mutually exclusive");
 }
 
+// The top-level no_duration arm shares the duration oneof, so a well-formed
+// proto can carry phases + no_duration -- which would silently drop the
+// mandatory per-phase durations (no termination predicate ever fires, every
+// boundary censors and the final phase hangs the run). The combination is
+// rejected with the same fail-fast mutual-exclusion text.
+TEST(OptionsPhasesTest, PhaseVectorRejectsTopLevelNoDurationConflict) {
+  nighthawk::client::CommandLineOptions with_no_duration = makeOptionsWithPhases(2);
+  with_no_duration.mutable_no_duration()->set_value(true);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(with_no_duration),
+                          MalformedArgvException, "mutually exclusive.*per-phase durations");
+
+  // A single-phase vector is not exempt (it is the legacy-equivalent shape,
+  // but its per-phase durations are still mandatory).
+  nighthawk::client::CommandLineOptions single_with_no_duration = makeOptionsWithPhases(1);
+  single_with_no_duration.mutable_no_duration()->set_value(true);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(single_with_no_duration),
+                          MalformedArgvException, "mutually exclusive");
+
+  // The pure validation entry agrees.
+  const absl::Status status = validatePhaseVector(with_no_duration);
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(std::string(status.message()), testing::HasSubstr("per-phase durations"));
+}
+
 TEST(OptionsPhasesTest, PhaseVectorRejectsInvalidDurationOrRps) {
   nighthawk::client::CommandLineOptions short_duration = makeOptionsWithPhases(2);
   short_duration.mutable_phases(1)->mutable_duration()->set_seconds(0);

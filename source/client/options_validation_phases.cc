@@ -56,6 +56,16 @@ absl::Status validatePhaseVector(const nighthawk::client::CommandLineOptions& op
         "phases and the top-level concurrency are mutually exclusive; specify "
         "per-phase concurrency on the PhaseSpec entries instead");
   }
+  // The no_duration arm shares the duration oneof, so phases + no_duration is
+  // a well-formed proto that would slip past the duration check -- and
+  // silently drop the mandatory per-phase durations (no termination predicate
+  // ever fires on duration, every phase boundary censors, and the final phase
+  // hangs the run until an external cancel). Fail fast the same way.
+  if (options.has_no_duration()) {
+    return absl::InvalidArgumentError(
+        "phases and the top-level no_duration are mutually exclusive; a phase "
+        "vector requires per-phase durations on the PhaseSpec entries instead");
+  }
 
   // A single phase is legacy-equivalent run-wise (a one-element vector,
   // legacy-shaped output), but its declared fields are validated like any
