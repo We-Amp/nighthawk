@@ -1281,6 +1281,30 @@ TEST(BoundaryDrainWatchTest, StaleWatchCannotSatisfyNextBoundary) {
   EXPECT_EQ(2222, future2.get().sequencer_stop_monotonic_ns);
 }
 
+// FORK-ONLY (m3-drain-pair): the boundary-drain live-update gate is scoped
+// by boundary index. A straggler whose non-final sequencer stops only after
+// runPhases closed its boundary's drain and began the successor fires the
+// gate open with ITS boundary's index; anything at or below the closed mark
+// is stale and must be ignored -- the old unscoped flag re-opened the gate
+// mid-successor-phase and nothing cleared it until the NEXT boundary,
+// spuriously rejecting legitimate live updates for the rest of the phase.
+TEST(BoundaryDrainGateTest, LateStopForAClosedBoundaryDoesNotReopen) {
+  BoundaryDrainGate gate;
+  EXPECT_FALSE(gate.in_progress());
+  gate.open(0);
+  EXPECT_TRUE(gate.in_progress());
+  gate.close(0);
+  EXPECT_FALSE(gate.in_progress());
+  gate.open(0);  // the straggler's late stop for the already-closed boundary
+  EXPECT_FALSE(gate.in_progress())
+      << "a late stop for a completed boundary must not re-open the gate";
+  // A genuinely new boundary still opens the gate.
+  gate.open(1);
+  EXPECT_TRUE(gate.in_progress());
+  gate.close(1);
+  EXPECT_FALSE(gate.in_progress());
+}
+
 TEST(PhaseOrchestratorTest, PartialAcksAreCensored) {
   std::vector<PhaseEvent> events;
   PhaseOrchestrator orchestrator(

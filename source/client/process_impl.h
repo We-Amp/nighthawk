@@ -207,6 +207,43 @@ private:
  * introduce a --lock-name option. Note that multiple instances in the same process may
  * be problematic because of Envoy enforcing a single runtime instance.
  */
+// FORK-ONLY (m3-drain-pair): the boundary-drain live-update gate, scoped by
+// boundary index. The workers' stop hooks fire open() with the boundary the
+// stop belongs to; runPhases fires close() when that boundary's drain is
+// collected. A straggler whose non-final sequencer stops only AFTER its
+// boundary was closed (the censored-drain shape: collectDrainAcks gave up
+// on it) fires a stale index, which open() ignores -- the old unscoped flag
+// re-opened the gate mid-successor-phase and nothing cleared it until the
+// NEXT boundary, spuriously rejecting legitimate live updates for the rest
+// of the successor phase. Cheap: a mutex-protected pair, touched once per
+// stop hook / boundary close and by the update-admission check.
+class BoundaryDrainGate {
+public:
+  void open(uint32_t boundary_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (static_cast<int64_t>(boundary_index) <= last_closed_boundary_) {
+      return;
+    }
+    in_progress_ = true;
+  }
+  void close(uint32_t boundary_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (static_cast<int64_t>(boundary_index) > last_closed_boundary_) {
+      last_closed_boundary_ = boundary_index;
+    }
+    in_progress_ = false;
+  }
+  bool in_progress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return in_progress_;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  int64_t last_closed_boundary_{-1};
+  bool in_progress_{false};
+};
+
 class ProcessImpl : public Process, public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
   /**
@@ -395,7 +432,14 @@ private:
   void fanOutEnd();
   // The boundary-drain live-update gate, see the .cc. Set from the worker
   // dispatchers' sequencer-stop observers; cleared by runPhases.
-  void setBoundaryDrainInProgress(bool in_progress);
+  // FORK-ONLY (m3-drain-pair): boundary-scoped halves of the old
+  // setBoundaryDrainInProgress. The worker's stop hook reports the boundary
+  // index it belongs to; open ignores an index at or below the closed mark
+  // (a straggler firing after runPhases closed its boundary and began the
+  // successor), so the stale fire can no longer hold the live-update gate
+  // open until the next boundary.
+  void openBoundaryDrainGate(uint32_t boundary_index);
+  void closeBoundaryDrainGate(uint32_t boundary_index);
   // Fence condition callback (the fence mutex is held).
   bool LiveUpdateFanOutsDrained() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(live_update_fence_mutex_) {
     return in_flight_fan_outs_ == 0;
@@ -429,7 +473,9 @@ private:
   // and a bend must never be applied across a boundary).
   uint32_t current_phase_index_{0};
   uint32_t active_worker_count_{0};
-  bool boundary_drain_in_progress_{false};
+  // FORK-ONLY (m3-drain-pair): the boundary-drain live-update gate, scoped
+  // by boundary index (see BoundaryDrainGate).
+  BoundaryDrainGate boundary_drain_gate_;
   // FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out shutdown fence: every
   // in-flight fan-out registers itself here; the workers are destroyed only
   // after the fence drained (bounded by the applier deadline), so no

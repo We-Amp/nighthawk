@@ -146,7 +146,7 @@ public:
   // boundary begins, possibly EARLY via a termination predicate). The
   // process uses it to open the boundary-drain live-update gate. Set before
   // the worker thread starts.
-  void setSequencerStopObserver(std::function<void()> observer) override {
+  void setSequencerStopObserver(std::function<void(uint32_t)> observer) override {
     sequencer_stop_observer_ = std::move(observer);
   }
   const std::vector<StatisticPtrMap>& phaseStatistics() const override {
@@ -247,8 +247,10 @@ private:
   std::vector<uint64_t> phase_gate_exceeded_starts_;
   // FORK-ONLY (We-Amp): M3 Task 6 -- the boundary-begin observer, see
   // setSequencerStopObserver(). Set before the worker thread starts; called
-  // on this dispatcher inside the non-final stop hook.
-  std::function<void()> sequencer_stop_observer_;
+  // on this dispatcher inside the non-final stop hook with the boundary
+  // index captured at that boundary's begin-phase (a straggler's late stop
+  // therefore reports ITS boundary, never the successor's).
+  std::function<void(uint32_t)> sequencer_stop_observer_;
   std::promise<void> ready_promise_;
   std::shared_future<void> ready_future_;
   std::unique_ptr<BoundaryDrainWatch> drain_watch_;

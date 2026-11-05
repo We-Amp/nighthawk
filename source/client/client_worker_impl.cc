@@ -415,7 +415,7 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   const size_t duration_slot = phase_execution_durations_.size();
   phase_execution_durations_.push_back(0);
   sequencer_impl->setExitDispatcherOnStop(final_phase);
-  sequencer_impl->setStopHook([this, final_phase, duration_slot,
+  sequencer_impl->setStopHook([this, final_phase, phase_index, duration_slot,
                                drain_promise](bool /*timed_out*/) {
     // On this dispatcher, inside the sequencer's stop.
     dispatcher_->updateApproximateMonotonicTime();
@@ -432,7 +432,7 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
     // process's boundary-drain live-update gate before the drain watch
     // starts.
     if (sequencer_stop_observer_ != nullptr) {
-      sequencer_stop_observer_();
+      sequencer_stop_observer_(phase_index);
     }
     startDrainWatch(time_source_->monotonicTime().time_since_epoch().count(), drain_promise);
   });
