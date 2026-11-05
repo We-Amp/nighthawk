@@ -205,24 +205,41 @@ void SequencerImpl::applyLiveUpdateOnDispatcherThread(
   if (t_bend > now + kLiveUpdateBendGrace) {
     // Schedule the apply at the agreed bend instant. Bends are not queued
     // (Task 4 Q4 ruling): while a bend is pending, a new one fails honestly.
-    // (Pending-ness is a flag, not a null timer pointer: destroying the
-    // timer from inside its own firing callback is use-after-free.)
+    //
+    // The pending bend lives in dispatcher-confined members that the timer
+    // lambda reads AT FIRE TIME (the lambda captures only `this`): the timer
+    // object is created once and reused across bends, and each firing
+    // applies whatever bend is currently pending -- never a stale capture
+    // from the first arming (a stale capture would re-apply the first
+    // bend's rate and re-invoke its already-consumed callback, dropping the
+    // second caller's). Pending-ness is a flag, not a null-timer check, and
+    // the timer is never destroyed inside its own firing callback
+    // (use-after-free).
     if (bend_timer_pending_) {
       callback(absl::InvalidArgumentError(
           "a live-update bend is already pending for this worker; bends are not queued"));
       return;
     }
     if (live_update_timer_ == nullptr) {
-      live_update_timer_ = dispatcher_.createTimer([this, t_bend, new_rps, callback]() mutable {
-        bend_timer_pending_ = false;
-        callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
-      });
+      live_update_timer_ = dispatcher_.createTimer([this]() { firePendingBend(); });
     }
+    pending_bend_time_ = t_bend;
+    pending_bend_rps_ = new_rps;
+    pending_bend_callback_ = std::move(callback);
     bend_timer_pending_ = true;
     live_update_timer_->enableHRTimer(
         std::chrono::duration_cast<std::chrono::milliseconds>(t_bend - now));
     return;
   }
+  callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
+}
+
+void SequencerImpl::firePendingBend() {
+  bend_timer_pending_ = false;
+  const Envoy::MonotonicTime t_bend = pending_bend_time_;
+  const uint32_t new_rps = pending_bend_rps_;
+  auto callback = std::move(pending_bend_callback_);
+  pending_bend_callback_ = nullptr;
   callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
 }
 

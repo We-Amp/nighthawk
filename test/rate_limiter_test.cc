@@ -593,6 +593,14 @@ public:
   int64_t credit() const { return acquireable_count_; }
   uint64_t acquired() const { return acquired_count_; }
 };
+
+class CreditProbeRampingRateLimiter : public LinearRampingRateLimiterImpl {
+public:
+  using LinearRampingRateLimiterImpl::LinearRampingRateLimiterImpl;
+  void forceCredit(int64_t credit) { acquireable_count_ = credit; }
+  int64_t credit() const { return acquireable_count_; }
+  uint64_t acquired() const { return acquired_count_; }
+};
 } // namespace
 
 // The §8.7 linear degenerate case: a live up-bend conserves the cumulative
@@ -760,8 +768,21 @@ TEST_F(RateLimiterTest, RampingLimiterApplyLiveRpsPendingRejection) {
 // Task 5 obligation pin: the ramping limiter gates credit on BARE TRUTHINESS
 // (`if (acquireable_count_)`, rate_limiter_impl.cc), so negative credit --
 // which a Task 5 down-bend into the ramp regimes can produce -- would be
-// truthy and hand out an acquisition. Task 5's truthiness fix owns this;
-// the test stays disabled until then (enabling it before the fix fails).
-TEST_F(RateLimiterTest, DISABLED_RampingLimiterNegativeCreditClamped) {}
+// truthy and handed out as an acquisition. Task 5's truthiness fix owns
+// this. The body FAILS against the stock limiter: with credit forced to -5
+// the stock gate grants an acquisition sourced from the negative balance
+// (credit drops to -6). Enable together with the fix.
+TEST_F(RateLimiterTest, DISABLED_RampingLimiterNegativeCreditClamped) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  CreditProbeRampingRateLimiter limiter(time_system, 2s, 10_Hz);
+  acquireAll(limiter); // start the schedule
+  limiter.forceCredit(-5);
+  const bool granted = limiter.tryAcquireOne();
+  // An acquisition may only be granted from freshly recomputed (non-negative)
+  // credit -- never sourced from the negative balance.
+  EXPECT_TRUE(!granted || limiter.credit() >= 0)
+      << "an acquisition was sourced from negative acquireable_count_";
+  EXPECT_EQ(limiter.acquired(), granted ? 1u : 0u);
+}
 
 } // namespace Nighthawk

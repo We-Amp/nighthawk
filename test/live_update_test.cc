@@ -1020,6 +1020,52 @@ TEST_F(SequencerLiveUpdateTest, SecondBendWhilePendingRejectedNotQueued) {
   EXPECT_TRUE(first_status.ok()) << first_status.message();
 }
 
+// Two SEQUENTIAL bends (not bend-while-pending) on the same sequencer: the
+// timer is reused, and each firing must apply its OWN bend's rate and invoke
+// its OWN callback exactly once -- never a stale capture from the first
+// arming.
+TEST_F(SequencerLiveUpdateTest, SequentialBendsEachApplyTheirOwnRate) {
+  auto sequencer = makeSequencer(10, /*with_handle=*/true);
+  const uint64_t base = drive(*sequencer, 500ms, 10ms); // ~5 at 10 Hz
+  ASSERT_NEAR(base, 5, 1);
+
+  std::atomic<int> first_calls{0};
+  std::atomic<int> second_calls{0};
+  absl::Status first_status = absl::InternalError("callback not run");
+  absl::Status second_status = absl::InternalError("callback not run");
+  std::atomic<bool> first_done{false};
+  std::atomic<bool> second_done{false};
+
+  sequencer->applyLiveUpdate(timeSource().monotonicTime() + 100ms, 20, [&](absl::Status s) {
+    first_calls++;
+    first_status = s;
+    first_done = true;
+  });
+  pumpUntil([&first_done]() { return first_done.load(); });
+  ASSERT_TRUE(first_done.load());
+  EXPECT_TRUE(first_status.ok()) << first_status.message();
+
+  const uint64_t mid = drive(*sequencer, 500ms, 10ms); // ~10 at 20 Hz
+  EXPECT_NEAR(mid, 10, 2);
+
+  // Second sequential bend on the SAME timer object.
+  sequencer->applyLiveUpdate(timeSource().monotonicTime() + 100ms, 40, [&](absl::Status s) {
+    second_calls++;
+    second_status = s;
+    second_done = true;
+  });
+  pumpUntil([&second_done]() { return second_done.load(); });
+  ASSERT_TRUE(second_done.load());
+  EXPECT_TRUE(second_status.ok()) << second_status.message();
+
+  const uint64_t last = drive(*sequencer, 1000ms, 10ms); // ~40 at 40 Hz
+  EXPECT_NEAR(last, 40, 3);
+
+  // Each bend's callback fired EXACTLY once.
+  EXPECT_EQ(first_calls.load(), 1);
+  EXPECT_EQ(second_calls.load(), 1);
+}
+
 TEST_F(SequencerLiveUpdateTest, NoCapturedHandleFailsHonestly) {
   auto sequencer = makeSequencer(10, /*with_handle=*/false);
   absl::Status status = absl::OkStatus();

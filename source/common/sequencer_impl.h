@@ -149,6 +149,11 @@ protected:
   // always runs on this sequencer's own dispatcher.
   void applyLiveUpdateOnDispatcherThread(Envoy::MonotonicTime t_bend, uint32_t new_rps,
                                          std::function<void(absl::Status)> callback);
+  // FORK-ONLY (We-Amp): the bend timer's body. Reads the pending bend from
+  // the members below at fire time (the timer lambda captures only `this`),
+  // so each firing applies the CURRENTLY pending bend and its own callback
+  // -- never a stale capture from the first arming.
+  void firePendingBend();
 
 private:
   SequencerTarget target_;
@@ -181,6 +186,13 @@ private:
   // True while a future bend is armed (the timer object is reused, so the
   // pointer alone cannot say whether a bend is pending).
   bool bend_timer_pending_{false};
+  // The currently pending future bend, dispatched to the limiter when the
+  // bend timer fires. Dispatcher-confined like everything above; each
+  // successful arming overwrites the previous (bends are not queued, so
+  // there is never more than one pending bend).
+  Envoy::MonotonicTime pending_bend_time_;
+  uint32_t pending_bend_rps_{0};
+  std::function<void(absl::Status)> pending_bend_callback_;
 };
 
 } // namespace Nighthawk

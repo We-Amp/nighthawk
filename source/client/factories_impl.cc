@@ -119,9 +119,9 @@ SequencerPtr SequencerFactoryImpl::create(
     // wraps it. A plugin limiter that does not implement the interface (or a
     // load that produced something else) captures null: the registry then
     // fails a live update honestly at lookup, never silently.
+    captured_handle = dynamic_cast<LiveTunableRateLimiter*>(rate_limiter.get());
     if (captured_live_tunable != nullptr) {
-      *captured_live_tunable = dynamic_cast<LiveTunableRateLimiter*>(rate_limiter.get());
-      captured_handle = *captured_live_tunable;
+      *captured_live_tunable = captured_handle;
     }
     rate_limiter = std::make_unique<ScheduledStartingRateLimiter>(std::move(rate_limiter),
                                                                   scheduled_starting_time);

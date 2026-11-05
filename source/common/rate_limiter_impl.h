@@ -110,7 +110,10 @@ public:
   void releaseOne() override;
   absl::Status ApplyLiveRps(Envoy::MonotonicTime t_bend, uint32_t new_rps) override;
 
-private:
+protected:
+  // FORK-ONLY (We-Amp): protected (not private) since M3 Task 3, matching
+  // LinearRateLimiter -- lets the white-box test probe pin Task 5's
+  // truthiness/clamp obligation.
   int64_t acquireable_count_{0};
   uint64_t acquired_count_{0};
   const std::chrono::nanoseconds ramp_time_;
