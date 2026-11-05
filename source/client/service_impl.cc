@@ -153,10 +153,16 @@ void ServiceImpl::handleExecutionRequest(
   // final output response; the only concurrent writer is the live snapshot
   // collector, and the shared stream-write mutex serializes both. A failed
   // write means the stream is gone (client cancelled); stop delivering.
+  // The flag MUST live at function scope: the callback stored below fires
+  // during process->run() further down, i.e. after this registration block
+  // has closed — a block-scoped flag there reads destroyed storage by the
+  // time the run thread checks it. Like stop_live_collector below, the
+  // reference stays valid because the callback can only fire before this
+  // function returns.
+  std::atomic<bool> phase_event_stream_gone{false};
   if (options->liveStreamingEnabled()) {
-    // m8: the collector's write contract — a failed Write means the stream
+    // m8: the collector write contract — a failed Write means the stream
     // is gone (client cancelled); stop producing boundary responses.
-    std::atomic<bool> phase_event_stream_gone{false};
     static_cast<ProcessImpl&>(*process).setPhaseEventCallback(
         [this, stream, &phase_event_stream_gone](const Nighthawk::Client::PhaseEvent& event) {
           if (!event.boundary_complete ||
