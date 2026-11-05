@@ -24,6 +24,9 @@ nighthawk::client::ProfileWindowRecord ToProfileWindowRecord(
                                  ? nighthawk::client::WINDOW_INTERVAL_SOURCE_PROFILE_TIMESTAMPS
                                  : nighthawk::client::WINDOW_INTERVAL_SOURCE_FETCH_ORCHESTRATION);
   record.set_clock_offset_uncertainty_ns(w.clock_offset_uncertainty_ns);
+  // M3 epoch purity (spec 8.5): the knob epoch whose schedule produced the
+  // window's samples (empty before the run's first applied live change).
+  record.set_epoch_id(w.epoch_id.data(), w.epoch_id.size());
   return record;
 }
 

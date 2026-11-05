@@ -126,7 +126,8 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                             const std::vector<PhaseTimelineSegment>* timeline = nullptr,
                             const std::vector<KnobDisplay>* staged_preview = nullptr,
                             const std::string* staged_workers_annotation = nullptr,
-                            const std::vector<uint64_t>* boundary_stamps = nullptr);
+                            const std::vector<uint64_t>* boundary_stamps = nullptr,
+                            const LiveKnobTurn* rps_turn = nullptr);
 
 // The charts tab (tab 0): on a completed run a completion-summary block
 // first (backlog item 7: totals, error ratio, final percentiles, the saved

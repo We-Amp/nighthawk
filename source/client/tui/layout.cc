@@ -357,6 +357,10 @@ ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open, int
     bar = "tab field | enter apply | esc cancel";
   } else if (mode == InputMode::kEditingSearch) {
     bar = "type to search | enter apply | esc cancel";
+  } else if (mode == InputMode::kEditingKnob) {
+    // The M3 rps turn: the typed value is the PHASE TOTAL (the knob speaks
+    // global rps; the engine divides at fan-out).
+    bar = "digits: new rps (phase total) | enter: turn | esc: cancel";
   } else if (active_tab == 1) {
     // The flame tab: the pane's own keys (the key map table's flame rows).
     bar = "Arrows nav | Enter zoom | Esc root | / find | p win | d diff | N noise";
@@ -412,6 +416,7 @@ const std::vector<KeyBinding>& KeyBindingTable() {
       {"d", "differential (default: last two pure)"},
       {"N", "noise-floor view (plain n stays dialog)"},
       {"e", "stage an edit for the next phase (knobs tab; esc discards)"},
+      {"u", "turn the rps knob (knobs tab, live run; the PHASE TOTAL)"},
   };
   return *table;
 }
@@ -434,20 +439,20 @@ ftxui::Element RenderHelpOverlay() {
   lines.push_back(ftxui::text(borderedRow("keys (navigate)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  c / k / f       charts / knobs / flame tab", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  n               open the start-run dialog", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  N               noise-floor view (plain n stays)", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  s               stop the running run", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  q               quit; a live run is stopped first", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  d / N           differential | noise-floor view", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  s / q           stop the run | quit (run stops first)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  u               turn the rps knob (PHASE TOTAL, live run)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  Arrows          flame frame navigation (flame tab)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  Enter           zoom to the selected frame", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  Esc/Backspace   unzoom to the tree root", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  /               flame search (enter applies)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  p               start/stop a profile window", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  d               differential (last two pure)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("keys (start-run dialog): tab next field | enter apply | esc", inner_width)));
   lines.push_back(ftxui::text(borderedRow("status-bar fields", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  state/elapsed  idle|running|completed|stopped; 39s/60s", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  target         uri under load; (target pending) pre-ack", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  phase/epoch    placeholders until M2 / M3", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  phase/epoch    live phase and knob epoch of the latest flush", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  rps semantics  rps values are PHASE TOTALS across workers", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  flush 1s       chart cadence: one column per flush", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  4xx/rst/t/o    per-flush client-side failure rates", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  session        session recording path", inner_width)));
@@ -499,6 +504,8 @@ ftxui::Element RenderStartRunDialog(const StartRunDialogModel& dialog,
   }
   lines.push_back(ftxui::text(borderedRow("", kDialogInnerWidth)));
   lines.push_back(ftxui::text(borderedRow("tab: next field  enter: start  esc: cancel", kDialogInnerWidth)));
+  lines.push_back(ftxui::text(borderedRow("every rps value is the phase total (split across", kDialogInnerWidth)));
+  lines.push_back(ftxui::text(borderedRow("the active workers)", kDialogInnerWidth)));
   lines.push_back(ftxui::text(borderRule(kDialogOverlayWidth)));
   return ftxui::vbox(std::move(lines));
 }
@@ -512,7 +519,8 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
                             const std::vector<PhaseTimelineSegment>* timeline,
                             const std::vector<KnobDisplay>* staged_preview,
                             const std::string* staged_workers_annotation,
-                            const std::vector<uint64_t>* boundary_stamps) {
+                            const std::vector<uint64_t>* boundary_stamps,
+                            const LiveKnobTurn* rps_turn) {
   // The min-size gate wraps everything: below the declared minimum, render
   // the message and nothing else — no partial status bar, no wrapped charts.
   if (width < kMinTerminalWidth || height < kMinTerminalHeight) {
@@ -568,21 +576,24 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
     // Tab 2 is the knob pane, rendered from the most recent run's options
     // (unset defaults before any run). Empty options never render an empty
     // pane: KnobsFromOptions yields the five knobs with "unset"/"not
-    // configured" values. While a run is active and edits are staged, the
-    // staged next-phase preview renders below the current knobs (visually
-    // distinct; discardable; never applied to the current phase).
+    // configured" values. M3: the live rps turn renders above the knob
+    // vocabulary with its state marker (acked/pending/rejected/failed);
+    // while a run is active and edits are staged, the staged next-phase
+    // preview renders below (visually distinct; discardable; never applied
+    // to the current phase).
     const std::vector<KnobDisplay> current = KnobsFromOptions(knob_options);
-    if (staged_preview == nullptr || staged_preview->empty()) {
-      pane = RenderKnobPane(current, width, height - 5);
-    } else {
-      std::vector<ftxui::Element> rows;
-      rows.push_back(RenderKnobPane(current, width, height - 5));
+    std::vector<ftxui::Element> rows;
+    if (rps_turn != nullptr) {
+      rows.push_back(RenderLiveKnobTurns(*rps_turn, width, height - 5));
+    }
+    rows.push_back(RenderKnobPane(current, width, height - 5));
+    if (staged_preview != nullptr && !staged_preview->empty()) {
       rows.push_back(RenderNextPhasePreviewBlock(*staged_preview,
                                                  staged_workers_annotation == nullptr
                                                      ? ""
                                                      : *staged_workers_annotation));
-      pane = ftxui::vbox(std::move(rows));
     }
+    pane = ftxui::vbox(std::move(rows));
     break;
   }
   default:

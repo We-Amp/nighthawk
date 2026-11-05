@@ -11,6 +11,7 @@
 #include <thread>
 #include <utility>
 
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -232,12 +233,14 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
   // anchor.monotonic).
   const int64_t anchor_offset = input.anchor.wall_time_unix_ns - input.anchor.monotonic_ns;
 
-  if (!input.boundary_events.empty() || !input.phase_specs.empty()) {
+  if (!input.boundary_events.empty() || !input.phase_specs.empty() || !input.epoch_marks.empty()) {
     // M2 split-at-boundary alignment: engine intervals joined on the
     // streamed (wall, monotonic) pairs (DQ-3). A window straddling a
     // boundary splits into per-phase parts. Before the run's FIRST boundary
     // lands, a phase run still gets its phase-0 interval from the specs
-    // (bounded by observed time only — never a fabricated future end).
+    // (bounded by observed time only — never a fabricated future end). M3:
+    // a legacy single-phase run WITH applied knob epochs also goes through
+    // the split producer — the epoch cuts join the phase cuts (spec 8.5).
     const int64_t interval_end =
         input.run_finished ? input.run_end_unix_ns
                            : std::max(input.run_start_unix_ns + 1, fetched.requested_end_unix_ns);
@@ -259,13 +262,19 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
       }
       intervals.push_back(std::move(first));
     }
+    if (intervals.empty() && !input.epoch_marks.empty()) {
+      // Legacy single-phase run with epochs: one "main" interval over the
+      // run span; the epoch cuts sub-split it.
+      intervals.push_back(PreA1RunInterval(input.run_start_unix_ns, interval_end,
+                                           input.worker_count));
+    }
     if (intervals.empty()) {
       outcome.note = "window rejected: no phase intervals from the boundary events";
       return outcome;
     }
     SplitAlignment split = WindowPhaseAlignment::AlignSplit(
         *std::move(tree_or), intervals, window_start, window_end, fetched.profile_type,
-        uncertainty, input.completed_series, anchor_offset);
+        uncertainty, input.completed_series, anchor_offset, input.epoch_marks);
     // The excluded-and-marked parts ALWAYS land (store + session, purity 0.0,
     // the rule-naming reason) — the fix-round rule: a marked part must never
     // vanish just because a pure sibling exists; only the note changes shape.
@@ -285,7 +294,11 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
         absl::StrAppend(&note, " | ", split.reasons[i]);
       }
     } else {
-      note = "window rejected: no part overlaps the run's phase intervals";
+      // The winalign diagnosis's honesty affordance: the note names the run
+      // interval it aligned against, so a wrong-context pull (a stale
+      // finished-run instance) is self-identifying at read time.
+      note = absl::StrCat("window rejected: no part overlaps the run's phase intervals [",
+                          input.run_start_unix_ns, ", ", interval_end, ")");
       outcome.windows.clear();
     }
     if (!symbolizer_note.empty()) {
@@ -646,6 +659,47 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     return false;
   }
 
+  // The live rps knob turn (M3, knobs tab + a live run): typed digits are
+  // the new PHASE TOTAL rps; enter sends the update (the pending state and
+  // the ack flow through the controller's knob tracker), esc cancels. The
+  // suspension rule is the M0b pattern: exactly one forced redraw on exit.
+  if (state.mode == InputMode::kEditingKnob) {
+    if (event == Event::Escape) {
+      state.knob_draft.clear();
+      state.mode = InputMode::kNavigate;
+      state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+      force_redraw();
+      return true;
+    }
+    if (event == Event::Return) {
+      uint32_t value = 0;
+      if (!absl::SimpleAtoi(state.knob_draft, &value) || value == 0) {
+        controller.NoteFlameStatus("rps turn: enter a positive integer (the phase total)");
+        return true;
+      }
+      const absl::Status turned = controller.TurnRps(value);
+      state.knob_draft.clear();
+      state.mode = InputMode::kNavigate;
+      state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+      if (!turned.ok()) {
+        controller.NoteFlameStatus(absl::StrCat("rps turn refused: ", turned.message()));
+      }
+      force_redraw();
+      return true;
+    }
+    if (event == Event::Backspace) {
+      if (!state.knob_draft.empty()) {
+        state.knob_draft.pop_back();
+      }
+      return true;
+    }
+    if (event.is_character()) {
+      state.knob_draft += event.character();
+      return true;
+    }
+    return false;
+  }
+
   // Navigate mode key map. Tab indices match the tab strip's order: c ->
   // charts (0), f -> flame (1, M1), k -> knobs (2).
   if (event == Event::Character('c')) {
@@ -702,6 +756,24 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     state.staged_draft.clear();
     state.staged_field = 0;
     state.mode = InputMode::kEditingStagedPhase;
+    state.mode_mirror.store(state.mode, std::memory_order_relaxed);
+    return true;
+  }
+  if (event == Event::Character('u')) {
+    // The live rps turn (M3): knobs tab + a live run. Entering the mode
+    // also dismisses a stale rejection/failed note (the dismissal
+    // affordance the inline reasons advertise).
+    if (state.active_tab != 2) {
+      controller.NoteFlameStatus("the rps turn lives on the knobs tab (k, then u)");
+      return true;
+    }
+    if (!controller.runInProgress()) {
+      controller.NoteFlameStatus("no run to steer: u turns rps while a run is live");
+      return true;
+    }
+    state.knob_draft.clear();
+    controller.DismissKnobOutcome();
+    state.mode = InputMode::kEditingKnob;
     state.mode_mirror.store(state.mode, std::memory_order_relaxed);
     return true;
   }
@@ -814,7 +886,9 @@ RunController::RunController(const std::shared_ptr<grpc::ChannelInterface>& chan
                                                          std::placeholders::_1),
                              .on_completed =
                                  std::bind(&RunController::onCompleted, this, std::placeholders::_1),
-                             .on_update_result = nullptr,
+                             .on_update_result =
+                                 std::bind(&RunController::onUpdateResult, this,
+                                           std::placeholders::_1),
                              .on_finished =
                                  std::bind(&RunController::onFinished, this, std::placeholders::_1)}) {}
 
@@ -917,8 +991,21 @@ absl::Status RunController::StartProfileWindow() {
     return started;
   }
   {
+    // The winalign diagnosis's self-identifying note: the open line echoes
+    // the run context it aligns against (the run's start stamp + current
+    // phase), so a press landing in a stale finished-run TUI instance is
+    // identifiable at press time, not 85 minutes later.
+    int64_t run_start = 0;
+    std::string phase;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      run_start = run_start_unix_ns_;
+      phase = model_.last_snapshot.phase_id();
+    }
     absl::MutexLock lock(&diff_mu_);
-    flame_note_ = absl::StrCat("profile window open (", window_seconds, "s) - p closes it");
+    flame_note_ = absl::StrCat("profile window open (", window_seconds, "s, run t0=", run_start,
+                               phase.empty() ? "" : absl::StrCat(", phase=", phase),
+                               ") - p closes it");
   }
   return absl::OkStatus();
 }
@@ -995,6 +1082,8 @@ absl::Status RunController::StopProfileWindowAndFold() {
                                  ? boundary_events_
                                  : profile_config_.test_boundary_events;
     input->phase_specs = {knob_options_.phases().begin(), knob_options_.phases().end()};
+    // M3: the run's epoch-change marks (the window-split inputs).
+    input->epoch_marks = epoch_marks_;
     // RunFeed clears its running flag BEFORE on_finished fires (run_feed.cc's
     // teardown order), so "feed idle but stamp not yet recorded" means the
     // terminal event is in flight — wait briefly for the REAL stamp.
@@ -1172,8 +1261,20 @@ void RunController::ComputeWindowDiffForLastTwoPureWindows(bool noise_floor) {
   }
   const size_t base = pure[pure.size() - 2];
   const size_t cur = pure[pure.size() - 1];
+  // The pair's claim routing (8.4 + M3): an epoch-boundary pair is the
+  // knob-effect differential (comparable by default — that is the point);
+  // the noise-floor claim is honest only for a same-state pair. Only
+  // worker-count changes stay non-comparable (ComputeDifferential's verdict).
+  const std::string pair_label = DifferentialPairLabel((*snapshots)[base], (*snapshots)[cur]);
+  if (noise_floor && !pair_label.empty()) {
+    absl::MutexLock lock(&diff_mu_);
+    flame_note_ = absl::StrCat(
+        "noise floor refused: the pair spans a knob epoch boundary (", pair_label,
+        ") - use d for the knob-effect differential");
+    return;
+  }
   RunController* self = this;
-  pool_.Submit([self, snapshots, base, cur, noise_floor]() {
+  pool_.Submit([self, snapshots, base, cur, noise_floor, pair_label]() {
     // Pool-side computation; the overlay TYPE-pairs the result with the
     // snapshot that owns its frame pointers (flamegraph.h's lifetime rule).
     absl::StatusOr<DifferentialResult> result =
@@ -1185,13 +1286,15 @@ void RunController::ComputeWindowDiffForLastTwoPureWindows(bool noise_floor) {
       auto paired = DiffOverlay::Pair(snapshots, *std::move(result));
       if (paired.ok()) {
         overlay = *std::move(paired);
-        // Claim discipline (the plan's Global Constraint, minor b): until M3
-        // adds knob epochs every differential IS a same-state pair, so the
-        // d-view's label says so on-screen — the "effect size" reading the
-        // name implies is not claimable at M1.
-        note = absl::StrCat(noise_floor ? "noise floor" : "differential", ": windows #", base + 1,
-                            " vs #", cur + 1,
-                            noise_floor ? "" : " (same-state; no knob epochs until M3)",
+        // Claim discipline (8.4 + M3): a same-state pair keeps the
+        // noise-floor caveat; an epoch-boundary pair claims the knob effect
+        // and carries the boundary label.
+        note = absl::StrCat(noise_floor ? "noise floor" : pair_label.empty()
+                                                        ? "differential (same-state pair)"
+                                                        : "knob-effect differential",
+                            ": windows #", base + 1, " vs #", cur + 1,
+                            pair_label.empty() ? " (same-state; the noise floor applies)"
+                                               : absl::StrCat(" (", pair_label, ")"),
                             overlay->result().comparable
                                 ? ""
                                 : absl::StrCat(" (non-comparable: ",
@@ -1327,6 +1430,18 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
         (!concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0)
             ? parsed
             : 1;
+    // M3 knob state: fresh per run; the starting acked value is the run's
+    // configured rps (the configured PHASE TOTAL).
+    rps_tracker_ = KnobTurnTracker{};
+    knob_epoch_marks_.clear();
+    epoch_marks_.clear();
+    last_seen_epoch_id_.clear();
+    pending_new_rps_ = 0;
+    pending_phase_id_.clear();
+    pending_ramp_bent_ = false;
+    if (request.options().has_requests_per_second()) {
+      rps_tracker_.SeedAckedValue(request.options().requests_per_second().value());
+    }
   }
   store_.store(model_);
 
@@ -1505,6 +1620,17 @@ void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) 
       anchor_.wall_time_unix_ns = snapshot.wall_time_unix_ns();
       anchor_.monotonic_ns = snapshot.monotonic_ns();
     }
+    // M3 epoch-change marks (spec 8.5): the explicit LiveSnapshot
+    // epoch_changed marker (field 7) is the split discipline — one mark per
+    // marker-bearing snapshot (an applied advance OR a rollback demotion),
+    // deduped by epoch id for belt-and-braces. These are the WINDOW-SPLIT
+    // inputs; the timeline marks come only from the acks (onUpdateResult).
+    if (snapshot.epoch_changed() && !snapshot.epoch_id().empty() &&
+        snapshot.epoch_id() != last_seen_epoch_id_) {
+      last_seen_epoch_id_ = snapshot.epoch_id();
+      epoch_marks_.push_back(EpochMark{snapshot.epoch_id(), snapshot.wall_time_unix_ns(),
+                                       snapshot.monotonic_ns()});
+    }
     model_ = ApplySnapshot(std::move(model_), snapshot);
     store_.store(model_);
     if (writer_ != nullptr) {
@@ -1574,6 +1700,90 @@ void RunController::onFinished(const absl::Status& /*status*/) {
   cv_.notify_all();
 }
 
+// --- M3 live knob steering (Task 8) -----------------------------------------
+
+absl::Status RunController::TurnRps(uint32_t new_rps) {
+  nighthawk::client::UpdateRequest request;
+  nighthawk::client::KnobDelta* delta = request.add_deltas();
+  delta->mutable_requests_per_second()->set_value(new_rps);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!feed_.running()) {
+      return absl::FailedPreconditionError("no run in flight: u turns rps while a run is live");
+    }
+    if (rps_tracker_.has_pending()) {
+      // The one-outstanding discipline (run_feed.h): wait for the ack.
+      return absl::FailedPreconditionError(
+          "a knob turn is already pending: wait for its ack or rejection");
+    }
+    // Send-time context for the session record: the attempted phase-total
+    // rps, the phase it was sent from, and whether the rps delta is a ramp
+    // bend (C1 — the ENGINE's exact plugin rule, not any named plugin).
+    pending_new_rps_ = new_rps;
+    pending_phase_id_ = model_.last_snapshot.phase_id();
+    pending_ramp_bent_ = RpsTurnBendsRamp(knob_options_);
+    rps_tracker_.BeginRpsTurn(new_rps);
+  }
+  const absl::Status sent = feed_.SendUpdate(request);
+  if (!sent.ok()) {
+    // The write never reached the service (no run / dead stream): resolve
+    // the pending state honestly as failed-pending — never a stuck pending.
+    nighthawk::client::UpdateResult failed;
+    failed.set_applied(false);
+    failed.set_rejection_reason(absl::StrCat("run-feed: update write failed: ", sent.message()));
+    onUpdateResult(failed);
+    return sent;
+  }
+  return absl::OkStatus();
+}
+
+void RunController::onUpdateResult(const nighthawk::client::UpdateResult& result) {
+  std::function<void()> notification;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // The feed-generated pending surfacing (run_feed.h's "run-feed: "
+    // prefix) is NOT an engine verdict: it resolves the pending state as
+    // failed-pending and writes no session record and no timeline mark.
+    const bool feed_generated = absl::StartsWith(result.rejection_reason(), "run-feed: ");
+    rps_tracker_.OnUpdateResult(result);
+    if (!feed_generated) {
+      nighthawk::client::KnobEpochRecord knob_record =
+          ToKnobEpochRecord(result, pending_phase_id_, pending_new_rps_, pending_ramp_bent_);
+      if (writer_ != nullptr) {
+        nighthawk::client::SessionRecord record;
+        *record.mutable_knob_epoch() = knob_record;
+        writer_->enqueue(std::move(record));
+      }
+      // Timeline truth (spec §4 B): the epoch mark lands ONLY on an applied
+      // ack — a user edit, a rejection, and a timeout all mark nothing.
+      if (result.applied() && !result.epoch_id().empty()) {
+        knob_epoch_marks_.push_back(std::move(knob_record));
+      }
+    }
+    pending_new_rps_ = 0;
+    pending_phase_id_.clear();
+    notification = snapshot_notification_;
+  }
+  if (notification != nullptr) {
+    notification();
+  }
+}
+
+void RunController::DismissKnobOutcome() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  rps_tracker_.DismissOutcome();
+}
+
+LiveKnobTurn RunController::rpsTurnState() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return rps_tracker_.rps();
+}
+
+std::vector<nighthawk::client::KnobEpochRecord> RunController::knobEpochMarks() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return knob_epoch_marks_;
+}
+
 namespace {
 
 // The interactive shell: RenderLayout composition, the navigate-mode key map
@@ -1593,8 +1803,9 @@ int runInteractive(const std::string& address, const std::string& session_prefix
   Component uri_input = Input(&state.uri_field, "target uri");
   Component rps_input = Input(&state.rps_field, "requests per second");
   Component duration_input = Input(&state.duration_field, "duration in seconds");
-  Component phases_input =
-      Input(&state.phases_field, "phases: name:rps:secs[:workers[:conns]], ...");
+  Component phases_input = Input(
+      &state.phases_field,
+      "phases: name:rps:secs[:workers[:conns]] (rps = phase total, split across workers)");
 
   // Fullscreen (the alternate-screen buffer) keeps the live TUI from messing
   // up the terminal's scrollback.
@@ -1654,9 +1865,12 @@ int runInteractive(const std::string& address, const std::string& session_prefix
     const std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events =
         controller.boundaryEvents();
     const std::string current_phase_id = view_model.last_snapshot.phase_id();
-    const std::vector<PhaseTimelineSegment> timeline =
+    // The timeline's epoch marks (M3): applied acks ONLY — the marks join
+    // M2's phase timeline via WithEpochMarks.
+    const std::vector<PhaseTimelineSegment> timeline = WithEpochMarks(
         BuildPhaseTimeline(knob_options, boundary_events, controller.finalPhaseMetadata(),
-                           current_phase_id);
+                           current_phase_id),
+        controller.knobEpochMarks());
     // The charts' band reset markers ride the same events (the boundaries'
     // monotonic stamps).
     std::vector<uint64_t> boundary_stamps;
@@ -1682,12 +1896,16 @@ int runInteractive(const std::string& address, const std::string& session_prefix
             static_cast<uint32_t>(parsed), ActivePhaseIndex(knob_options, current_phase_id) + 1);
       }
     }
+    // The live rps turn state (M3): rendered on the knobs tab while a run
+    // is in flight (held in a local so the pointer outlives the render).
+    const LiveKnobTurn rps_turn_render = controller.rpsTurnState();
     return RenderLayout(screen.dimx(), screen.dimy(), state.active_tab, state.mode, view_model,
                         state.dialog, controller.sessionPath(), knob_options, &overlay, &flame,
                         controller.profileWindowState(), &timeline,
                         staged_preview.empty() ? nullptr : &staged_preview,
                         staged_preview.empty() ? nullptr : &staged_annotation,
-                        &boundary_stamps);
+                        &boundary_stamps,
+                        controller.runInProgress() ? &rps_turn_render : nullptr);
   });
 
   Component app = CatchEvent(view, [&](Event event) {

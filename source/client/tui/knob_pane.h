@@ -7,17 +7,20 @@
 #include "ftxui/dom/elements.hpp"
 
 #include "api/client/options.pb.h"
+#include "api/client/service.pb.h"
 
 namespace Nighthawk {
 namespace Client {
 namespace Tui {
 
-// FORK-ONLY (We-Amp): the display-only knob pane (M0b). It renders the knob
-// vocabulary with its spec §3 steering split — the live steering set is
-// rps + ramp (M3); everything else is phase-gated — without implementing any
-// steering. A visible banner states that steering lands in M3, so the pane can
-// never masquerade as a control surface. Staged-edit/preview/ack states arrive
-// with M2/M3.
+// FORK-ONLY (We-Amp): the knob pane. M0b rendered it display-only; M3's
+// Task 8 turns the live set real: the rps knob carries the §4 knob state
+// machine (current-acked / pending-apply / rejected-with-inline-reason /
+// staged-next-phase, visually distinct), and the display-only banner is
+// gone. The steering split stays visible: the live set is rps + ramp
+// (spec §3); everything else is phase-gated. RPS VALUES ARE THE PHASE
+// TOTAL (the knob speaks global rps; the engine divides across the active
+// workers at fan-out) — every rps surface says so.
 
 // Whether a knob joins M3's live steering set or is gated behind the phase
 // engine (spec §3 ruling). kStaged marks the M2 staged next-phase preview:
@@ -44,10 +47,91 @@ struct KnobDisplay {
 // say "unset", an unconfigured ramp says "not configured".
 std::vector<KnobDisplay> KnobsFromOptions(const nighthawk::client::CommandLineOptions& options);
 
-// The knobs tab (tab 1): a display-only banner row followed by one line per
-// knob. `width`/`height` are the pane-local dimensions (terminal size minus
-// the status bar); a non-positive dimension renders an empty pane.
+// The knobs tab (tab 2): one line per knob under a header that states the
+// live set and the phase-total semantics of every rps value (the M3 pane is
+// no longer display-only). `width`/`height` are the pane-local dimensions
+// (terminal size minus the status bar); a non-positive dimension renders an
+// empty pane.
 ftxui::Element RenderKnobPane(const std::vector<KnobDisplay>& knobs, int width, int height);
+
+// ---------------------------------------------------------------------------
+// M3 Task 8: the live knob-turn state machine (spec §4 B). A live-set turn
+// goes pending-apply (the timeline is UNCHANGED until the engine acks) ->
+// current-acked (the timeline gains the epoch mark) or
+// rejected-with-inline-reason (the service's reason, inline, dismissable);
+// a pending turn that resolves without an engine verdict (the feed's
+// run-end surfacing) renders as failed-pending with the reason — never
+// silently cleared. All four states are visually distinct BY MARKER WORD,
+// never by color alone (the five-lens accessibility rule).
+// ---------------------------------------------------------------------------
+
+// The knob-turn states. kStaged is M2's staged-next-phase preview, kept
+// distinct from every live state.
+enum class KnobTurnState {
+  kCurrentAcked,  // the engine-acked value; the timeline-stable state
+  kPendingApply,  // a turn is in flight; the timeline marks nothing yet
+  kRejected,      // the service rejected the last turn; reason inline
+  kFailedPending, // the pending turn resolved without an engine verdict
+  kStaged,        // the M2 staged-next-phase preview
+};
+
+// One live-set knob line's turn state.
+struct LiveKnobTurn {
+  std::string name;           // "rps"
+  std::string acked_value;    // the last engine-acked value; "" before the first ack
+  std::string pending_value;  // the value awaiting its ack ("" when none)
+  KnobTurnState state = KnobTurnState::kCurrentAcked;
+  std::string note; // the rejection / failed-pending reason (kRejected/kFailedPending)
+};
+
+// The one-line marker word per turn state — the visual-distinctness anchor
+// ("acked" / "pending" / "rejected" / "failed" / "STAGED"). Exposed for the
+// distinctness test.
+absl::string_view KnobTurnStateMarker(KnobTurnState state);
+
+// The rps knob's turn state machine (pure, no I/O): BeginRpsTurn moves to
+// pending-apply; OnUpdateResult resolves it with the feed's ack (applied ->
+// current-acked with the new value; an engine rejection -> rejected with the
+// reason; a feed-generated result — rejection_reason prefixed "run-feed: ",
+// never an engine verdict — -> failed-pending with the reason). Dismiss
+// clears a stale rejection/failed note (the u-key affordance). One turn at
+// a time: BeginRpsTurn while pending is a no-op (the caller's
+// one-outstanding discipline; the controller refuses earlier still).
+class KnobTurnTracker {
+public:
+  // The run's configured rps (the starting acked value — the configured
+  // PHASE TOTAL); seeded by the controller at run start. No-op while a turn
+  // is pending.
+  void SeedAckedValue(uint32_t rps);
+  // Begins a turn of the rps knob to `new_rps` (the PHASE TOTAL). A stale
+  // rejection/failed note is dismissed by the turn.
+  void BeginRpsTurn(uint32_t new_rps);
+  // Resolves the pending turn (no-op when nothing is pending; a rejected
+  // attempt still resolves the turn).
+  void OnUpdateResult(const nighthawk::client::UpdateResult& result);
+  // The dismissal affordance for a stale rejection/failed-pending note.
+  void DismissOutcome();
+  bool has_pending() const { return turn_.state == KnobTurnState::kPendingApply; }
+  const LiveKnobTurn& rps() const { return turn_; }
+
+private:
+  LiveKnobTurn turn_{"rps", /*acked_value=*/"", /*pending_value=*/"",
+                     KnobTurnState::kCurrentAcked, /*note=*/""};
+};
+
+// The live knob-turn lines for the knobs tab: the rps turn rendered with its
+// state marker (acked/pending/rejected/failed) and, outside the acked state,
+// the inline reason or the pending transition; rps values carry the phase-
+// total disclosure. Pure.
+ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height);
+
+// Whether an rps turn on this run is a ramp bend (C1): the engine treats a
+// live rps delta as ramp re-parameterization ONLY on a run configured with
+// the linear-ramping rate limiter plugin — the exact name the engine's
+// whitelist validator and fan-out admit on ("nighthawk.linear-ramping-
+// rate-limiter-plugin"). Any other named limiter plugin does NOT bend
+// (the session record must not claim a bend that never happened). Pure.
+bool RpsTurnBendsRamp(const nighthawk::client::CommandLineOptions& options);
 
 // ---------------------------------------------------------------------------
 // M2: the staged next-phase preview (spec §4 knob state machine). While a

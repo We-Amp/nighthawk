@@ -44,7 +44,11 @@ message MetricSeriesRecord {
   int64 monotonic_ns = 2;
   // Constant "main" pre-A1 (M0a measurement semantics).
   string phase_id = 3;
-  // Constant execution-id-or-empty pre-A2.
+  // A2 (spec 8.5): the knob epoch whose schedule produced this snapshot's
+  // samples — the current knob epoch at snapshot production, first-applied
+  // wins; empty before the run's first applied live change. A change
+  // between consecutive records' epoch ids marks the epoch boundary the
+  // flush windows split at. FORK-ONLY semantics.
   string epoch_id = 4;
   map<string, uint64> counters = 5;
   repeated nighthawk.client.StatisticSnapshot statistics = 6;
@@ -118,6 +122,10 @@ message ProfileWindowRecord {
   // mac<->SUT clock-offset uncertainty in ns (0 on the local venue / when no
   // clock surface answered). Metadata only (spec §8.5).
   int64 clock_offset_uncertainty_ns = 12;
+  // FORK-ONLY (We-Amp): A2 (spec 8.5) — the knob epoch whose schedule
+  // produced this window's samples; empty before the run's first applied
+  // live change. Epoch-pure windows (M3) never straddle an epoch change.
+  string epoch_id = 13;
 }
 
 // One phase boundary of a multi-phase run, persisted when the boundary's
@@ -177,6 +185,40 @@ message PhaseBoundaryRecord {
   bool drain_censored = 14;
 }
 
+// One live knob change of a run (M3, spec 8.5). FORK-ONLY.
+//
+// Every APPLIED live change appends one record when the engine's apply ack
+// arrives: the new knob epoch, the phase the bend landed in, the engine
+// (wall, monotonic) pair at the bend instant (the same join-key discipline
+// as PhaseBoundaryRecord fields 4/5), and the applied values. A REJECTED
+// attempt ALSO appends one — the service's reason lands in rejection_note
+// with the epoch fields left empty — so the session's steering story is
+// counted, not hidden. The feed-generated pending-timeout surfacing ("run-feed: "
+// prefixed, client-side) is NOT recorded here: it is not an engine verdict.
+//
+// The format-evolution rule at the top of this file applies unchanged:
+// new reads old, old does NOT read new (an M2-era reader hits the
+// documented RECORD_NOT_SET version-skew rejection on a file carrying this
+// record).
+message KnobEpochRecord {
+  // The applied knob epoch ("epoch-<n>"); empty for a rejection.
+  string epoch_id = 1;
+  // The phase the bend landed in; empty for a rejection (nothing landed).
+  string phase_id = 2;
+  // Engine clock pair at the bend instant (spec 8.5).
+  int64 wall_time_unix_ns = 3;
+  int64 monotonic_ns = 4;
+  // The applied/attempted rps as the PHASE TOTAL (the knob speaks global
+  // rps; the engine divides across the active workers at fan-out).
+  uint32 new_rps = 5;
+  // True when the rps delta bent the ramp plugin's target (the plugin-path
+  // rps knob IS ramp re-parameterization, C1).
+  bool ramp_bent = 6;
+  // Present only for REJECTED attempts: the service's reason naming the
+  // offending field.
+  string rejection_note = 7;
+}
+
 // One frame of a session file.
 message SessionRecord {
   oneof record {
@@ -195,5 +237,10 @@ message SessionRecord {
     // boundary's metadata aggregate. The M1-era reader rejection asymmetry
     // applies unchanged — new reads old, old does NOT read new.
     PhaseBoundaryRecord phase_boundary = 5;
+    // M3's added case (see the format-evolution rule at the top of this
+    // file): one per applied live knob change (engine ack), plus one per
+    // rejected attempt with its reason. The M1/M2-era reader rejection
+    // asymmetry applies unchanged — new reads old, old does NOT read new.
+    KnobEpochRecord knob_epoch = 6;
   }
 }

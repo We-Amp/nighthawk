@@ -134,6 +134,14 @@ message PhaseMetadata {
   double completion_ratio = 12;
   // Pool health for every worker active in this phase.
   repeated WorkerPoolHealth pool_health = 13;
+  // FORK-ONLY (We-Amp): rebase check (fork-only fields >= 911). 8.6
+  // counted-not-hidden: this phase's ENDING boundary drain was censored
+  // (the bounded wait gave up at the deadline; drain_duration carries the
+  // full budget and idle_gap is measured from the censoring deadline — an
+  // honest lower bound). Mirrors PhaseBoundaryRecord.drain_censored; the
+  // streamed boundary event carries the same mark live, this field keeps it
+  // alive after the run (the post-run metadata rebuild's censoring source).
+  bool drain_censored = 911;
 }
 
 // The full set of output returned by a Nighthawk run, including the Results from every worker.

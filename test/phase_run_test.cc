@@ -1481,6 +1481,10 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
   EXPECT_EQ(censored.idle_gap_ns,
             censored_metadata.idle_gap().seconds() * 1000000000 +
                 censored_metadata.idle_gap().nanos());
+  // The censoring mark rides into the metadata (fork-only field): the
+  // streamed boundary event carries it live, this stamp keeps it alive in
+  // the post-run metadata (the TUI's post-run strip rebuild reads it).
+  EXPECT_TRUE(censored_metadata.drain_censored());
 
   // Uncensored boundary: in-flight reached zero, nothing extra is counted.
   PhaseBoundaryTiming clean;
@@ -1496,6 +1500,7 @@ TEST(BuildPhaseMetadataTest, DrainCensoringCountedNotHidden) {
   EXPECT_EQ(1u, clean_metadata.reset_or_timed_out());
   EXPECT_EQ(2u, clean_metadata.gate_exceeded());
   EXPECT_DOUBLE_EQ(1.0, clean_metadata.completion_ratio());
+  EXPECT_FALSE(clean_metadata.drain_censored());
 
   // The run's final phase has no boundary timing at all.
   const nighthawk::client::PhaseMetadata final_metadata =

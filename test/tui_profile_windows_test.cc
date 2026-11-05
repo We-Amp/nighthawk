@@ -598,6 +598,117 @@ TEST(ProducerReplacementTest, CensoredBoundaryExcludesTheAdjacentPart) {
   EXPECT_NE(split.reasons[0].find("drain not complete"), std::string::npos) << split.reasons[0];
 }
 
+// ---------------------------------------------------------------------------
+// M3 Task 8: epoch-pure windows (spec 8.5). A window straddling an epoch
+// change splits AT it, each part stamped with the epoch in effect; an
+// epoch-boundary differential pair is COMPARABLE and labeled
+// `knob effect: <epoch_a> -> <epoch_b>`; only worker-count changes stay
+// non-comparable (M2's rule, unchanged).
+// ---------------------------------------------------------------------------
+
+TEST(EpochWindowTest, StraddlingWindowSplitsAtEpoch) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 100)});
+  PhaseInterval phase;
+  phase.phase_id = "warm";
+  phase.start_unix_ns = 1'000'000'000;
+  phase.end_unix_ns = 8'000'000'000;
+  phase.drain_complete = true;
+  phase.worker_count = 2;
+
+  // One applied change at t=5s inside the window [4s, 8s).
+  std::vector<EpochMark> marks;
+  marks.push_back({"epoch-1", /*wall=*/5'000'000'000, /*monotonic=*/100});
+
+  SplitAlignment split = WindowPhaseAlignment::AlignSplit(
+      tree, {phase}, /*start=*/4'000'000'000, /*end=*/8'000'000'000, "cpu", 0, {},
+      /*anchor_offset=*/0, marks);
+  // Two epoch-pure parts, split exactly at the epoch change.
+  ASSERT_EQ(split.pure.size(), 2u);
+  EXPECT_EQ(split.pure[0].start_unix_ns, 4'000'000'000);
+  EXPECT_EQ(split.pure[0].end_unix_ns, 5'000'000'000);
+  EXPECT_EQ(split.pure[0].epoch_id, "") << "before the first applied change";
+  EXPECT_EQ(split.pure[1].start_unix_ns, 5'000'000'000);
+  EXPECT_EQ(split.pure[1].end_unix_ns, 8'000'000'000);
+  EXPECT_EQ(split.pure[1].epoch_id, "epoch-1");
+  for (const ProfileWindow& part : split.pure) {
+    EXPECT_DOUBLE_EQ(part.purity_fraction, 1.0);
+    EXPECT_EQ(part.phase_id, "warm") << "the epoch cut does not change the phase";
+    EXPECT_EQ(part.worker_count, 2u);
+  }
+  EXPECT_TRUE(split.reasons.empty());
+
+  // A mark OUTSIDE the window cuts nothing: one part, epoch from the mark
+  // before the window.
+  std::vector<EpochMark> outside;
+  outside.push_back({"epoch-1", /*wall=*/1'500'000'000, /*monotonic=*/10});
+  SplitAlignment unsplit = WindowPhaseAlignment::AlignSplit(
+      tree, {phase}, 4'000'000'000, 5'000'000'000, "cpu", 0, {}, 0, outside);
+  ASSERT_EQ(unsplit.pure.size(), 1u);
+  EXPECT_EQ(unsplit.pure[0].epoch_id, "epoch-1") << "the epoch in effect from the window start";
+
+  // A sub-part below the meaningful minimum is excluded-and-marked, naming
+  // its epoch span (the part under the applied change names it; the part
+  // before the first change renders no epoch).
+  std::vector<EpochMark> near;
+  near.push_back({"epoch-1", /*wall=*/4'500'000'000, /*monotonic=*/50});
+  SplitAlignment thin = WindowPhaseAlignment::AlignSplit(
+      tree, {phase}, 4'000'000'000, 5'000'000'000, "cpu", 0, {}, 0, near);
+  ASSERT_EQ(thin.pure.size(), 0u);
+  ASSERT_EQ(thin.excluded.size(), 2u); // both sub-parts are below the minimum
+  ASSERT_EQ(thin.reasons.size(), 2u);
+  EXPECT_EQ(thin.excluded[0].epoch_id, "") << "before the first applied change";
+  EXPECT_EQ(thin.excluded[1].epoch_id, "epoch-1");
+  EXPECT_NE(thin.reasons[1].find("epoch 'epoch-1'"), std::string::npos) << thin.reasons[1];
+  EXPECT_NE(thin.reasons[1].find("meaningful-minimum"), std::string::npos) << thin.reasons[1];
+}
+
+TEST(EpochWindowTest, EpochBoundaryPairIsComparableAndLabeled) {
+  FoldedTree tree = MakeTree({MakeFrame("work", 100)});
+  ProfileWindow before = WindowWith(tree, /*work_units=*/100, /*worker_count=*/4);
+  before.epoch_id = "epoch-1";
+  ProfileWindow after = WindowWith(tree, /*work_units=*/100, /*worker_count=*/4);
+  after.epoch_id = "epoch-2";
+
+  // The epoch-boundary pair is COMPARABLE by default (that is the point):
+  // only worker-count changes stay non-comparable.
+  auto diff = ComputeDifferential(before, after);
+  ASSERT_TRUE(diff.ok()) << diff.status();
+  EXPECT_TRUE(diff->comparable);
+
+  // The label names the knob effect.
+  EXPECT_EQ(DifferentialPairLabel(before, after), "knob effect: epoch-1 -> epoch-2");
+  EXPECT_EQ(DifferentialPairLabel(after, before), "knob effect: epoch-2 -> epoch-1");
+  // An empty epoch id (before the first applied change) renders as (none).
+  ProfileWindow first = WindowWith(tree, 100, 4);
+  first.epoch_id = "";
+  EXPECT_EQ(DifferentialPairLabel(first, before), "knob effect: (none) -> epoch-1");
+
+  // Same-state pairs route to the noise floor: no knob-effect label.
+  EXPECT_TRUE(SameStatePair(before, before));
+  EXPECT_TRUE(SameStatePair(first, first));
+  EXPECT_FALSE(SameStatePair(before, after));
+  EXPECT_EQ(DifferentialPairLabel(before, before), "");
+
+  // A worker-count change across an epoch boundary stays non-comparable
+  // (M2's rule wins).
+  ProfileWindow scaled = WindowWith(tree, 100, /*worker_count=*/8);
+  scaled.epoch_id = "epoch-2";
+  auto scaled_diff = ComputeDifferential(before, scaled);
+  ASSERT_TRUE(scaled_diff.ok());
+  EXPECT_FALSE(scaled_diff->comparable);
+  EXPECT_NE(scaled_diff->incomparable_reason.find("worker count"), std::string::npos);
+
+  // The noise-floor claim is honest only for a same-state pair: the caller
+  // routes an epoch-boundary pair to the knob-effect differential (the
+  // pure predicates the routing reads).
+  ProfileWindow other_epoch = WindowWith(tree, 100, 4);
+  other_epoch.epoch_id = "epoch-2";
+  EXPECT_FALSE(SameStatePair(before, other_epoch));
+  ProfileWindow same_epoch = WindowWith(tree, 100, 4);
+  same_epoch.epoch_id = "epoch-1";
+  EXPECT_TRUE(SameStatePair(before, same_epoch));
+}
+
 }  // namespace
 }  // namespace Tui
 }  // namespace Client

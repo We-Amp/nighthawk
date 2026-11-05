@@ -84,6 +84,25 @@ ToPhaseBoundaryRecord(const nighthawk::client::PhaseBoundaryEvent& event) {
   return record;
 }
 
+nighthawk::client::KnobEpochRecord
+ToKnobEpochRecord(const nighthawk::client::UpdateResult& result, absl::string_view phase_id,
+                  uint32_t new_rps, bool ramp_bent) {
+  nighthawk::client::KnobEpochRecord record;
+  record.set_new_rps(new_rps);
+  record.set_ramp_bent(ramp_bent);
+  if (result.applied()) {
+    record.set_epoch_id(result.epoch_id());
+    record.set_phase_id(phase_id.data(), phase_id.size());
+    record.set_wall_time_unix_ns(result.wall_time_unix_ns());
+    record.set_monotonic_ns(result.monotonic_ns());
+  } else {
+    // A rejected attempt: nothing landed — the epoch fields stay empty and
+    // the service's reason is the record (honesty: counted, not hidden).
+    record.set_rejection_note(result.rejection_reason());
+  }
+  return record;
+}
+
 } // namespace Tui
 } // namespace Client
 } // namespace Nighthawk

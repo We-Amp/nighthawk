@@ -66,9 +66,9 @@ CommandLineOptions fullySetOptions() {
 }
 
 // The five-knob vocabulary and its steering split: rps + ramp render
-// LIVE (M3); concurrency, connections and the queue bounds render
-// PHASE-GATED. The pane also carries the display-only banner so no hidden
-// timing semantics can masquerade as implemented steering (spec §3).
+// LIVE; concurrency, connections and the queue bounds render PHASE-GATED.
+// M3: the pane is live (the display-only banner is gone) and its header
+// states the phase-total semantics of every rps value.
 TEST(KnobPaneTest, KnobPaneMarksLiveVsPhaseGated) {
   std::vector<KnobDisplay> knobs = KnobsFromOptions(fullySetOptions());
   ASSERT_EQ(knobs.size(), 5u);
@@ -92,18 +92,21 @@ TEST(KnobPaneTest, KnobPaneMarksLiveVsPhaseGated) {
   ftxui::Element pane = RenderKnobPane(knobs, /*width=*/100, /*height=*/20);
   std::vector<std::string> lines = screenLines(pane, 100, 20);
 
-  EXPECT_NE(lineContaining(lines, "rps").find("LIVE (M3)"), std::string::npos);
-  EXPECT_NE(lineContaining(lines, "ramp").find("LIVE (M3)"), std::string::npos);
+  EXPECT_NE(lineContaining(lines, "100").find("LIVE"), std::string::npos);
+  EXPECT_NE(lineContaining(lines, "not configured").find("LIVE"), std::string::npos);
   EXPECT_NE(lineContaining(lines, "concurrency").find("PHASE-GATED"), std::string::npos);
   EXPECT_NE(lineContaining(lines, "connections").find("PHASE-GATED"), std::string::npos);
   EXPECT_NE(lineContaining(lines, "queue bounds").find("PHASE-GATED"), std::string::npos);
 
-  // Display-only banner: the pane states that steering lands in M3.
+  // The M3 header: live steering (the u key) and the phase-total semantics;
+  // the display-only banner is gone.
   std::string text;
   for (const std::string& line : lines) {
     text += line + "\n";
   }
-  EXPECT_NE(text.find("steering lands in M3"), std::string::npos);
+  EXPECT_NE(text.find("phase total"), std::string::npos);
+  EXPECT_NE(text.find("press u"), std::string::npos);
+  EXPECT_EQ(text.find("display-only"), std::string::npos);
 
   // The set queue bounds carry their two values.
   std::string queue_line = lineContaining(lines, "queue bounds");

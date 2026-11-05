@@ -288,8 +288,10 @@ TEST(LayoutTest, FlameTabRendersEmptyStateThenThePane) {
   EXPECT_NE(pane_text.find("envoy.worker.main"), std::string::npos) << pane_text;
 }
 
-// Pre-A1 placeholder semantics: phase and epoch ids carry placeholder markers
+// Pre-A1 placeholder semantics: the phase id carries its placeholder marker
 // in the status bar; an empty epoch id renders "(none)", not an empty field.
+// M3: the epoch cell dropped its placeholder suffix — the ack path makes the
+// epoch id real (a non-empty epoch renders bare).
 TEST(StatusBarTest, ShowsPhaseEpochPlaceholders) {
   RunViewModel model = runningModel();
 
@@ -301,7 +303,7 @@ TEST(StatusBarTest, ShowsPhaseEpochPlaceholders) {
   EXPECT_NE(with_epoch.find("phase: main"), std::string::npos);
   EXPECT_NE(with_epoch.find("pre-phase-engine placeholder"), std::string::npos);
   EXPECT_NE(with_epoch.find("epoch: bench-1"), std::string::npos);
-  EXPECT_NE(with_epoch.find("[placeholder]"), std::string::npos);
+  EXPECT_EQ(with_epoch.find("[placeholder]"), std::string::npos);
 
   model.last_snapshot.set_epoch_id("");
   std::string empty_epoch;
@@ -323,8 +325,10 @@ TEST(LayoutTest, KnobsTabRendersTheKnobPane) {
   for (const std::string& line : screenLines(element, 100, 30)) {
     text += line + "\n";
   }
-  EXPECT_NE(text.find("steering lands in M3"), std::string::npos);
-  EXPECT_NE(text.find("LIVE (M3)"), std::string::npos);
+  // M3: the pane is live — the phase-total semantics render, the
+  // display-only banner is gone.
+  EXPECT_NE(text.find("phase total"), std::string::npos);
+  EXPECT_NE(text.find("LIVE"), std::string::npos);
   EXPECT_NE(text.find("PHASE-GATED"), std::string::npos);
   EXPECT_NE(text.find("100"), std::string::npos);
   EXPECT_EQ(text.find("knobs (M0b Task 6)"), std::string::npos);

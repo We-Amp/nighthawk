@@ -20,6 +20,7 @@
 #include "source/client/tui/admin_client.h"
 #include "source/client/tui/flamegraph.h"
 #include "source/client/tui/input_mode.h"
+#include "source/client/tui/knob_pane.h"
 #include "source/client/tui/layout.h"
 #include "source/client/tui/pprof_worker_pool.h"
 #include "source/client/tui/profile_fetcher.h"
@@ -115,6 +116,11 @@ struct ProfileJobInput {
   // events keep the M1 legacy single-interval path.
   std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events;
   std::vector<nighthawk::client::PhaseSpec> phase_specs;
+  // M3 Task 8: the run's applied knob-epoch change marks (epoch id + the
+  // engine (wall, monotonic) pair at each bend), captured from the live
+  // snapshots' epoch-change markers. A window straddling one of these
+  // splits AT it (spec 8.5), even in a legacy single-phase run.
+  std::vector<EpochMark> epoch_marks;
 };
 
 // FORK-ONLY (We-Amp): the headless run/session lifecycle carrier behind the
@@ -290,6 +296,37 @@ public:
   // their reason). Display only; never mutates pipeline state.
   void NoteFlameStatus(std::string note);
 
+  // --- M3 live knob steering (Task 8, spec §4 B) ---------------------------
+  //
+  // Turns the rps knob to `new_rps` (the PHASE TOTAL per the global-rps
+  // ruling: the engine divides across the active workers at fan-out) on the
+  // in-flight run: one KnobDelta goes out via the feed's update channel, the
+  // knob state moves to pending-apply (the timeline marks NOTHING yet), and
+  // the engine's verdict arrives via onUpdateResult. kFailedPrecondition
+  // when no run is in flight or a turn is already pending (the
+  // one-outstanding discipline); the feed's own send errors are returned
+  // as-is (the pending state then resolves as failed-pending).
+  absl::Status TurnRps(uint32_t new_rps);
+
+  // The feed's apply-ack intake — PUBLIC so the wiring tests can fire
+  // synthetic results; the feed's read thread is the production caller
+  // (RunFeedCallbacks::on_update_result). Resolves the pending turn through
+  // the KnobTurnTracker, appends the session's KnobEpochRecord (applied AND
+  // rejected engine results — honesty; the feed-generated "run-feed: "
+  // pending surfacing is NOT recorded), and adds a timeline epoch mark ONLY
+  // on an applied ack.
+  void onUpdateResult(const nighthawk::client::UpdateResult& result);
+
+  // The u-key dismissal of a stale rejection/failed-pending knob note.
+  void DismissKnobOutcome();
+
+  // The rps knob's current turn state (render input for the knobs tab).
+  LiveKnobTurn rpsTurnState() const;
+
+  // The applied knob epochs, in ack order (the timeline's epoch marks;
+  // rejects/timeout surfaces never appear here).
+  std::vector<nighthawk::client::KnobEpochRecord> knobEpochMarks() const;
+
 private:
   // The feed callbacks; all fire on the feed's read thread.
   void onSnapshot(const nighthawk::client::LiveSnapshot& snapshot);
@@ -319,6 +356,22 @@ private:
   // M2 Task 7 wiring: the run's boundary events, in boundary order (the
   // feed's read thread appends; the render side copies under the mutex).
   std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events_;
+
+  // --- M3 live knob steering (Task 8), guarded by mutex_ -------------------
+  // The rps turn state machine (pending/acked/rejected/failed rendering).
+  KnobTurnTracker rps_tracker_;
+  // The applied knob epochs, in ack order (timeline marks; engine acks ONLY).
+  std::vector<nighthawk::client::KnobEpochRecord> knob_epoch_marks_;
+  // The run's epoch-change marks from the live snapshots (the window-split
+  // inputs; NOT the timeline marks — those are the acks above).
+  std::vector<EpochMark> epoch_marks_;
+  std::string last_seen_epoch_id_;
+  // Send-time context for the session record: the attempted phase-total
+  // rps, the phase it was sent from, and whether the run's ramp plugin
+  // makes the rps delta a ramp bend (C1).
+  uint32_t pending_new_rps_ = 0;
+  std::string pending_phase_id_;
+  bool pending_ramp_bent_ = false;
 
   // --- M1 state (guarded by mutex_ unless noted) ---------------------------
   // Configure-once pipeline configuration; read by pool jobs by value.
@@ -435,6 +488,9 @@ struct ShellState {
   // 1 = connections, 2 = max pending requests, 3 = max active requests).
   std::string staged_draft;
   int staged_field = 0;
+  // --- M3 live rps turn (kEditingKnob): the typed digits (the new PHASE
+  // TOTAL rps; enter sends the update, esc cancels).
+  std::string knob_draft;
 };
 
 // The shell's key map — the exact handler the interactive CatchEvent

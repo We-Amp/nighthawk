@@ -59,6 +59,17 @@ struct PhaseInterval {
   uint64_t worker_count = 0;
 };
 
+// One applied knob-epoch change (M3, spec 8.5): the epoch whose schedule
+// took over, and the ENGINE (wall, monotonic) pair at the bend instant —
+// the same join-key discipline as the phase boundaries. Marks are consumed
+// in ascending wall order; the epoch in effect at instant t is the last
+// mark with wall <= t (empty before the first mark).
+struct EpochMark {
+  std::string epoch_id;
+  int64_t wall_time_unix_ns = 0;
+  int64_t monotonic_ns = 0;
+};
+
 // Pre-A1 producer (plan major-fix): the whole run is one phase — the interval
 // spans run start->stop, the drain is trivially complete, and the worker
 // count comes from the start request's concurrency. M2 REPLACES this producer
@@ -116,6 +127,12 @@ struct ProfileWindow {
   // from differentials by ComputeDifferential (never rendered as comparable).
   double purity_fraction = 0.0;
   std::string phase_id;      // constant "main" pre-A1
+  // The knob epoch whose schedule produced the samples (M3, spec 8.5):
+  // empty before the run's first applied live change. Epoch-pure windows
+  // never straddle an epoch change (the split produces per-epoch parts);
+  // an epoch-boundary PAIR is comparable by default (that is the point) —
+  // only worker-count changes stay non-comparable.
+  std::string epoch_id;
   uint64_t worker_count = 0;  // non-comparability key (8.4)
   // Completed requests inside the window — the per-unit-of-work denominator
   // (8.4), anchor-mapped by the caller (CompletedWorkInMonotonicRange).
@@ -181,15 +198,25 @@ class WindowPhaseAlignment {
 
   // The split-at-boundary alignment (the SplitAlignment contract above).
   // Degenerate input (end <= start, empty intervals) yields an empty result
-  // — the caller excludes-and-marks with its own reason.
+  // — the caller excludes-and-marks with its own reason. M3: `epoch_marks`
+  // (ascending wall order) sub-split each phase part at the applied knob
+  // changes — a window straddling an epoch change splits AT it (spec 8.5),
+  // each part stamped with the epoch in effect over its span (empty before
+  // the first mark). A below-minimum sub-part is excluded-and-marked like
+  // any other part, with its epoch span named.
   static SplitAlignment AlignSplit(FoldedTree tree,
                                    const std::vector<PhaseInterval>& intervals,
                                    int64_t start_unix_ns, int64_t end_unix_ns,
                                    std::string profile_type,
                                    int64_t clock_offset_uncertainty_ns,
                                    const std::vector<CounterPoint>& completed_series,
-                                   int64_t anchor_offset_ns);
+                                   int64_t anchor_offset_ns,
+                                   const std::vector<EpochMark>& epoch_marks = {});
 };
+
+// The epoch in effect at unix instant `t` (the last mark with wall <= t);
+// empty before the first mark. Ascending-order marks expected; pure.
+std::string EpochInEffect(const std::vector<EpochMark>& marks, int64_t t);
 
 // Work-units join (plan major-fix): the completed-request counter series
 // lives in the monotonic domain; the window lives in the unix/SUT domain.
@@ -271,12 +298,24 @@ absl::StatusOr<DifferentialResult> ComputeDifferential(const ProfileWindow& base
                                                        const ProfileWindow& current);
 
 // Same-state adjacent-window pair (8.4's noise floor): identical math and
-// checks as ComputeDifferential — M1 has no knob epochs, so its demo
-// differential IS the noise floor (Global Constraint claim discipline); the
-// separate name keeps the TUI's labeling honest until M3 makes the
-// knob-effect differential meaningful.
+// checks as ComputeDifferential. M3: the noise floor claim is honest ONLY
+// for a same-state pair (SameStatePair below) — a pair spanning a knob
+// epoch boundary must route to the knob-effect differential instead.
 absl::StatusOr<DifferentialResult> ComputeNoiseFloor(const ProfileWindow& w1,
                                                      const ProfileWindow& w2);
+
+// The differential pair's claim label (8.4 + M3): an epoch-boundary pair is
+// the knob-effect differential — "knob effect: <epoch_a> -> <epoch_b>".
+// A same-state pair (equal epoch ids, both empty included) returns "" — the
+// caller's existing same-state/noise-floor labeling applies. Worker-count
+// changes are orthogonal (ComputeDifferential's non-comparable verdict
+// wins); profile types/purity are checked before the label is consulted.
+std::string DifferentialPairLabel(const ProfileWindow& base, const ProfileWindow& current);
+
+// Whether a same-state (noise-floor) claim is honest for this pair: the
+// noise floor is for windows under the SAME knob epoch (8.4); a pair that
+// spans an epoch boundary is the knob-effect differential, not noise.
+bool SameStatePair(const ProfileWindow& base, const ProfileWindow& current);
 
 // Mutex-guarded immutable swap, same pattern as the M0b SnapshotStore: the
 // pool-completion side stores fully-formed windows; the render side loads a

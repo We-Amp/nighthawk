@@ -127,10 +127,22 @@ std::vector<PhaseInterval> PhaseIntervalsFromBoundaries(
   return intervals;
 }
 
+std::string EpochInEffect(const std::vector<EpochMark>& marks, int64_t t) {
+  std::string epoch;
+  for (const EpochMark& mark : marks) {
+    if (mark.wall_time_unix_ns > t) {
+      break;
+    }
+    epoch = mark.epoch_id;
+  }
+  return epoch;
+}
+
 SplitAlignment WindowPhaseAlignment::AlignSplit(
     FoldedTree tree, const std::vector<PhaseInterval>& intervals, int64_t start_unix_ns,
     int64_t end_unix_ns, std::string profile_type, int64_t clock_offset_uncertainty_ns,
-    const std::vector<CounterPoint>& completed_series, int64_t anchor_offset_ns) {
+    const std::vector<CounterPoint>& completed_series, int64_t anchor_offset_ns,
+    const std::vector<EpochMark>& epoch_marks) {
   if (end_unix_ns <= start_unix_ns) {
     // Mirror Align's degenerate guard; the caller excludes-and-marks.
     return SplitAlignment{};
@@ -146,7 +158,8 @@ SplitAlignment WindowPhaseAlignment::AlignSplit(
       continue;
     }
     // One part: [cursor, min(interval end, window end)). Fully inside the
-    // interval by construction.
+    // interval by construction. M3: the part sub-splits at the applied knob
+    // epochs inside it (spec 8.5) — each sub-part is epoch-pure.
     const int64_t part_start = std::max(cursor, interval.start_unix_ns);
     const int64_t part_end = boundary;
     cursor = boundary;
@@ -154,42 +167,67 @@ SplitAlignment WindowPhaseAlignment::AlignSplit(
       continue;
     }
 
-    ProfileWindow part;
-    part.start_unix_ns = part_start;
-    part.end_unix_ns = part_end;
-    part.phase_id = interval.phase_id;
-    part.worker_count = interval.worker_count;
-    part.profile_type = profile_type;
-    part.symbolized = tree.symbolized;
-    part.interval_source = (tree.time_nanos != 0 && tree.duration_nanos != 0)
-                               ? WindowIntervalSource::kProfileTimestamps
-                               : WindowIntervalSource::kFetchOrchestration;
-    part.clock_offset_uncertainty_ns = clock_offset_uncertainty_ns;
-    // Each part carries its own per-unit-of-work denominator through the
-    // caller's anchor mapping.
-    const uint64_t lo = static_cast<uint64_t>(std::max<int64_t>(0, part_start - anchor_offset_ns));
-    const uint64_t hi = static_cast<uint64_t>(std::max<int64_t>(0, part_end - anchor_offset_ns));
-    part.work_units = CompletedWorkInMonotonicRange(completed_series, lo, hi);
+    // The epoch cut points inside the part, ascending: part_start, then
+    // every mark strictly inside it.
+    std::vector<int64_t> cuts;
+    cuts.push_back(part_start);
+    for (const EpochMark& mark : epoch_marks) {
+      if (mark.wall_time_unix_ns > part_start && mark.wall_time_unix_ns < part_end) {
+        cuts.push_back(mark.wall_time_unix_ns);
+      }
+    }
+    cuts.push_back(part_end);
 
-    if (!interval.drain_complete) {
-      part.purity_fraction = 0.0;
-      result.reasons.push_back(absl::StrCat("part [", part_start, ", ", part_end,
-                                            "] in phase '", interval.phase_id,
-                                            "': drain not complete"));
-      result.excluded.push_back(std::move(part));
-      continue;
+    for (size_t c = 0; c + 1 < cuts.size(); ++c) {
+      const int64_t sub_start = cuts[c];
+      const int64_t sub_end = cuts[c + 1];
+      if (sub_end <= sub_start) {
+        continue;
+      }
+      ProfileWindow part;
+      part.start_unix_ns = sub_start;
+      part.end_unix_ns = sub_end;
+      part.phase_id = interval.phase_id;
+      // The epoch in effect over this sub-part (empty before the run's
+      // first applied change).
+      part.epoch_id = EpochInEffect(epoch_marks, sub_start);
+      part.worker_count = interval.worker_count;
+      part.profile_type = profile_type;
+      part.symbolized = tree.symbolized;
+      part.interval_source = (tree.time_nanos != 0 && tree.duration_nanos != 0)
+                                 ? WindowIntervalSource::kProfileTimestamps
+                                 : WindowIntervalSource::kFetchOrchestration;
+      part.clock_offset_uncertainty_ns = clock_offset_uncertainty_ns;
+      // Each part carries its own per-unit-of-work denominator through the
+      // caller's anchor mapping.
+      const uint64_t lo = static_cast<uint64_t>(std::max<int64_t>(0, sub_start - anchor_offset_ns));
+      const uint64_t hi = static_cast<uint64_t>(std::max<int64_t>(0, sub_end - anchor_offset_ns));
+      part.work_units = CompletedWorkInMonotonicRange(completed_series, lo, hi);
+
+      if (!interval.drain_complete) {
+        part.purity_fraction = 0.0;
+        result.reasons.push_back(absl::StrCat("part [", sub_start, ", ", sub_end,
+                                              "] in phase '", interval.phase_id,
+                                              "': drain not complete"));
+        result.excluded.push_back(std::move(part));
+        continue;
+      }
+      if (sub_end - sub_start < kMinSplitWindowNs) {
+        part.purity_fraction = 0.0;
+        std::string reason = absl::StrCat("part [", sub_start, ", ", sub_end, "] in phase '",
+                                          interval.phase_id);
+        if (!part.epoch_id.empty()) {
+          absl::StrAppend(&reason, " (epoch '", part.epoch_id, "')");
+        }
+        absl::StrAppend(&reason, ": below the ", kMinSplitWindowNs / 1000000000,
+                        "s meaningful-minimum rule; excluded-and-marked");
+        result.reasons.push_back(std::move(reason));
+        result.excluded.push_back(std::move(part));
+        continue;
+      }
+      part.purity_fraction = 1.0;
+      result.pure.push_back(std::move(part));
     }
-    if (part_end - part_start < kMinSplitWindowNs) {
-      part.purity_fraction = 0.0;
-      result.reasons.push_back(absl::StrCat("part [", part_start, ", ", part_end, "] in phase '",
-                                            interval.phase_id, "': below the ",
-                                            kMinSplitWindowNs / 1000000000,
-                                            "s meaningful-minimum rule; excluded-and-marked"));
-      result.excluded.push_back(std::move(part));
-      continue;
-    }
-    part.purity_fraction = 1.0;
-    result.pure.push_back(std::move(part));
   }
   // The tree rides into the FIRST part (the only tree the flame renderer
   // needs; the parts are one window's samples). Later parts carry an empty
@@ -379,8 +417,21 @@ absl::StatusOr<DifferentialResult> ComputeDifferential(const ProfileWindow& base
 absl::StatusOr<DifferentialResult> ComputeNoiseFloor(const ProfileWindow& w1,
                                                      const ProfileWindow& w2) {
   // Identical math and checks; the distinct name is the claim label (see the
-  // header): pre-A1 this IS the differential the demo shows.
+  // header). M3: honest only for a same-state pair — SameStatePair gates the
+  // caller's routing.
   return ComputeDifferential(w1, w2);
+}
+
+std::string DifferentialPairLabel(const ProfileWindow& base, const ProfileWindow& current) {
+  if (base.epoch_id == current.epoch_id) {
+    return "";
+  }
+  return absl::StrCat("knob effect: ", base.epoch_id.empty() ? "(none)" : base.epoch_id, " -> ",
+                      current.epoch_id.empty() ? "(none)" : current.epoch_id);
+}
+
+bool SameStatePair(const ProfileWindow& base, const ProfileWindow& current) {
+  return base.epoch_id == current.epoch_id;
 }
 
 void ProfileWindowStore::store(std::vector<ProfileWindow> windows) {

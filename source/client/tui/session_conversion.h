@@ -72,6 +72,21 @@ ToPhaseBoundaryRecord(uint32_t phase_index, absl::string_view phase_id,
 nighthawk::client::PhaseBoundaryRecord
 ToPhaseBoundaryRecord(const nighthawk::client::PhaseBoundaryEvent& event);
 
+// One knob-epoch record for the session (M3 Task 8, api/client/session.proto's
+// KnobEpochRecord). An APPLIED result (`result.applied()`) carries the epoch
+// id, the engine (wall, monotonic) pair at the bend instant, and the applied
+// values; a REJECTED engine result carries the service's reason in
+// rejection_note with the epoch fields empty (the session's honesty rule —
+// counted, not hidden). `phase_id` names the phase the bend landed in (the
+// controller captures it at send time; empty for a rejection, nothing
+// landed); `new_rps` is the attempted/applied PHASE-TOTAL rps; `ramp_bent`
+// is true when the run's ramp plugin makes the rps delta a ramp
+// re-parameterization (C1). The feed-generated pending-timeout surfacing
+// ("run-feed: " prefixed) is NOT a session record — the caller filters it.
+nighthawk::client::KnobEpochRecord ToKnobEpochRecord(
+    const nighthawk::client::UpdateResult& result, absl::string_view phase_id, uint32_t new_rps,
+    bool ramp_bent);
+
 } // namespace Tui
 } // namespace Client
 } // namespace Nighthawk
