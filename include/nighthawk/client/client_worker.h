@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -105,6 +106,17 @@ public:
    * was censored).
    */
   virtual void goIdleAsync(bool exit_dispatcher) PURE;
+
+  /**
+   * FORK-ONLY (We-Amp): M3 Task 6 -- registers an observer invoked on the
+   * worker's dispatcher inside the sequencer's stop hook when a NON-final
+   * phase ends (the boundary begins, possibly EARLY via a termination
+   * predicate). The process uses it to open the boundary-drain live-update
+   * gate. Set before the worker thread starts; default no-op.
+   */
+  virtual void setSequencerStopObserver(std::function<void()> observer) {
+    std::ignore = observer;
+  }
 
   /**
    * FORK-ONLY (We-Amp): per-phase counts of starts refused by the per-phase

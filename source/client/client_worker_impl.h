@@ -110,11 +110,12 @@ public:
                    // built (once for a legacy run's main sequencer at
                    // construction, then at every begin-phase) with the
                    // captured pre-decorator live-update capability: the phase
-                   // index, the handle to the inner limiter, and the apply
+                   // index, the handle to the inner limiter, the apply
                    // surface bound to the sequencer (posts on this worker's
-                   // dispatcher).
+                   // dispatcher), and the cancel surface for the staged
+                   // bend (M3 Task 6's staging-failure path).
                    std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
-                                      Nighthawk::LiveApplyFn)>
+                                      Nighthawk::LiveApplyFn, std::function<void()>)>
                        live_capability_cb = {});
   StatisticPtrMap statistics() const override;
 
@@ -139,6 +140,15 @@ public:
                                              const nighthawk::client::PhaseSpec& phase,
                                              bool final_phase) override;
   void goIdleAsync(bool exit_dispatcher) override;
+
+  // FORK-ONLY (We-Amp): M3 Task 6 -- invoked on this worker's dispatcher
+  // inside the sequencer's stop hook when a NON-final phase ends (the
+  // boundary begins, possibly EARLY via a termination predicate). The
+  // process uses it to open the boundary-drain live-update gate. Set before
+  // the worker thread starts.
+  void setSequencerStopObserver(std::function<void()> observer) override {
+    sequencer_stop_observer_ = std::move(observer);
+  }
   const std::vector<StatisticPtrMap>& phaseStatistics() const override {
     return phase_statistics_;
   }
@@ -199,11 +209,18 @@ private:
   const HardCodedWarmupStyle hardcoded_warmup_style_;
   const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)> live_snapshot_partial_cb_;
   const std::chrono::milliseconds live_snapshot_interval_;
+  // FORK-ONLY (We-Amp): M3 Task 6 -- this worker's current knob epoch, set on
+  // its OWN dispatcher when a live-update apply through the captured
+  // capability succeeds (and re-set to the prior epoch by a rollback
+  // re-apply). Read by emitLiveSnapshotPartial on the same dispatcher, so
+  // the stamp and the bend are serialized within this worker: a partial
+  // computed within the bend lead window carries the OUTGOING epoch.
+  std::string current_epoch_id_;
   // FORK-ONLY (We-Amp): M3 Task 3 -- publish-each-phase-capability callback,
   // see the constructor argument. Fixed at construction; invoked on this
   // worker's dispatcher only.
   const std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
-                           Nighthawk::LiveApplyFn)>
+                           Nighthawk::LiveApplyFn, std::function<void()>)>
       live_capability_cb_;
   Envoy::Event::TimerPtr live_snapshot_timer_;
   // FORK-ONLY (We-Amp): multi-phase run state. Everything here is touched on
@@ -222,6 +239,10 @@ private:
   // has completed by then); phaseGateExceededCounts() derives the per-phase
   // refusal counts from the snapshots.
   std::vector<uint64_t> phase_gate_exceeded_starts_;
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the boundary-begin observer, see
+  // setSequencerStopObserver(). Set before the worker thread starts; called
+  // on this dispatcher inside the non-final stop hook.
+  std::function<void()> sequencer_stop_observer_;
   std::promise<void> ready_promise_;
   std::shared_future<void> ready_future_;
   // Created on the orchestrator thread in beginPhaseAsync (before the post,

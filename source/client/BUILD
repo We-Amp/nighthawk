@@ -97,6 +97,7 @@ envoy_cc_library(
     deps = [
         "//api/client:base_cc_proto",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -119,6 +120,7 @@ envoy_cc_library(
         "factories_impl.h",
         "flush_worker_impl.h",
         "live_partial_aggregator.h",
+        "live_update_applier.h",
         "process_impl.h",
         "remote_process_impl.h",
         "stream_decoder.h",
@@ -137,6 +139,7 @@ envoy_cc_library(
         ":output_formatter_impl_lib",
         ":process_bootstrap",
         "//api/client:base_cc_proto",
+        "//api/rate_limiter:rate_limiter_plugin_cc_proto",
         "//include/nighthawk/client:client_includes",
         "//include/nighthawk/common:base_includes",
         "//include/nighthawk/user_defined_output:user_defined_output_plugin",
@@ -260,6 +263,7 @@ envoy_cc_library(
         "service_main.cc",
     ],
     hdrs = [
+        "live_update_applier.h",
         "live_update_orchestrator.h",
         "service_impl.h",
         "service_main.h",

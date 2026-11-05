@@ -88,9 +88,10 @@ void ServiceImpl::handleExecutionRequest(
   // and writes it under the stream write mutex — the acks_allowed_ gate
   // checked under that same mutex is what keeps an ack from ever landing
   // after the final output (M4's no-ack-after-final-output rule).
-  std::unique_ptr<LiveUpdateOrchestrator::Applier> update_applier =
-      update_applier_factory_ ? update_applier_factory_() : MakeDefaultUpdateApplier();
   ProcessImpl* process_impl_ptr = static_cast<ProcessImpl*>(process.get());
+  std::unique_ptr<LiveUpdateOrchestrator::Applier> update_applier =
+      update_applier_factory_ ? update_applier_factory_()
+                              : process_impl_ptr->MakeLiveUpdateApplier();
   LiveUpdateOrchestrator orchestrator(
       update_applier.get(),
       [this, stream](const nighthawk::client::UpdateResult& result) {
@@ -116,6 +117,12 @@ void ServiceImpl::handleExecutionRequest(
   {
     absl::MutexLock lock(&in_flight_mutex_);
     in_flight_orchestrator_ = &orchestrator;
+    // FORK-ONLY (We-Amp): M3 Task 1 parked minor, closed in Task 6 -- the
+    // run-aborted flag is a per-run residue of an exception unwind; a NEW
+    // run's registration clears it, so arms dispatched against this run
+    // wait for THIS run's registration instead of tripping the stale
+    // abort.
+    run_dispatch_aborted_ = false;
   }
   // FORK-ONLY (We-Amp): RAII unregister guard (mirrors CollectorJoin /
   // WatchdogJoin). The normal path unregisters explicitly below, before

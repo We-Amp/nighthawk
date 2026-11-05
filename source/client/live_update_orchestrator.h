@@ -34,38 +34,20 @@
 
 #include "api/client/service.pb.h"
 
+#include "source/client/live_update_applier.h"
 #include "source/client/live_update_validator.h"
 
 namespace Nighthawk {
 namespace Client {
 
-// The engine clock pair at one instant (spec 8.5 discipline, the same pair
-// PhaseEvent emits).
-struct EngineInstant {
-  int64_t wall_time_unix_ns;
-  int64_t monotonic_ns;
-};
-
-// The default engine clock: (wall, monotonic) ns pair captured at now.
-EngineInstant DefaultEngineInstant();
-
 class LiveUpdateOrchestrator {
 public:
-  // The engine-apply step. The default applier (MakeDefaultUpdateApplier)
-  // rejects every delta that reaches it; the Task-2 whitelist validator runs
-  // in front of it, and Tasks 3/6 replace the applier with the real
-  // capability fan-out + ack aggregation.
-  class Applier {
-  public:
-    virtual ~Applier() = default;
-    // Applies the request's deltas to the engine. Called on a short-lived
-    // orchestrator thread, never on the stream reader thread. MUST honor
-    // `deadline`: on expiry it resolves the update as a rejection instead of
-    // blocking past it — JoinPendingAcks waits at most this long.
-    virtual nighthawk::client::UpdateResult
-    ApplyDeltas(const nighthawk::client::UpdateRequest& request, const std::string& epoch_id,
-                const EngineInstant& bend_instant, absl::Time deadline) = 0;
-  };
+  // The engine-apply seam, extracted to live_update_applier.h (the Task-6
+  // process-side fan-out lives across the client/service target boundary).
+  // The default applier (MakeDefaultUpdateApplier) rejects every delta that
+  // reaches it; the Task-2 whitelist validator runs in front of it, and the
+  // real capability fan-out replaces it in the service wiring.
+  using Applier = LiveUpdateApplier;
 
   // Writes one UpdateResult ack onto the execution stream. Returns false when
   // the ack was not delivered (stream gone, or the stream no longer carries

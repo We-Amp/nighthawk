@@ -940,4 +940,73 @@ TEST_F(RateLimiterTest, LinearLimiterApplyLiveRampRejected) {
   EXPECT_THAT(status.message(), HasSubstr("linear-ramping rate limiter plugin"));
 }
 
+// The Q7 rollback form through the real limiter (M3 Task 6's count-
+// conservation assert across the rollback): a worker that applied a bend and
+// then got the rollback re-apply of the PRIOR schedule at the rollback
+// instant t_r ends up -- cumulative acquisitions identical to the
+// never-bent counterfactual at t_r and beyond. This is exactly why the
+// rollback must re-anchor at the ACTUAL t_r (solve the prior schedule's
+// origin so its integrated releases to t_r equal the acquired count): a
+// naive re-apply at the original t_bend would leave the post-bend releases
+// double-counted against a diverged acquired count.
+TEST_F(RateLimiterTest, RollbackReApplyAtTRConservesAgainstNeverBentCounterfactual) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  // The worker's limiter, the never-bent counterfactual, and a stand-in for
+  // a worker that never got the failed bend at all.
+  LinearRateLimiter worker(time_system, 10_Hz);
+  LinearRateLimiter counterfactual(time_system, 10_Hz);
+
+  uint64_t total = 0;
+  uint64_t total_cf = 0;
+  for (int i = 0; i < 500; i++) { // 500ms at 10 Hz
+    total += acquireAll(worker);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_EQ(total, total_cf);
+
+  // The (successful) forward bend at t_bend: 10 -> 20 Hz.
+  const absl::Status bend = worker.ApplyLiveRps(time_system.monotonicTime(), 20);
+  ASSERT_TRUE(bend.ok()) << bend.message();
+
+  // The bend acts for 300ms: the post-bend releases (about 6 at 20 Hz) put
+  // the worker's acquired count on the BENT schedule -- the state a naive
+  // rollback at t_bend could never repair.
+  for (int i = 0; i < 300; i++) {
+    total += acquireAll(worker);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_GT(total, total_cf) << "the bend must have measurably diverged before the rollback";
+
+  // The rollback at t_r (the actual now): re-apply the PRIOR 10 Hz. Q7's
+  // conservation at t_r: no release is revoked (the acquired count is frozen
+  // as the restored schedule's baseline) and no catch-up credit is granted
+  // (the restored schedule re-anchors so its integrated releases continue
+  // from the frozen count -- never a windfall that would close the gap).
+  const uint64_t gap_at_t_r = total - total_cf;
+  const absl::Status rollback = worker.ApplyLiveRps(time_system.monotonicTime(), 10);
+  ASSERT_TRUE(rollback.ok()) << rollback.message();
+  uint64_t total_right_after_rollback = total;
+  for (int i = 0; i < 5; i++) { // the first ticks after the rollback
+    total_right_after_rollback += acquireAll(worker);
+    time_system.advanceTimeWait(1ms);
+  }
+  EXPECT_LE(total_right_after_rollback - total, 1u)
+      << "the rollback itself must neither revoke nor windfall the count";
+
+  // Beyond t_r, the rolled-back worker runs the prior 10 Hz schedule and the
+  // bend's count divergence stays frozen (bounded by one acquisition
+  // interval of drift): identical rate, no catch-up burst, no silence.
+  for (int i = 0; i < 1000; i++) { // 1s at 10 Hz on both
+    total += acquireAll(worker);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  EXPECT_NEAR(total - total_cf, gap_at_t_r, 1)
+      << "the divergence the bend produced must be conserved across the "
+         "rollback, never amplified (catch-up burst) or revokes (silence)";
+}
+
 } // namespace Nighthawk
+

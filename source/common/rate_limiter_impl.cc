@@ -273,7 +273,14 @@ absl::Status LinearRampingRateLimiterImpl::ApplyLiveRamp(const Envoy::MonotonicT
         "agreed bend instant t_bend",
         (t_bend - now).count()));
   }
-  const std::chrono::nanoseconds elapsed_now = elapsed();
+  // The elapsed-under-the-CURRENT-schedule at the bend: after a previous
+  // bend, the current schedule is anchored at the re-anchor origin, not at
+  // the run's start -- measuring from the start would place the bend at the
+  // wrong point of the outgoing schedule (and trip the bookkeeping sanity
+  // check on any second bend onto an already-bent limiter, e.g. a mixed
+  // rps+ramp request's rps-then-ramp composition).
+  const std::chrono::nanoseconds elapsed_now =
+      live_origin_.has_value() ? now - *live_origin_ : elapsed();
   const RampReanchor::RampSchedule current{ramp_time_, static_cast<double>(frequency_.value())};
   auto reanchor = RampReanchor::Reanchor(current, elapsed_now, acquired_count_, next);
   if (!reanchor.ok()) {

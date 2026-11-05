@@ -106,9 +106,31 @@ public:
   // with the per-worker apply status. Callers without a dispatcher running
   // on their side get no callback (the run's final stop exits this
   // dispatcher); the Task 6 orchestrator bounds that window with its run-end
-  // resolution.
+  // resolution. The Task-3-era signature: no staging callback, no epoch id
+  // (the stage callback defaults to a no-op, the epoch to empty).
   void applyLiveUpdate(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                        std::function<void(absl::Status)> callback);
+
+  // FORK-ONLY (We-Amp): the Task 6 fan-out surface (the staging-confirm
+  // ruling). Same apply semantics as above, plus `stage_callback`: it fires
+  // on the dispatcher BEFORE t_bend for a future bend (at the arming
+  // checks): OkStatus = staged and armed, an error = nothing armed, nothing
+  // will ever apply. The Task 6 fan-out uses it to surface most failures
+  // with NOTHING applied, and to know which staged bends to cancel. The
+  // knob epoch does not pass through here: the caller's apply callback
+  // wrapper owns the worker-side epoch stamping (M3 Task 6).
+  void applyLiveUpdate(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
+                       std::function<void(absl::Status)> stage_callback,
+                       std::function<void(absl::Status)> callback);
+
+  // FORK-ONLY (We-Amp): cancels the currently pending future bend (Task 6's
+  // staging-failure path). Posts onto this sequencer's own dispatcher; if a
+  // bend was pending, the timer is disarmed, the pending state is cleared,
+  // and the bend's apply callback is invoked on the dispatcher with a
+  // CancelledError (its apply will never run). When nothing is pending this
+  // is a no-op. Safe to call from any thread; never call from inside the
+  // bend timer's own firing (the same re-entrancy trap as timer deletion).
+  void cancelPendingLiveUpdate();
 
 protected:
   /**
@@ -148,6 +170,7 @@ protected:
   // FORK-ONLY (We-Amp): M3 Task 3 -- applyLiveUpdate's dispatcher-side half;
   // always runs on this sequencer's own dispatcher.
   void applyLiveUpdateOnDispatcherThread(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
+                                         std::function<void(absl::Status)> stage_callback,
                                          std::function<void(absl::Status)> callback);
   // FORK-ONLY (We-Amp): the bend timer's body. Reads the pending bend from
   // the members below at fire time (the timer lambda captures only `this`),

@@ -1209,5 +1209,173 @@ TEST_P(ServiceTest, TwoWorkersMergeIntoLiveSnapshots) {
 }
 
 } // namespace
+// --- M3 Task 6: the fan-out end-to-end, epoch-stamped snapshots and the
+// flush-window change markers (Review Focus 3 + the 8.5 snapshot
+// semantics). ---
+
+// A two-phase live run (phase 0: two workers; phase 1: one -- the M2 worker
+// subsets). The limiter is per-phase, so this also exercises the per-PHASE
+// registry: the fan-out targets the CURRENT phase's active subset through
+// the capability stamped at its begin-phase.
+ExecutionRequest makePhasedLiveRequest(const std::string& uri, uint32_t flush_seconds) {
+  ExecutionRequest request;
+  auto* options = request.mutable_start_request()->mutable_options();
+  options->mutable_uri()->set_value(uri);
+  options->mutable_stats_flush_interval()->set_value(flush_seconds);
+  options->mutable_concurrency()->set_value("2");
+  options->mutable_live_streaming();
+  auto* phase0 = options->mutable_phases()->Add();
+  phase0->set_name("p0");
+  phase0->mutable_duration()->set_seconds(2);
+  phase0->set_requests_per_second(10);
+  phase0->mutable_concurrency()->set_value("2");
+  auto* phase1 = options->mutable_phases()->Add();
+  phase1->set_name("p1");
+  phase1->mutable_duration()->set_seconds(3);
+  phase1->set_requests_per_second(10);
+  phase1->mutable_concurrency()->set_value("1");
+  return request;
+}
+
+// Review Focus 3, live: a two-worker run takes a live rps update -- ONE ack,
+// ONE epoch id, and the snapshots carry the change marker exactly once (the
+// 8.5 flush-window split point). Snapshots before the bend carry the empty
+// (pre-first-apply) epoch; snapshots produced from post-bend partials carry
+// epoch-1; the final output stays the last response on the stream.
+TEST_P(ServiceTest, FanOutAppliesSingleEpochAtAgreedInstant) {
+  TestHttpListener listener;
+  request_ = makeLiveRequest(listener.uri(), 4, 10, 1, /*live_streaming=*/true,
+                             /*concurrency=*/2);
+  auto r = stub_->ExecutionStream(&context_);
+  ASSERT_TRUE(r->Write(request_, {}));
+  std::this_thread::sleep_for(1200ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      50);
+  ASSERT_TRUE(r->Write(update_request, {}));
+
+  int acks = 0;
+  int markers = 0;
+  bool saw_output = false;
+  std::string last_epoch_before_marker;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      acks++;
+      EXPECT_TRUE(response_.update_result().applied())
+          << response_.update_result().rejection_reason();
+      EXPECT_EQ(response_.update_result().epoch_id(), "epoch-1");
+      EXPECT_GT(response_.update_result().monotonic_ns(), 0);
+      EXPECT_GT(response_.update_result().wall_time_unix_ns(), 0);
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    } else {
+      ASSERT_TRUE(response_.has_live_snapshot());
+      const nighthawk::client::LiveSnapshot& snapshot = response_.live_snapshot();
+      if (snapshot.epoch_changed()) {
+        markers++;
+        EXPECT_EQ(snapshot.epoch_id(), "epoch-1");
+        EXPECT_EQ(last_epoch_before_marker, "")
+            << "every pre-marker snapshot must carry the EMPTY (pre-first-apply) "
+               "epoch, so the marker-bearing snapshot is the FIRST one with "
+               "epoch-1";
+      } else if (markers == 0) {
+        // A pre-marker snapshot: remember its epoch for the marker check.
+        last_epoch_before_marker = snapshot.epoch_id();
+      } else {
+        // An epoch-bearing snapshot after the marker: a later one.
+        EXPECT_EQ(snapshot.epoch_id(), "epoch-1");
+        EXPECT_EQ(markers, 1) << "the marker must have come first";
+      }
+      EXPECT_FALSE(snapshot.phase_id().empty());
+    }
+  }
+  EXPECT_EQ(acks, 1) << "exactly one ack for one update";
+  EXPECT_EQ(markers, 1) << "exactly one marker-bearing snapshot per epoch change";
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// The fan-out targets the ACTIVE subset only: a retired worker's stale
+// pre-boundary capability stamp must not fail the update (and must not be
+// touched). The update lands in phase 1, whose active subset is one worker;
+// the retired worker's registry stamp is still phase 0's -- targeting the
+// full fleet would fail the lookup honestly and the ack would be a
+// rejection. Applied=true IS the active-subset pin.
+TEST_P(ServiceTest, FanOutTargetsActiveWorkersInOrder) {
+  TestHttpListener listener;
+  request_ = makePhasedLiveRequest(listener.uri(), 1);
+  auto r = stub_->ExecutionStream(&context_);
+  ASSERT_TRUE(r->Write(request_, {}));
+  // Phase 1 begins at ~2s; land the update well inside it (but before the
+  // phase's remaining duration can no longer take a 250ms bend lead).
+  std::this_thread::sleep_for(2300ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      20);
+  ASSERT_TRUE(r->Write(update_request, {}));
+
+  int acks = 0;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      acks++;
+      EXPECT_TRUE(response_.update_result().applied())
+          << response_.update_result().rejection_reason();
+      EXPECT_EQ(response_.update_result().epoch_id(), "epoch-1");
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    }
+  }
+  EXPECT_EQ(acks, 1);
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+// Epoch is orthogonal to phase (the 8.5 stamping): an epoch applied in phase
+// 0 still stamps phase 1's snapshots -- the bend survives the boundary in
+// the labels even though the limiter (and its schedule) is per-phase.
+TEST_P(ServiceTest, EpochSurvivesPhaseBoundary) {
+  TestHttpListener listener;
+  request_ = makePhasedLiveRequest(listener.uri(), 1);
+  auto r = stub_->ExecutionStream(&context_);
+  ASSERT_TRUE(r->Write(request_, {}));
+  // Land the update inside phase 0, with the bend still inside the phase.
+  std::this_thread::sleep_for(800ms);
+  nighthawk::client::ExecutionRequest update_request;
+  update_request.mutable_update_request()->add_deltas()->mutable_requests_per_second()->set_value(
+      20);
+  ASSERT_TRUE(r->Write(update_request, {}));
+
+  int acks = 0;
+  int phase1_snapshots_with_epoch = 0;
+  bool saw_output = false;
+  while (r->Read(&response_)) {
+    if (response_.has_update_result()) {
+      acks++;
+      EXPECT_TRUE(response_.update_result().applied())
+          << response_.update_result().rejection_reason();
+    } else if (response_.has_output()) {
+      saw_output = true;
+      break;
+    } else if (response_.live_snapshot().phase_id() == "p1") {
+      ASSERT_TRUE(response_.has_live_snapshot());
+      EXPECT_EQ(response_.live_snapshot().epoch_id(), "epoch-1");
+      phase1_snapshots_with_epoch++;
+    }
+  }
+  EXPECT_EQ(acks, 1);
+  EXPECT_GT(phase1_snapshots_with_epoch, 0) << "phase 1 snapshots must carry the epoch applied "
+                                              "in phase 0";
+  EXPECT_TRUE(saw_output);
+  EXPECT_TRUE(r->WritesDone());
+  EXPECT_TRUE(r->Finish().ok());
+}
+
+
 } // namespace Client
 } // namespace Nighthawk
+

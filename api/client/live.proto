@@ -45,11 +45,14 @@ message LiveSnapshot {
   int64 monotonic_ns = 2;
   // The benchmark phase the snapshot belongs to (currently "main").
   string phase_id = 3;
-  // Identifier of the execution this snapshot belongs to. FORK-ONLY rebase
-  // check on semantics: pre-A2 this field carries execution identity (the
-  // execution_id option when set, empty otherwise); A2 repurposes it as the
-  // knob-epoch id. A rebase that lands on top of A2 must account for this
-  // semantics change, not just the field number.
+  // FORK-ONLY (We-Amp) A2 semantics (spec 8.5): the knob epoch whose schedule
+  // produced this snapshot's samples -- the CURRENT knob epoch at snapshot
+  // production, first-applied wins. EMPTY before the run's first applied
+  // live change; "epoch-<n>" (a plain per-run monotonic counter, its own
+  // namespace, never compared with phase ids) from the bend instant of the
+  // n-th applied change onward. A rolled-back update leaves the prior epoch
+  // in place. Consumers split flush windows at epoch changes exactly as they
+  // split them at phase changes.
   string epoch_id = 4;
   // Global counter values accumulated so far, keyed by counter name.
   map<string, uint64> counters = 5;
@@ -57,6 +60,12 @@ message LiveSnapshot {
   // values are the maximum over the workers (per-worker histograms cannot be
   // merged without their raw samples, so this is an approximation).
   repeated StatisticSnapshot statistics = 6;
+  // FORK-ONLY (We-Amp) A2 (spec 8.5): true on exactly the one snapshot that
+  // first carries a changed epoch_id (advance to a new epoch, or the demotion
+  // back to the prior epoch after a rolled-back update). The flush-window
+  // split marker: a window straddling a marker-bearing snapshot is split at
+  // it, the way M2 taught consumers to split at phase changes.
+  bool epoch_changed = 7;
 }
 
 // Internal: the immutable partial snapshot one worker computes on its own
@@ -72,6 +81,12 @@ message WorkerLiveSnapshotPartial {
   // slabs; the aggregator groups/labels by this stamp and never folds
   // statistics across different stamps.
   string phase_id = 4;
+  // FORK-ONLY (We-Amp) A2 (spec 8.5): the knob epoch current on this worker
+  // at computation time, stamped on its dispatcher (the same dispatcher the
+  // bend applies run on, so within one worker the stamp and the bend are
+  // serialized). Empty until the run's first applied change reaches this
+  // worker's limiter.
+  string epoch_id = 5;
 }
 
 // FORK-ONLY (We-Amp): rebase check - fork-specific. One completed phase

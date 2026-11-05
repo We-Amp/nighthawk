@@ -26,6 +26,7 @@
 #include "nighthawk/common/statistic.h"
 
 #include "source/client/live_partial_aggregator.h"
+#include "source/client/live_update_applier.h"
 #include "source/client/live_update_validator.h"
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
@@ -75,6 +76,10 @@ struct LiveCapabilityEntry {
   // Binds the worker's current-phase sequencer: posts the apply onto the
   // worker's own dispatcher (thread confinement).
   LiveApplyFn apply;
+  // Binds the same sequencer's cancel surface (M3 Task 6): cancels the
+  // worker's staged-but-unfired bend (the staging-failure path). Posts onto
+  // the worker dispatcher; a no-op when nothing is pending.
+  std::function<void()> cancel_live_update;
 };
 
 // FORK-ONLY (We-Amp): M3 Task 3 -- the per-PHASE capability registry:
@@ -90,19 +95,109 @@ public:
   // Called from the worker's begin-phase task on the WORKER dispatcher (and
   // once for a legacy run's main sequencer): (re)stamps the worker's entry.
   void Record(int worker_id, uint32_t phase_index, LiveTunableRateLimiter* handle,
-              LiveApplyFn apply);
+              LiveApplyFn apply, std::function<void()> cancel_live_update);
   // Reader side (the Task 6 fan-out): the worker's capability stamped for
   // `phase_index`, or an error when the worker has no stamp for that phase
   // (no entry at all, or a stale pre-boundary one). Thread-safe.
   absl::StatusOr<LiveCapabilityEntry> CapabilityForPhase(int worker_id,
                                                          uint32_t phase_index) const;
   // A new run starts from an empty registry (workers are recreated per run;
-  // this guards a re-run on a long-lived process).
+  // this guards a re-run on a long-lived process). Also cleared when the
+  // workers are torn down (M3 Task 6's registry-outlives-sequencer ruling:
+  // a stale entry whose sequencer is gone must never be reachable).
   void Reset();
 
 private:
   mutable std::mutex mutex_;
   absl::flat_hash_map<int, LiveCapabilityEntry> entries_;
+};
+
+// FORK-ONLY (We-Amp): M3 Task 6. Everything the fan-out reads off the
+// in-flight run, as injectable functions so the fan-out mechanics (ordering,
+// staging, rollback, honest aggregation) are unit-testable without a
+// ProcessImpl. ProcessImpl::MakeLiveUpdateApplier() builds the real one.
+struct LiveFanOutContext {
+  // The engine clock the rollback instant is taken at (and the fan-out's
+  // deadline math).
+  std::function<Envoy::MonotonicTime()> now;
+  // OkStatus when a live update may be applied right now; the error message
+  // is the rejection reason otherwise (boundary drain in progress, no
+  // active workers, run teardown started).
+  std::function<absl::Status()> update_admissible;
+  // Error when t_bend would land outside the current phase's (phase-vector
+  // runs) or the run's (legacy runs) remaining duration: a bend landing
+  // past the boundary is undefined and rejected BEFORE any fan-out.
+  std::function<absl::Status(Envoy::MonotonicTime)> bend_instant_admissible;
+  std::function<uint32_t()> current_phase_index;
+  std::function<uint32_t()> active_worker_count;
+  std::function<absl::StatusOr<LiveCapabilityEntry>(int worker_id, uint32_t phase_index)>
+      capability_for_phase;
+  // The current phase's declared schedule (the per-phase rps inheritance
+  // applied): initializes the fan-out's rollback prior-state tracker when
+  // the phase changes (each phase constructs fresh limiters, so the prior
+  // schedule is the phase's declared one, not the previous phase's bent
+  // one).
+  std::function<LiveKnobDelta()> current_phase_schedule;
+  // The shutdown fence. fan_out_begin returns false once the run's workers
+  // are being torn down (a fan-out must not be started against them); every
+  // started fan-out pairs it with fan_out_end, and the teardown waits for
+  // the count to drain before destroying the workers.
+  std::function<bool()> fan_out_begin;
+  std::function<void()> fan_out_end;
+};
+
+// FORK-ONLY (We-Amp): M3 Task 6 -- the real update applier: the process-side
+// fan-out. Implements the LiveUpdateApplier seam (called on a
+// short-lived orchestrator thread, honors the deadline): worker-id-ordered
+// staging posts onto the active workers' own dispatchers through the
+// per-PHASE capability registry, the staging-confirm-before-t_bend primary
+// failure path (cancel-everything, nothing applied), the residual post-bend
+// rollback at the rollback instant t_r (a re-anchored re-apply of the PRIOR
+// schedule -- the A2b design note's Q7 form), and the honest single
+// UpdateResult aggregation (applied=true only when every active worker
+// confirmed the apply; the epoch number is consumed by the orchestrator
+// only then).
+class LiveCapabilityFanOutApplier : public LiveUpdateApplier,
+                                    public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
+public:
+  explicit LiveCapabilityFanOutApplier(LiveFanOutContext context);
+
+  nighthawk::client::UpdateResult
+  ApplyDeltas(const nighthawk::client::UpdateRequest& request, const std::string& epoch_id,
+              const EngineInstant& bend_instant, absl::Time deadline) override;
+
+private:
+  struct WorkerOutcome {
+    int worker_id;
+    absl::Status status;
+  };
+  // Condition callbacks for the bounded waits (the mutex is held).
+  bool StageOutcomesComplete() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  bool ApplyOutcomesComplete() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // Registers the stage/apply callbacks for one worker's post.
+  void RecordStageOutcome(int worker_id, absl::Status status);
+  void RecordApplyOutcome(int worker_id, absl::Status status);
+  // The normalized delta set (the wire oneofs, resolved; validation
+  // guarantees at least one knob and no duplicate knob).
+  static LiveKnobDelta NormalizeDelta(const nighthawk::client::UpdateRequest& request);
+
+  LiveFanOutContext context_;
+  absl::Mutex mutex_;
+  std::vector<WorkerOutcome> stage_outcomes_ ABSL_GUARDED_BY(mutex_);
+  std::vector<WorkerOutcome> apply_outcomes_ ABSL_GUARDED_BY(mutex_);
+  size_t expected_workers_ ABSL_GUARDED_BY(mutex_) = 0;
+  // Task 4 Q4's no-queued-bends ruling, enforced at the fan-out: a second
+  // update arriving before the first resolves is rejected.
+  bool apply_in_progress_ ABSL_GUARDED_BY(mutex_) = false;
+  // The rollback prior-state tracker: the current phase's declared schedule,
+  // updated after every applied change. Reset whenever the phase index moves
+  // (fresh limiters per phase).
+  uint32_t tracked_phase_index_ ABSL_GUARDED_BY(mutex_) = 0;
+  bool schedule_initialized_ ABSL_GUARDED_BY(mutex_) = false;
+  LiveKnobDelta tracked_schedule_ ABSL_GUARDED_BY(mutex_);
+  // The epoch id the rollback restores ("" before the run's first applied
+  // change). Advances to the applied epoch on every success.
+  std::string prior_epoch_id_ ABSL_GUARDED_BY(mutex_);
 };
 
 /**
@@ -183,6 +278,13 @@ public:
   const LiveCapabilityRegistry& liveCapabilityRegistry() const {
     return live_capability_registry_;
   }
+
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the real update applier for this
+  // in-flight run: the worker-id-ordered capability fan-out with staging
+  // confirm, the rollback-at-t_r residual path and the honest aggregation.
+  // The service wires it into the run's LiveUpdateOrchestrator; a test may
+  // substitute its own applier at the service's factory seam instead.
+  std::unique_ptr<LiveUpdateApplier> MakeLiveUpdateApplier();
 
   // FORK-ONLY (We-Amp): multi-phase support (M2 A1). The callback fires on
   // the run-calling thread at each phase boundary the orchestrator marks;
@@ -281,6 +383,28 @@ private:
   // before its first phase work (per-dispatcher FIFO). Single caller: the
   // orchestrator is the only mergeValues caller in the process.
   void applyPhaseBreakerOverrides(const PhaseResourceLimits& desired_limits);
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out context halves, all
+  // thread-safe reads off the run's shared state (the LiveFanOutContext
+  // function set MakeLiveUpdateApplier binds):
+  absl::Status liveUpdateAdmissionStatus() const;
+  absl::Status bendInstantAdmissibleForUpdate(Envoy::MonotonicTime t_bend) const;
+  uint32_t currentPhaseIndexForUpdate() const;
+  uint32_t activeWorkerCountForUpdate() const;
+  LiveKnobDelta currentPhaseScheduleDelta() const;
+  bool fanOutBegin();
+  void fanOutEnd();
+  // The boundary-drain live-update gate, see the .cc. Set from the worker
+  // dispatchers' sequencer-stop observers; cleared by runPhases.
+  void setBoundaryDrainInProgress(bool in_progress);
+  // Fence condition callback (the fence mutex is held).
+  bool LiveUpdateFanOutsDrained() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(live_update_fence_mutex_) {
+    return in_flight_fan_outs_ == 0;
+  }
+  // Called in shutdown() BEFORE the workers are destroyed: disables new
+  // fan-outs, then waits (bounded -- appliers honor their deadlines) for the
+  // in-flight ones to register out, then clears the capability registry (a
+  // stale entry's sequencer is about to be gone).
+  void drainLiveUpdateFanOuts();
   std::function<void(const PhaseEvent&)> phase_event_cb_;
   std::vector<PhaseBoundaryTiming> boundary_timings_;
   std::vector<uint64_t> phase_gate_exceeded_;
@@ -295,6 +419,26 @@ private:
   std::vector<std::shared_future<void>> worker_ready_futures_;
   mutable std::mutex current_phase_id_mutex_;
   std::string current_phase_id_{"main"};
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out's view of the in-flight
+  // run, guarded by current_phase_id_mutex_ (the same domain the phase id
+  // and the run-shape bound already live in): the current phase index (0 for
+  // legacy runs), the active worker count (the M2 subset for phase-driven
+  // runs, the full fleet for legacy runs), and the boundary-drain gate (set
+  // around each boundary's bounded drain wait: an update arriving inside the
+  // drain window is rejected -- the operating point is undefined mid-drain,
+  // and a bend must never be applied across a boundary).
+  uint32_t current_phase_index_{0};
+  uint32_t active_worker_count_{0};
+  bool boundary_drain_in_progress_{false};
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out shutdown fence: every
+  // in-flight fan-out registers itself here; the workers are destroyed only
+  // after the fence drained (bounded by the applier deadline), so no
+  // capability apply can be posted to a dispatcher that is going away (the
+  // registry-outlives-sequencer window, closed with the registry Reset below
+  // in shutdown()).
+  mutable absl::Mutex live_update_fence_mutex_;
+  int in_flight_fan_outs_ ABSL_GUARDED_BY(live_update_fence_mutex_) = 0;
+  bool live_updates_disabled_ ABSL_GUARDED_BY(live_update_fence_mutex_) = false;
   // FORK-ONLY (We-Amp): current-phase duration and start instant, and the
   // run's start instant, for liveUpdateRunShape()'s remaining-duration bound
   // (M3 Task 2). Monotonic ns on time_system_'s clock.

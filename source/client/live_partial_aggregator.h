@@ -48,17 +48,34 @@ public:
   void addPartial(nighthawk::client::WorkerLiveSnapshotPartial partial);
 
   // Completes a snapshot from the folded state. The monotonic stamp is
-  // strictly increasing across calls.
-  nighthawk::client::LiveSnapshot snapshot(const std::string& epoch_id);
+  // strictly increasing across calls. The snapshot's epoch_id is the run's
+  // current knob epoch (M3 Task 6, spec 8.5): tracked from the per-worker
+  // epoch stamps -- empty until the first applied change, "epoch-<n>" from
+  // the bend instant on -- and epoch_changed is true on exactly the one
+  // snapshot per epoch change (advance or post-rollback demotion).
+  nighthawk::client::LiveSnapshot snapshot();
 
 private:
   // Position of phase_id in phase_order_; -1 when unknown (or no order set).
   int stampRank(const std::string& phase_id) const;
   // Whether a worker advancing to phase_id may advance latest_phase_id_.
   bool advancesLatest(const std::string& phase_id) const;
+  // FORK-ONLY (We-Amp): M3 Task 6. Updates latest_epoch_id_ from the
+  // per-worker epoch stamps. "epoch-<n>" ids compare by their numeric
+  // suffix ("" sorts before every epoch: it is the pre-first-apply state).
+  // - Advance (first-applied wins): any worker stamping a LATER epoch moves
+  //   the label there immediately and marks one epoch change.
+  // - Demotion (rollback honesty): a stamp EARLIER than the label is a
+  //   rolled-back update; the label moves back down only once NO worker is
+  //   still stamped at the demoted epoch (the last epoch-<n>-stamped
+  //   worker's post-rollback partial), and marks one epoch change.
+  //   Retired/idle workers frozen on "" (or an older epoch) never block a
+  //   demotion.
+  void advanceEpochLabel(const std::string& worker_epoch);
 
   struct WorkerState {
     std::string phase_id;
+    std::string epoch_id;
     std::map<std::string, nighthawk::client::StatisticSnapshot> statistics;
   };
   std::vector<std::string> phase_order_;
@@ -67,6 +84,11 @@ private:
   // The newest stamp any worker has advanced to; "main" before the first
   // partial arrives (legacy single-phase runs have no other stamp).
   std::string latest_phase_id_{"main"};
+  // FORK-ONLY (We-Amp): M3 Task 6. The run's current knob epoch (empty
+  // before the first applied change) and the pending one-snapshot change
+  // marker.
+  std::string latest_epoch_id_;
+  bool epoch_change_pending_{false};
   // Enforces strictly increasing monotonic_ns across snapshots.
   int64_t last_live_snapshot_monotonic_ns_{0};
 };

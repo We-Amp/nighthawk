@@ -612,11 +612,15 @@ TEST(LiveCapabilityRegistryTest, CaptureRecapturedAtEachPhaseBegin) {
   int phase1_applies = 0;
 
   registry.Record(0, 0, &handle_phase0,
-                  [&phase0_applies](Envoy::MonotonicTime, const LiveKnobDelta&,
+                  [&phase0_applies](Envoy::MonotonicTime, const std::string&,
+                                    const LiveKnobDelta&,
+                                    std::function<void(absl::Status)> stage,
                                     std::function<void(absl::Status)> callback) {
                     phase0_applies++;
+                    stage(absl::OkStatus());
                     callback(absl::OkStatus());
-                  });
+                  },
+                  [] {});
   auto cap0 = registry.CapabilityForPhase(0, 0);
   ASSERT_TRUE(cap0.ok());
   EXPECT_EQ(cap0->handle, &handle_phase0);
@@ -624,11 +628,15 @@ TEST(LiveCapabilityRegistryTest, CaptureRecapturedAtEachPhaseBegin) {
 
   // Phase 1 begins: the worker re-stamps, and the phase-0 entry is gone.
   registry.Record(0, 1, &handle_phase1,
-                  [&phase1_applies](Envoy::MonotonicTime, const LiveKnobDelta&,
+                  [&phase1_applies](Envoy::MonotonicTime, const std::string&,
+                                    const LiveKnobDelta&,
+                                    std::function<void(absl::Status)> stage,
                                     std::function<void(absl::Status)> callback) {
                     phase1_applies++;
+                    stage(absl::OkStatus());
                     callback(absl::OkStatus());
-                  });
+                  },
+                  [] {});
   const auto stale = registry.CapabilityForPhase(0, 0);
   EXPECT_FALSE(stale.ok());
   EXPECT_EQ(stale.status().code(), absl::StatusCode::kFailedPrecondition);
@@ -641,8 +649,10 @@ TEST(LiveCapabilityRegistryTest, CaptureRecapturedAtEachPhaseBegin) {
   int applies = 0;
   auto current = registry.CapabilityForPhase(0, 1);
   ASSERT_TRUE(current.ok());
-  current->apply(std::chrono::steady_clock::now(), LiveKnobDelta{std::uint32_t{5}, std::nullopt},
-                 [&applies](absl::Status) { applies++; });
+  LiveKnobDelta delta;
+  delta.new_rps = 5;
+  current->apply(std::chrono::steady_clock::now(), "epoch-1", delta,
+                 [](absl::Status) {}, [&applies](absl::Status) { applies++; });
   EXPECT_EQ(applies, 1);
   EXPECT_EQ(phase0_applies, 0);
   EXPECT_EQ(phase1_applies, 1);
@@ -1247,6 +1257,525 @@ TEST_F(SequencerLiveUpdateTest, NoCapturedHandleFailsHonestly) {
   ASSERT_TRUE(done.load());
   EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
   EXPECT_THAT(status.message(), HasSubstr("no captured live-update capability"));
+}
+
+
+// ===================================================================
+// M3 Task 6: the fan-out (staging confirm, ordered posts, rollback at
+// t_r, honest aggregation), the knob epochs and the flush-window
+// change markers.
+// ===================================================================
+
+// (T5-review carry-in): the mixed rps+ramp LiveKnobDelta composition path.
+// The normalized delta applies the rps knob FIRST, then the ramp change on
+// top of the resulting schedule -- observable when both knobs set the same
+// sub-field: the ramp's explicit target wins, never the rps knob's value.
+TEST_F(SequencerLiveUpdateTest, MixedDeltaAppliesRpsFirstThenRampOnTop) {
+  auto ramp_seq = makeRampSequencer(100, 100ms);
+  // Half a second: the 100ms ramp completes (~5 counts) and the schedule
+  // settles at ~100 Hz in the post-ramp regime.
+  const uint64_t pre = drive(*ramp_seq, 500ms, 1ms);
+  ASSERT_GE(pre, 40u);
+
+  // Mixed request {new_rps: 40, ramp: {target_rps: 90}} on a live (immediate)
+  // bend. rps-first order: ApplyLiveRps(40) re-anchors at target 40, then
+  // ApplyLiveRamp(target 90, ramp time preserved) re-anchors ON TOP -- the
+  // final schedule targets 90 Hz. An rps-LAST order would leave 40 Hz.
+  LiveKnobDelta mixed;
+  mixed.new_rps = 40;
+  RampShapeChange ramp_change;
+  ramp_change.target_rps = 90;
+  mixed.ramp = ramp_change;
+
+  absl::Status status = absl::InternalError("callback not run");
+  std::atomic<bool> done{false};
+  ramp_seq->applyLiveUpdate(timeSource().monotonicTime(), mixed, [&](absl::Status s) {
+    status = s;
+    done = true;
+  });
+  pumpUntil([&done]() { return done.load(); });
+  ASSERT_TRUE(done.load());
+  EXPECT_TRUE(status.ok()) << status.message();
+
+  // ~90 Hz over 500ms: ~45 grants (NOT ~20, which the wrong order gives).
+  const uint64_t post = drive(*ramp_seq, 500ms, 1ms);
+  EXPECT_NEAR(post, 45, 5) << "the ramp knob's explicit target must win the mixed apply";
+}
+
+// The staging surface: a FUTURE bend arms and confirms (stage callback OK)
+// strictly BEFORE t_bend, while the apply callback stays silent until the
+// bend fires.
+TEST_F(SequencerLiveUpdateTest, StageConfirmsBeforeFutureBendApplies) {
+  auto sequencer = makeSequencer(10, /*with_handle=*/true);
+  drive(*sequencer, 500ms, 10ms);
+  const Envoy::MonotonicTime t_bend = timeSource().monotonicTime() + 200ms;
+
+  absl::Status stage_status = absl::InternalError("stage callback not run");
+  absl::Status apply_status = absl::InternalError("apply callback not run");
+  std::atomic<bool> staged{false};
+  std::atomic<bool> applied{false};
+  LiveKnobDelta delta;
+  delta.new_rps = 20;
+  sequencer->applyLiveUpdate(
+      t_bend, delta, [&](absl::Status s) { stage_status = s; staged = true; },
+      [&](absl::Status s) { apply_status = s; applied = true; });
+  pump(20);
+  ASSERT_TRUE(staged.load()) << "the staging confirm must fire at arming time";
+  EXPECT_TRUE(stage_status.ok()) << stage_status.message();
+  EXPECT_FALSE(applied.load()) << "the apply must not fire before the bend instant";
+  pumpUntil([&applied]() { return applied.load(); });
+  ASSERT_TRUE(applied.load());
+  EXPECT_TRUE(apply_status.ok()) << apply_status.message();
+}
+
+// The staging-failure path, sequencer-side: a staged future bend that is
+// cancelled before its instant never applies -- the limiter's schedule stays
+// on the prior rate and the apply callback resolves cancelled.
+TEST_F(SequencerLiveUpdateTest, CancelledStagedBendNeverApplies) {
+  auto sequencer = makeSequencer(10, /*with_handle=*/true);
+  const uint64_t pre = drive(*sequencer, 500ms, 10ms);
+  ASSERT_NEAR(pre, 5, 1);
+  const Envoy::MonotonicTime t_bend = timeSource().monotonicTime() + 200ms;
+
+  std::atomic<bool> staged{false};
+  absl::Status apply_status = absl::OkStatus();
+  std::atomic<bool> applied{false};
+  LiveKnobDelta delta;
+  delta.new_rps = 100;
+  sequencer->applyLiveUpdate(
+      t_bend, delta, [&](absl::Status s) { ASSERT_TRUE(s.ok()); staged = true; },
+      [&](absl::Status s) { apply_status = s; applied = true; });
+  pump(20);
+  ASSERT_TRUE(staged.load());
+  sequencer->cancelPendingLiveUpdate();
+  pump(20);
+
+  // Drive past the (now cancelled) bend instant: still ~10 Hz, never a step
+  // to 100 Hz.
+  const uint64_t post = drive(*sequencer, 500ms, 10ms);
+  EXPECT_NEAR(post, 5, 1) << "the cancelled bend must not have applied";
+  pumpUntil([&applied]() { return applied.load(); });
+  ASSERT_TRUE(applied.load());
+  EXPECT_EQ(apply_status.code(), absl::StatusCode::kCancelled);
+  EXPECT_THAT(apply_status.message(), HasSubstr("cancelled"));
+}
+
+// --- The process-side fan-out (LiveCapabilityFanOutApplier) against an
+// injected LiveFanOutContext: deterministic ordering, staging, rollback and
+// aggregation mechanics without a ProcessImpl. ---
+
+
+// One fake active worker: records every apply post (forward AND rollback),
+// replays configurable stage/apply results, and can defer its callbacks so a
+// test controls exactly when (and at what fan-out-clock reading) they fire.
+class FakeFanOutWorker {
+public:
+  struct ApplyRecord {
+    Envoy::MonotonicTime t_bend;
+    std::string epoch_id;
+    LiveKnobDelta delta;
+  };
+
+  void Post(Envoy::MonotonicTime t_bend, const std::string& epoch_id, const LiveKnobDelta& delta,
+            std::function<void(absl::Status)> stage_cb,
+            std::function<void(absl::Status)> apply_cb, Envoy::MonotonicTime* fan_out_clock) {
+    applies.push_back({t_bend, epoch_id, delta});
+    pending_stage_cb_ = std::move(stage_cb);
+    pending_apply_cb_ = std::move(apply_cb);
+    fan_out_clock_ = fan_out_clock;
+    if (!defer_stage) {
+      FireStage();
+    }
+    if (!defer_apply && stage_ok) {
+      // The sequencer fires the apply at the bend instant: simulate the
+      // timer by advancing the fan-out clock to the bend (+5ms of dispatch
+      // slack) before the result lands.
+      if (fan_out_clock_ != nullptr) {
+        *fan_out_clock_ = t_bend + std::chrono::milliseconds(5);
+      }
+      FireApply();
+    }
+  }
+
+  void FireStage() {
+    ASSERT_TRUE(pending_stage_cb_ != nullptr);
+    stage_results.push_back(stage_status);
+    pending_stage_cb_(stage_status);
+    pending_stage_cb_ = nullptr;
+  }
+
+  void FireApply() {
+    ASSERT_TRUE(pending_apply_cb_ != nullptr);
+    apply_results.push_back(apply_status);
+    pending_apply_cb_(apply_status);
+    pending_apply_cb_ = nullptr;
+  }
+
+  // Config
+  bool defer_stage = false;
+  bool defer_apply = false;
+  bool stage_ok = true;
+  bool apply_ok = true;
+  absl::Status stage_status = absl::OkStatus();
+  absl::Status apply_status = absl::OkStatus();
+  // Recorded
+  std::vector<ApplyRecord> applies;
+  std::vector<absl::Status> stage_results;
+  std::vector<absl::Status> apply_results;
+  int cancel_calls = 0;
+
+private:
+  std::function<void(absl::Status)> pending_stage_cb_;
+  std::function<void(absl::Status)> pending_apply_cb_;
+  Envoy::MonotonicTime* fan_out_clock_ = nullptr;
+};
+
+class LiveCapabilityFanOutTest : public testing::Test {
+public:
+  LiveCapabilityFanOutTest() : fake_now_(std::chrono::steady_clock::now()) {}
+
+  LiveFanOutContext MakeContext() {
+    LiveFanOutContext context;
+    context.now = [this]() { return fake_now_; };
+    context.update_admissible = [this]() { return admission_status_; };
+    context.bend_instant_admissible = [this](Envoy::MonotonicTime) {
+      return bend_admissible_status_;
+    };
+    context.current_phase_index = [this]() { return phase_index_; };
+    context.active_worker_count = [this]() { return static_cast<uint32_t>(workers_.size()); };
+    context.capability_for_phase = [this](int worker_id, uint32_t) -> absl::StatusOr<LiveCapabilityEntry> {
+      if (missing_worker_.has_value() && worker_id == *missing_worker_) {
+        return absl::NotFoundError(
+            absl::StrCat("worker ", worker_id, " has no captured live-update capability"));
+      }
+      LiveCapabilityEntry entry;
+      entry.phase_index = 0;
+      entry.handle = nullptr;
+      FakeFanOutWorker* worker = workers_[worker_id].get();
+      const int recorded_worker_id = worker_id;
+      entry.apply = [worker, recorded_worker_id, this](
+                        Envoy::MonotonicTime t_bend, const std::string& epoch_id,
+                        const LiveKnobDelta& delta,
+                        std::function<void(absl::Status)> stage_cb,
+                        std::function<void(absl::Status)> apply_cb) {
+        post_order_.push_back(recorded_worker_id);
+        worker->Post(t_bend, epoch_id, delta, std::move(stage_cb), std::move(apply_cb),
+                     &fake_now_);
+      };
+      entry.cancel_live_update = [worker]() { worker->cancel_calls++; };
+      return entry;
+    };
+    context.current_phase_schedule = [this]() { return declared_schedule_; };
+    context.fan_out_begin = [this]() {
+      if (!updates_enabled_) {
+        return false;
+      }
+      in_flight_fan_outs_++;
+      return true;
+    };
+    context.fan_out_end = [this]() { in_flight_fan_outs_--; };
+    return context;
+  }
+
+  UpdateRequest RpsRequest(uint32_t rps) {
+    UpdateRequest request;
+    request.add_deltas()->mutable_requests_per_second()->set_value(rps);
+    return request;
+  }
+
+  absl::Time Deadline() const { return absl::Now() + absl::Seconds(1); }
+
+  // Config
+  std::vector<std::unique_ptr<FakeFanOutWorker>> workers_;
+  std::optional<int> missing_worker_;
+  absl::Status admission_status_ = absl::OkStatus();
+  absl::Status bend_admissible_status_ = absl::OkStatus();
+  uint32_t phase_index_ = 0;
+  LiveKnobDelta declared_schedule_;
+  bool updates_enabled_ = true;
+  Envoy::MonotonicTime fake_now_;
+  int in_flight_fan_outs_ = 0;
+
+  // Recorded
+  std::vector<int> post_order_;
+};
+
+// Review Focus 3: the posts go to the ACTIVE workers in worker-id order,
+// every worker sees the SAME agreed bend instant, and the aggregation
+// resolves ONE applied epoch.
+TEST_F(LiveCapabilityFanOutTest, FanOutTargetsActiveWorkersInOrderAtOneInstant) {
+  for (int i = 0; i < 3; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(result.applied()) << result.rejection_reason();
+  EXPECT_EQ(result.epoch_id(), "epoch-1");
+  // The ack carries the bend instant's engine pair (8.5): the monotonic
+  // stamp IS the agreed instant; the wall stamp follows by the lead.
+  const int64_t t_bend_ns = bend_instant.monotonic_ns + kLiveUpdateBendLead.count();
+  EXPECT_EQ(result.monotonic_ns(), t_bend_ns);
+  EXPECT_EQ(result.wall_time_unix_ns(), bend_instant.wall_time_unix_ns + kLiveUpdateBendLead.count());
+
+  // Worker-id-ordered posts, one per worker, one shared t_bend.
+  ASSERT_EQ(post_order_.size(), 3u);
+  EXPECT_EQ(post_order_, (std::vector<int>{0, 1, 2}));
+  for (const std::unique_ptr<FakeFanOutWorker>& worker : workers_) {
+    ASSERT_EQ(worker->applies.size(), 1u);
+    EXPECT_EQ(worker->applies[0].epoch_id, "epoch-1");
+    EXPECT_EQ(worker->applies[0].t_bend.time_since_epoch().count(), t_bend_ns);
+    ASSERT_EQ(worker->applies[0].delta.new_rps.has_value(), true);
+    EXPECT_EQ(*worker->applies[0].delta.new_rps, 20u);
+    EXPECT_EQ(worker->cancel_calls, 0);
+  }
+}
+
+// The staging-confirm ruling (the PRIMARY failure path): a worker that
+// cannot stage fails the update with nothing applied anywhere -- the workers
+// that staged OK get their armed bends cancelled, and no apply ever fires.
+TEST_F(LiveCapabilityFanOutTest, StagingFailureLeavesNothingApplied) {
+  for (int i = 0; i < 3; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+    // The applies are deferred on every worker: in the real engine the bend
+    // timer fires at t_bend, and a staged bend that gets cancelled must
+    // never reach that fire. The fakes therefore keep their applies unfired
+    // unless the test releases them.
+    workers_.back()->defer_apply = true;
+  }
+  workers_[1]->stage_ok = false;
+  workers_[1]->stage_status = absl::InvalidArgumentError(
+      "a live-update bend is already pending for this worker; bends are not queued");
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("worker 1"));
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("bends are not queued"));
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("nothing was applied"));
+  // The staged workers' bends were cancelled; no apply ever fired anywhere.
+  EXPECT_EQ(workers_[0]->cancel_calls, 1);
+  EXPECT_EQ(workers_[2]->cancel_calls, 1);
+  EXPECT_EQ(workers_[1]->cancel_calls, 1);
+  for (const std::unique_ptr<FakeFanOutWorker>& worker : workers_) {
+    EXPECT_TRUE(worker->apply_results.empty()) << "nothing may apply after a staging failure";
+  }
+}
+
+// The residual post-bend failure path: one worker's apply fails AT the bend;
+// every worker that DID apply is rolled back by a re-anchored re-apply of
+// the PRIOR schedule AT THE ROLLBACK INSTANT t_r (Q7's ratified form: t_r is
+// the failure handling instant, strictly after t_bend -- never a naive
+// re-apply at t_bend), carrying the PRIOR epoch id; the ack reports
+// applied=false with the reason, and the failed worker (never mutated) is
+// not posted.
+TEST_F(LiveCapabilityFanOutTest, PartialFanOutRollsBackHonestlyAtTR) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  declared_schedule_.new_rps = 10; // the phase's declared schedule
+  workers_[1]->apply_ok = false;
+  workers_[1]->apply_status = absl::InternalError("limiter cannot honor the delta");
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("worker 1"));
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("limiter cannot honor the delta"));
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("rolled back"));
+
+  // Worker 0: forward apply at the shared t_bend, then the rollback re-apply
+  // at a strictly later rollback instant, restoring the PRIOR schedule and
+  // the PRIOR (empty) epoch id.
+  ASSERT_EQ(workers_[0]->applies.size(), 2u);
+  const int64_t t_bend_ns = bend_instant.monotonic_ns + kLiveUpdateBendLead.count();
+  EXPECT_EQ(workers_[0]->applies[0].t_bend.time_since_epoch().count(), t_bend_ns);
+  const FakeFanOutWorker::ApplyRecord& rollback = workers_[0]->applies[1];
+  EXPECT_GT(rollback.t_bend.time_since_epoch().count(), t_bend_ns)
+      << "the rollback re-apply must run at t_r > t_bend, never a naive re-apply at the bend";
+  ASSERT_TRUE(rollback.delta.new_rps.has_value());
+  EXPECT_EQ(*rollback.delta.new_rps, 10u) << "the PRIOR schedule is restored";
+  EXPECT_EQ(rollback.epoch_id, "") << "the prior (empty) epoch id is restored";
+
+  // Worker 1 never applied: no rollback post (it is already on the prior
+  // schedule), and no staged bend to cancel.
+  EXPECT_EQ(workers_[1]->applies.size(), 1u);
+  EXPECT_EQ(workers_[1]->cancel_calls, 0);
+}
+
+// Sequential bends: a second applied bend updates the rollback prior-state,
+// and a failure of the second bend rolls back to the FIRST bend's schedule
+// and epoch -- the tracker follows the applied history, per phase.
+TEST_F(LiveCapabilityFanOutTest, SequentialBendsRollBackToPreviousScheduleAndEpoch) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  declared_schedule_.new_rps = 10;
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult first = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(first.applied()) << first.rejection_reason();
+
+  // The second bend fails on worker 1 at its bend instant.
+  workers_[1]->apply_ok = false;
+  workers_[1]->apply_status = absl::InternalError("boom");
+  const EngineInstant second_instant{2000, fake_now_.time_since_epoch().count() + 1000000000};
+  const UpdateResult second =
+      applier.ApplyDeltas(RpsRequest(30), "epoch-2", second_instant, Deadline());
+  ASSERT_FALSE(second.applied());
+  // The rollback restores the FIRST bend's state: schedule 20, epoch-1.
+  ASSERT_EQ(workers_[0]->applies.size(), 3u);
+  const FakeFanOutWorker::ApplyRecord& rollback = workers_[0]->applies[2];
+  EXPECT_EQ(rollback.epoch_id, "epoch-1");
+  EXPECT_EQ(*rollback.delta.new_rps, 20u);
+}
+
+// The rollback prior-state for a MIXED applied bend carries the full prior
+// schedule: the changed knob's prior value AND the untouched knob's
+// (tracker-preserved) value.
+TEST_F(LiveCapabilityFanOutTest, MixedBendRollbackCarriesFullPriorSchedule) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  // A plugin-style declared schedule: ramp time 1s, target 100.
+  RampShapeChange declared_ramp;
+  declared_ramp.ramp_time = std::chrono::seconds(1);
+  declared_ramp.target_rps = 100;
+  declared_schedule_.ramp = declared_ramp;
+
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  // Apply a mixed bend {new_rps: 20, ramp: {target_rps: 90}} -- succeeds.
+  UpdateRequest mixed;
+  mixed.add_deltas()->mutable_requests_per_second()->set_value(20);
+  mixed.add_deltas()->mutable_ramp()->mutable_target_rps()->set_value(90);
+  const UpdateResult first = applier.ApplyDeltas(mixed, "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(first.applied()) << first.rejection_reason();
+
+  // A follow-up rps-only bend fails post-bend ON WORKER 0 (worker 1 applies
+  // it and is rolled back too); the rollback must restore the FULL prior
+  // schedule: rps 20 AND the ramp {target 90, ramp time 1s preserved through
+  // the applied bend}.
+  workers_[0]->apply_ok = false;
+  workers_[0]->apply_status = absl::InternalError("boom");
+  const UpdateResult second = applier.ApplyDeltas(RpsRequest(30), "epoch-2", bend_instant, Deadline());
+  ASSERT_FALSE(second.applied());
+  // Worker 0: mixed forward apply, failed forward apply -- and NO rollback
+  // post (it never mutated, so it is already on the prior schedule).
+  ASSERT_EQ(workers_[0]->applies.size(), 2u);
+  // Worker 1 applied both bends: mixed forward, rps forward, rollback
+  // re-apply -- the rollback must carry the FULL prior schedule.
+  ASSERT_EQ(workers_[1]->applies.size(), 3u);
+  const FakeFanOutWorker::ApplyRecord& rollback = workers_[1]->applies[2];
+  ASSERT_TRUE(rollback.delta.new_rps.has_value());
+  EXPECT_EQ(*rollback.delta.new_rps, 20u);
+  ASSERT_TRUE(rollback.delta.ramp.has_value());
+  ASSERT_TRUE(rollback.delta.ramp->target_rps.has_value());
+  EXPECT_EQ(*rollback.delta.ramp->target_rps, 90u);
+  ASSERT_TRUE(rollback.delta.ramp->ramp_time.has_value());
+  EXPECT_EQ(*rollback.delta.ramp->ramp_time, std::chrono::seconds(1));
+}
+
+// The honest no-handle case (the M2 registry ruling): a stale/missing
+// capability fails the update at LOOKUP, before any post.
+TEST_F(LiveCapabilityFanOutTest, FanOutToWorkerWithoutCurrentPhaseHandleFailsHonestly) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  missing_worker_ = 1;
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("worker 1"));
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("no captured live-update capability"));
+  EXPECT_TRUE(post_order_.empty()) << "a lookup failure must fail the fan-out before any post";
+}
+
+// A bend instant that would land past the current phase's end is rejected
+// pre-fan-out.
+TEST_F(LiveCapabilityFanOutTest, BendInstantPastPhaseEndRejected) {
+  workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  bend_admissible_status_ = absl::FailedPreconditionError(
+      "the bend instant would land 300ms past the current phase's end; a bend "
+      "is never applied across a phase boundary");
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("past the current phase's end"));
+  EXPECT_TRUE(post_order_.empty());
+}
+
+// An update arriving inside the boundary-drain window is rejected with a
+// clear reason, pre-fan-out.
+TEST_F(LiveCapabilityFanOutTest, UpdateDuringBoundaryDrainRejected) {
+  workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  admission_status_ = absl::FailedPreconditionError(
+      "the run is inside a phase boundary drain; live updates are rejected "
+      "there");
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("boundary drain"));
+  EXPECT_TRUE(post_order_.empty());
+}
+
+// Task 4 Q4's ruling enforced at the fan-out: a second update arriving
+// before the first resolves is rejected, never queued.
+TEST_F(LiveCapabilityFanOutTest, SecondUpdateWhileInFlightRejectedNotQueued) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  workers_[0]->defer_apply = true;
+  workers_[1]->defer_apply = true;
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+
+  // The first update stalls in its apply wait (deferred callbacks).
+  std::atomic<bool> first_done{false};
+  UpdateResult first_result;
+  std::thread first_thread([&]() {
+    first_result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+    first_done = true;
+  });
+  // Wait for the first fan-out to be registered and staged.
+  for (int i = 0; i < 500 && workers_[1]->applies.empty(); i++) {
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_FALSE(first_done.load());
+
+  // The second update while the first is in flight: honest rejection, and
+  // no NEW post to any worker.
+  const size_t posts_before = post_order_.size();
+  const UpdateResult second =
+      applier.ApplyDeltas(RpsRequest(30), "epoch-2", bend_instant, Deadline());
+  ASSERT_FALSE(second.applied());
+  EXPECT_THAT(second.rejection_reason(), HasSubstr("bends are not queued"));
+  EXPECT_EQ(post_order_.size(), posts_before)
+      << "the rejected second update must not have posted to any worker";
+
+  // Release the first: its staged bends resolve through the deadline path --
+  // the deferred applies fire here, completing the first update applied.
+  workers_[0]->FireApply();
+  workers_[1]->FireApply();
+  first_thread.join();
+  EXPECT_TRUE(first_result.applied()) << first_result.rejection_reason();
+}
+
+// The shutdown fence: once the fence refuses, the update resolves honestly
+// with no post to any worker.
+TEST_F(LiveCapabilityFanOutTest, FanOutRefusedWhenUpdatesDisabled) {
+  workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  updates_enabled_ = false;
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("shutting down"));
+  EXPECT_TRUE(post_order_.empty());
+  EXPECT_EQ(in_flight_fan_outs_, 0) << "the fence registration must always pair";
 }
 
 } // namespace

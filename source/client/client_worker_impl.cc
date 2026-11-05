@@ -29,7 +29,7 @@ ClientWorkerImpl::ClientWorkerImpl(
         live_snapshot_partial_cb,
     std::chrono::milliseconds live_snapshot_interval, bool phase_driven_run,
     std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
-                       Nighthawk::LiveApplyFn)>
+                       Nighthawk::LiveApplyFn, std::function<void()>)>
         live_capability_cb)
     : WorkerImpl(api, tls, store), api_(api),
       time_source_(std::make_unique<CachedTimeSourceImpl>(*dispatcher_)),
@@ -63,16 +63,40 @@ ClientWorkerImpl::ClientWorkerImpl(
         *time_source_, *dispatcher_, sequencer_target_,
         termination_predicate_factory_.create(*time_source_, *worker_number_scope_, starting_time),
         *worker_number_scope_, starting_time, api, std::nullopt, &captured_live_tunable);
-    SequencerImpl& sequencer_impl = static_cast<SequencerImpl&>(*sequencer);
+    // The production factory only ever produces SequencerImpl; a checked
+    // cast keeps that invariant load-bearing instead of silently mis-casting
+    // (the T3-review UB note). A non-SequencerImpl sequencer (only possible
+    // through a test mock) publishes NO capability: a live update then fails
+    // honestly at the registry lookup, never through a mistyped handle.
+    auto* sequencer_impl = dynamic_cast<SequencerImpl*>(sequencer.get());
     phase_ = std::make_unique<PhaseImpl>("main", std::move(sequencer), /*measure=*/true);
-    if (live_capability_cb_) {
-      SequencerImpl* sequencer_ptr = &sequencer_impl;
+    if (sequencer_impl == nullptr) {
+      ENVOY_LOG(warn,
+                "worker {}: the legacy sequencer carries no live-update "
+                "capability (not a SequencerImpl)",
+                worker_number_);
+    } else if (live_capability_cb_) {
+      SequencerImpl* sequencer_ptr = sequencer_impl;
       live_capability_cb_(
           0, captured_live_tunable,
-          [sequencer_ptr](Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
-                          std::function<void(absl::Status)> callback) {
-            sequencer_ptr->applyLiveUpdate(t_bend, delta, std::move(callback));
-          });
+          [this, sequencer_ptr](Envoy::MonotonicTime t_bend, const std::string& epoch_id,
+                                const LiveKnobDelta& delta,
+                                std::function<void(absl::Status)> stage_callback,
+                                std::function<void(absl::Status)> apply_callback) {
+            sequencer_ptr->applyLiveUpdate(
+                t_bend, delta, std::move(stage_callback),
+                [this, epoch_id, apply_callback = std::move(apply_callback)](absl::Status status) {
+                  if (status.ok()) {
+                    // On this dispatcher: the stamp is serialized with the
+                    // bend apply and with the live partial computation (a
+                    // rollback re-apply carries the PRIOR epoch id and
+                    // restores it here the same way).
+                    current_epoch_id_ = epoch_id;
+                  }
+                  apply_callback(status);
+                });
+          },
+          [sequencer_ptr]() { sequencer_ptr->cancelPendingLiveUpdate(); });
     }
   }
 }
@@ -182,6 +206,11 @@ void ClientWorkerImpl::emitLiveSnapshotPartial() {
   // statistics across different stamps (snapshot-acquisition-vs-slab-swap
   // seam, M2 A1).
   partial.set_phase_id(benchmark_client_->currentPhaseId());
+  // FORK-ONLY (We-Amp): M3 Task 6 -- stamp the knob epoch current on this
+  // worker (set by this dispatcher's apply callbacks, so the stamp is
+  // serialized with the bend: a partial computed within the bend lead window
+  // carries the OUTGOING epoch). Empty until the run's first applied change.
+  partial.set_epoch_id(current_epoch_id_);
   // These statistics are confined to this worker's thread; we are running on
   // that very dispatcher, so reading them here is race-free without locking.
   for (const auto& statistic : statistics()) {
@@ -332,15 +361,33 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
                                 std::move(termination_predicate), *worker_number_scope_,
                                 phase_start, api_, phase_spec.requests_per_second(),
                                 &captured_live_tunable);
-  SequencerImpl& sequencer_impl = static_cast<SequencerImpl&>(*sequencer);
+  // The factory only ever produces SequencerImpl; assert rather than
+  // blind-cast (the T3-review UB note, same as the legacy branch above).
+  auto* sequencer_impl = dynamic_cast<SequencerImpl*>(sequencer.get());
+  RELEASE_ASSERT(sequencer_impl != nullptr,
+                 "the sequencer factory only produces SequencerImpl instances");
   if (live_capability_cb_) {
-    SequencerImpl* sequencer_ptr = &sequencer_impl;
+    SequencerImpl* sequencer_ptr = sequencer_impl;
     live_capability_cb_(
         phase_index, captured_live_tunable,
-        [sequencer_ptr](Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
-                        std::function<void(absl::Status)> callback) {
-          sequencer_ptr->applyLiveUpdate(t_bend, delta, std::move(callback));
-        });
+        [this, sequencer_ptr](Envoy::MonotonicTime t_bend, const std::string& epoch_id,
+                              const LiveKnobDelta& delta,
+                              std::function<void(absl::Status)> stage_callback,
+                              std::function<void(absl::Status)> apply_callback) {
+          sequencer_ptr->applyLiveUpdate(
+              t_bend, delta, std::move(stage_callback),
+              [this, epoch_id, apply_callback = std::move(apply_callback)](absl::Status status) {
+                if (status.ok()) {
+                  // On this dispatcher: the stamp is serialized with the
+                  // bend apply and with the live partial computation (a
+                  // rollback re-apply carries the PRIOR epoch id and
+                  // restores it here the same way).
+                  current_epoch_id_ = epoch_id;
+                }
+                apply_callback(status);
+              });
+        },
+        [sequencer_ptr]() { sequencer_ptr->cancelPendingLiveUpdate(); });
   }
   // The sequencer factory only ever produces SequencerImpl instances; the
   // multi-phase stop-mode surface is SequencerImpl-only (the Sequencer
@@ -349,7 +396,7 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
       std::make_unique<PhaseImpl>(phase_spec.name(), std::move(sequencer), /*measure=*/true);
   current_phase_ = phase.get();
   phases_history_.push_back(std::move(phase));
-  phase_statistics_.push_back(sequencer_impl.statistics());
+  phase_statistics_.push_back(sequencer_impl->statistics());
   // The per-phase vectors are POSITIONAL over the phases this worker began
   // (a removed-and-rejoined worker begins a non-contiguous set, M2 Task 6);
   // the process maps positions to phase indexes via its own begin
@@ -357,8 +404,8 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   // index.
   const size_t duration_slot = phase_execution_durations_.size();
   phase_execution_durations_.push_back(0);
-  sequencer_impl.setExitDispatcherOnStop(final_phase);
-  sequencer_impl.setStopHook([this, final_phase, duration_slot](bool /*timed_out*/) {
+  sequencer_impl->setExitDispatcherOnStop(final_phase);
+  sequencer_impl->setStopHook([this, final_phase, duration_slot](bool /*timed_out*/) {
     // On this dispatcher, inside the sequencer's stop.
     dispatcher_->updateApproximateMonotonicTime();
     phase_execution_durations_[duration_slot] =
@@ -367,6 +414,14 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
       // The final phase keeps today's exact behavior: the dispatcher exits
       // and work()'s event loop returns into the worker teardown.
       return;
+    }
+    // FORK-ONLY (We-Amp): M3 Task 6 -- the boundary begins HERE (a
+    // termination predicate can end the phase before its nominal duration,
+    // so the orchestrator cannot time the drain window itself): open the
+    // process's boundary-drain live-update gate before the drain watch
+    // starts.
+    if (sequencer_stop_observer_ != nullptr) {
+      sequencer_stop_observer_();
     }
     startDrainWatch(time_source_->monotonicTime().time_since_epoch().count());
   });
@@ -378,7 +433,7 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   // On this dispatcher, so the swap is serialized with request starts,
   // completions and live partials.
   benchmark_client_->beginPhaseStatistics(phase_spec.name());
-  sequencer_impl.start();
+  sequencer_impl->start();
 
 }
 

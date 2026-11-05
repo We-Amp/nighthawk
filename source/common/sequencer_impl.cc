@@ -205,18 +205,30 @@ absl::Status ApplyLiveKnobDelta(LiveTunableRateLimiter* limiter, const Envoy::Mo
 
 void SequencerImpl::applyLiveUpdate(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                                     std::function<void(absl::Status)> callback) {
-  dispatcher_.post([this, t_bend, delta, callback = std::move(callback)]() {
-    applyLiveUpdateOnDispatcherThread(t_bend, delta, std::move(callback));
+  applyLiveUpdate(t_bend, delta, [](absl::Status) {}, std::move(callback));
+}
+
+void SequencerImpl::applyLiveUpdate(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
+                                    std::function<void(absl::Status)> stage_callback,
+                                    std::function<void(absl::Status)> callback) {
+  dispatcher_.post([this, t_bend, delta, stage_callback = std::move(stage_callback),
+                    callback = std::move(callback)]() {
+    applyLiveUpdateOnDispatcherThread(t_bend, delta, std::move(stage_callback),
+                                      std::move(callback));
   });
 }
 
 void SequencerImpl::applyLiveUpdateOnDispatcherThread(
     Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
+    std::function<void(absl::Status)> stage_callback,
     std::function<void(absl::Status)> callback) {
   if (live_tunable_rate_limiter_ == nullptr) {
-    callback(absl::InternalError(
+    const absl::Status no_handle = absl::InternalError(
         "this worker's current phase has no captured live-update capability "
-        "(no live-tunable rate limiter handle)"));
+        "(no live-tunable rate limiter handle)");
+    // Nothing was armed, nothing will ever apply: both callbacks resolve.
+    stage_callback(no_handle);
+    callback(no_handle);
     return;
   }
   const Envoy::MonotonicTime now = time_source_.monotonicTime();
@@ -234,8 +246,12 @@ void SequencerImpl::applyLiveUpdateOnDispatcherThread(
     // the timer is never destroyed inside its own firing callback
     // (use-after-free).
     if (bend_timer_pending_) {
-      callback(absl::InvalidArgumentError(
-          "a live-update bend is already pending for this worker; bends are not queued"));
+      // Nothing armed, nothing will ever apply: both callbacks resolve (the
+      // Task-3-era callers only ever consumed the apply callback's result).
+      const absl::Status not_queued = absl::InvalidArgumentError(
+          "a live-update bend is already pending for this worker; bends are not queued");
+      stage_callback(not_queued);
+      callback(not_queued);
       return;
     }
     if (live_update_timer_ == nullptr) {
@@ -247,9 +263,36 @@ void SequencerImpl::applyLiveUpdateOnDispatcherThread(
     bend_timer_pending_ = true;
     live_update_timer_->enableHRTimer(
         std::chrono::duration_cast<std::chrono::milliseconds>(t_bend - now));
+    // Staging confirm (Task 6): armed and able to honor the delta -- before
+    // t_bend. The bend itself stays pending; a staged bend whose fan-out
+    // fails elsewhere is cancelled via cancelPendingLiveUpdate().
+    stage_callback(absl::OkStatus());
     return;
   }
-  callback(ApplyLiveKnobDelta(live_tunable_rate_limiter_, t_bend, delta));
+  // At-or-past bend (within the dispatch grace): staging and apply collapse
+  // into the immediate apply -- the stage result IS the apply result.
+  const absl::Status status = ApplyLiveKnobDelta(live_tunable_rate_limiter_, t_bend, delta);
+  stage_callback(status);
+  callback(status);
+}
+
+void SequencerImpl::cancelPendingLiveUpdate() {
+  dispatcher_.post([this]() {
+    if (!bend_timer_pending_) {
+      return;
+    }
+    bend_timer_pending_ = false;
+    if (live_update_timer_ != nullptr) {
+      live_update_timer_->disableTimer();
+    }
+    auto callback = std::move(pending_bend_callback_);
+    pending_bend_callback_ = nullptr;
+    pending_bend_delta_ = LiveKnobDelta{};
+    if (callback != nullptr) {
+      callback(absl::CancelledError("the staged live-update bend was cancelled before the "
+                                    "bend instant; nothing was applied"));
+    }
+  });
 }
 
 void SequencerImpl::firePendingBend() {
@@ -258,6 +301,7 @@ void SequencerImpl::firePendingBend() {
   const LiveKnobDelta delta = pending_bend_delta_;
   auto callback = std::move(pending_bend_callback_);
   pending_bend_callback_ = nullptr;
+  pending_bend_delta_ = LiveKnobDelta{};
   callback(ApplyLiveKnobDelta(live_tunable_rate_limiter_, t_bend, delta));
 }
 

@@ -1,5 +1,7 @@
 #include "source/client/process_impl.h"
 
+#include "api/rate_limiter/linear_ramping_rate_limiter.pb.h"
+
 #include <sys/file.h>
 
 #include <algorithm>
@@ -729,6 +731,11 @@ ProcessImpl::~ProcessImpl() {
 }
 
 void ProcessImpl::shutdown() {
+  // FORK-ONLY (We-Amp): M3 Task 6 -- no capability apply may be posted to a
+  // dispatcher that is about to go away: disable new fan-outs, drain the
+  // in-flight ones (bounded), and clear the registry before the workers are
+  // destroyed (the registry-outlives-sequencer ruling).
+  drainLiveUpdateFanOuts();
   if (encap_runner_ != nullptr) {
     auto status = encap_runner_->TerminateEncapSubProcess();
     if (status != absl::OkStatus()) {
@@ -810,6 +817,14 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
   // main-sequencer capability is recorded by the worker constructor itself);
   // phase-driven runs re-stamp at every begin-phase.
   live_capability_registry_.Reset();
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out's run-state seed: a legacy
+  // run's single "phase" is index 0 with the full fleet active; a
+  // phase-driven run overwrites both at every begin-phase (runPhases).
+  {
+    std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+    current_phase_index_ = 0;
+    active_worker_count_ = concurrency;
+  }
   const Envoy::MonotonicTime first_worker_start =
       computeFirstWorkerStart(time_system_, scheduled_start, concurrency);
   const std::chrono::nanoseconds inter_worker_delay =
@@ -844,8 +859,10 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
     // begin-phase (and once for a legacy run's main sequencer).
     auto live_capability_cb = [this,
                                worker_number](uint32_t phase_index, LiveTunableRateLimiter* handle,
-                                              LiveApplyFn apply) {
-      live_capability_registry_.Record(worker_number, phase_index, handle, std::move(apply));
+                                              LiveApplyFn apply,
+                                              std::function<void()> cancel_live_update) {
+      live_capability_registry_.Record(worker_number, phase_index, handle, std::move(apply),
+                                       std::move(cancel_live_update));
     };
     workers_.push_back(std::make_unique<ClientWorkerImpl>(
         *api_, tls_, cluster_manager_, benchmark_client_factory_, termination_predicate_factory_,
@@ -855,6 +872,12 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
                                 : ClientWorkerImpl::HardCodedWarmupStyle::OFF,
         std::move(*plugins), live_partial_cb, live_snapshot_interval,
         /*phase_driven_run=*/options_.hasPhaseVector(), std::move(live_capability_cb)));
+    // FORK-ONLY (We-Amp): M3 Task 6 -- the worker opens the boundary-drain
+    // live-update gate when its non-final sequencer stops (the boundary
+    // begins); runPhases closes the gate when the drain is collected. Set
+    // before the worker thread starts.
+    workers_.back()->setSequencerStopObserver(
+        [this]() { setBoundaryDrainInProgress(true); });
     if (options_.hasPhaseVector()) {
       // FORK-ONLY (We-Amp): the phase orchestrator waits on these before
       // posting the first begin-phase: begin-phase must not land while a
@@ -879,9 +902,11 @@ void ProcessImpl::recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapsho
 // mutex is the only cross-thread surface and is never held while doing
 // engine work.
 void LiveCapabilityRegistry::Record(int worker_id, uint32_t phase_index,
-                                    LiveTunableRateLimiter* handle, LiveApplyFn apply) {
+                                    LiveTunableRateLimiter* handle, LiveApplyFn apply,
+                                    std::function<void()> cancel_live_update) {
   std::lock_guard<std::mutex> lock(mutex_);
-  entries_[worker_id] = LiveCapabilityEntry{phase_index, handle, std::move(apply)};
+  entries_[worker_id] =
+      LiveCapabilityEntry{phase_index, handle, std::move(apply), std::move(cancel_live_update)};
 }
 
 absl::StatusOr<LiveCapabilityEntry>
@@ -906,6 +931,380 @@ LiveCapabilityRegistry::CapabilityForPhase(int worker_id, uint32_t phase_index) 
 void LiveCapabilityRegistry::Reset() {
   std::lock_guard<std::mutex> lock(mutex_);
   entries_.clear();
+}
+
+namespace {
+
+// FORK-ONLY (We-Amp): M3 Task 6, see process_impl.h. The deadline reserve
+// held back for the residual rollback path: the forward waits never run past
+// deadline - reserve, so the rollback (the honest completion of a
+// partially-applied update) fits inside the applier deadline the orchestrator
+// bounds its join with.
+constexpr absl::Duration kLiveUpdateRollbackReserve = absl::Seconds(2);
+
+// The shutdown fence drain bound: an in-flight fan-out is bounded by the
+// orchestrator's ack-wait deadline (its applier contract); the fence waits
+// that long plus slack before proceeding with worker teardown anyway (and
+// says so).
+constexpr absl::Duration kLiveUpdateFenceDrainBound = absl::Seconds(8);
+
+} // namespace
+
+LiveCapabilityFanOutApplier::LiveCapabilityFanOutApplier(LiveFanOutContext context)
+    : context_(std::move(context)) {}
+
+bool LiveCapabilityFanOutApplier::StageOutcomesComplete() {
+  return stage_outcomes_.size() >= expected_workers_;
+}
+
+bool LiveCapabilityFanOutApplier::ApplyOutcomesComplete() {
+  return apply_outcomes_.size() >= expected_workers_;
+}
+
+LiveKnobDelta LiveCapabilityFanOutApplier::NormalizeDelta(
+    const nighthawk::client::UpdateRequest& request) {
+  // The Task-2 whitelist validator ran in front of this and guarantees: at
+  // least one knob, no duplicate knob, invariants satisfied.
+  LiveKnobDelta delta;
+  for (const nighthawk::client::KnobDelta& knob : request.deltas()) {
+    if (knob.has_requests_per_second()) {
+      delta.new_rps = knob.requests_per_second().value();
+    } else if (knob.has_ramp()) {
+      RampShapeChange change;
+      if (knob.ramp().has_ramp_time()) {
+        change.ramp_time = std::chrono::nanoseconds(knob.ramp().ramp_time().seconds()) +
+                           std::chrono::nanoseconds(knob.ramp().ramp_time().nanos());
+      }
+      if (knob.ramp().has_target_rps()) {
+        change.target_rps = knob.ramp().target_rps().value();
+      }
+      delta.ramp = change;
+    }
+  }
+  return delta;
+}
+
+void LiveCapabilityFanOutApplier::RecordStageOutcome(int worker_id, absl::Status status) {
+  absl::MutexLock lock(&mutex_);
+  stage_outcomes_.push_back({worker_id, std::move(status)});
+}
+
+void LiveCapabilityFanOutApplier::RecordApplyOutcome(int worker_id, absl::Status status) {
+  absl::MutexLock lock(&mutex_);
+  apply_outcomes_.push_back({worker_id, std::move(status)});
+}
+
+nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
+    const nighthawk::client::UpdateRequest& request, const std::string& epoch_id,
+    const EngineInstant& bend_instant, absl::Time deadline) {
+  nighthawk::client::UpdateResult result;
+  result.set_applied(false);
+  const auto reject = [&result](absl::string_view reason) {
+    result.set_rejection_reason(std::string(reason));
+    ENVOY_LOG(debug, "live update rejected: {}", reason);
+    return result;
+  };
+
+  // One bend at a time (Task 4 Q4's ruling, enforced at the fan-out): a
+  // second update arriving before the first resolves is rejected, never
+  // queued.
+  {
+    absl::MutexLock lock(&mutex_);
+    if (apply_in_progress_) {
+      return reject("another live update is still being applied; bends are not queued");
+    }
+    apply_in_progress_ = true;
+  }
+  struct InProgressGuard {
+    ~InProgressGuard() {
+      absl::MutexLock lock(&applier->mutex_);
+      applier->apply_in_progress_ = false;
+    }
+    LiveCapabilityFanOutApplier* applier;
+  } in_progress_guard{this};
+
+  // The shutdown fence: past this point every exit path releases the
+  // registration.
+  if (!context_.fan_out_begin()) {
+    return reject("the benchmark run is shutting down; live updates are no longer accepted");
+  }
+  struct FanOutScope {
+    ~FanOutScope() { end(); }
+    std::function<void()> end;
+  } fan_out_scope{context_.fan_out_end};
+
+  // Gate 1: admissibility (boundary drain in progress, no active workers,
+  // run teardown).
+  if (absl::Status admissible = context_.update_admissible(); !admissible.ok()) {
+    return reject(admissible.message());
+  }
+
+  // Gate 2: the bend instant must land inside the current phase's remaining
+  // duration (phase-vector runs) or the run's remaining duration (legacy
+  // runs) -- a bend landing past the boundary is undefined and rejected
+  // BEFORE any fan-out.
+  const Envoy::MonotonicTime t_bend =
+      Envoy::MonotonicTime(std::chrono::nanoseconds(bend_instant.monotonic_ns) +
+                           kLiveUpdateBendLead);
+  if (absl::Status bend_ok = context_.bend_instant_admissible(t_bend); !bend_ok.ok()) {
+    return reject(bend_ok.message());
+  }
+
+  // The normalized delta set and the rollback prior-state tracker (reset
+  // when the phase moved: fresh limiters per phase mean the prior schedule
+  // is the new phase's declared one).
+  const LiveKnobDelta delta = NormalizeDelta(request);
+  const uint32_t phase_index = context_.current_phase_index();
+  {
+    absl::MutexLock lock(&mutex_);
+    if (!schedule_initialized_ || phase_index != tracked_phase_index_) {
+      tracked_phase_index_ = phase_index;
+      tracked_schedule_ = context_.current_phase_schedule();
+      schedule_initialized_ = true;
+    }
+  }
+
+  // Staging, part 1 -- lookups in worker-id order over the ACTIVE subset
+  // only. Any lookup failure (worker never began a phase, stale
+  // pre-boundary stamp, retired worker) fails the update honestly before a
+  // single post: never a silent skip, never a mutation through a dead
+  // handle.
+  const uint32_t active_workers = context_.active_worker_count();
+  std::vector<LiveCapabilityEntry> entries;
+  entries.reserve(active_workers);
+  for (uint32_t worker_id = 0; worker_id < active_workers; ++worker_id) {
+    absl::StatusOr<LiveCapabilityEntry> entry_or =
+        context_.capability_for_phase(worker_id, phase_index);
+    if (!entry_or.ok()) {
+      return reject(
+          absl::StrCat("worker ", worker_id, " cannot accept the live update: ",
+                       entry_or.status().message()));
+    }
+    entries.push_back(*std::move(entry_or));
+  }
+
+  // Staging, part 2 -- the arming posts, in worker-id order (the defined
+  // fan-out ordering). stage_callback fires on the worker dispatcher BEFORE
+  // t_bend with the arming result; apply_callback fires at/after t_bend.
+  size_t expected = 0;
+  {
+    absl::MutexLock lock(&mutex_);
+    stage_outcomes_.clear();
+    apply_outcomes_.clear();
+    expected_workers_ = active_workers;
+    expected = expected_workers_;
+  }
+  const auto stage_cb = [this](int worker_id) {
+    return [this, worker_id](absl::Status status) { RecordStageOutcome(worker_id, status); };
+  };
+  const auto apply_cb = [this](int worker_id) {
+    return [this, worker_id](absl::Status status) { RecordApplyOutcome(worker_id, status); };
+  };
+  for (uint32_t worker_id = 0; worker_id < active_workers; ++worker_id) {
+    entries[worker_id].apply(t_bend, epoch_id, delta, stage_cb(worker_id), apply_cb(worker_id));
+  }
+
+  // Deadline budget: the forward waits hold back a reserve for the residual
+  // rollback path, so the honest completion of a partially-applied update
+  // still fits inside the applier deadline the orchestrator bounds its join
+  // with.
+  const absl::Duration remaining = deadline - absl::Now();
+  if (remaining <= absl::ZeroDuration()) {
+    return reject("the live-update deadline has already passed before staging began");
+  }
+  const absl::Duration reserve = std::min(kLiveUpdateRollbackReserve, remaining / 3);
+  const absl::Time apply_deadline = deadline - reserve;
+  // The staging wait must complete strictly before the bend instant (minus
+  // the dispatch grace): a staged bend can only be cancelled honestly while
+  // it has not fired.
+  const Envoy::MonotonicTime now_mono = context_.now();
+  const auto until_bend_grace = (t_bend - kLiveUpdateBendGrace) - now_mono;
+  const absl::Time stage_deadline =
+      std::min(apply_deadline,
+               absl::Now() + absl::FromChrono(until_bend_grace) - absl::Milliseconds(20));
+
+  const auto cancel_everything_staged = [&entries]() {
+    for (const LiveCapabilityEntry& entry : entries) {
+      if (entry.cancel_live_update != nullptr) {
+        entry.cancel_live_update();
+      }
+    }
+  };
+
+  // Staging wait (the PRIMARY failure path): bounded strictly before the
+  // bend instant.
+  {
+    mutex_.Lock();
+    mutex_.AwaitWithDeadline(absl::Condition(this, &LiveCapabilityFanOutApplier::StageOutcomesComplete),
+                             stage_deadline);
+    const bool staging_complete = stage_outcomes_.size() >= expected_workers_;
+    const WorkerOutcome* stage_failure = nullptr;
+    if (staging_complete) {
+      for (const WorkerOutcome& outcome : stage_outcomes_) {
+        if (!outcome.status.ok()) {
+          stage_failure = &outcome;
+          break;
+        }
+      }
+    }
+    const WorkerOutcome failure_copy =
+        stage_failure != nullptr ? *stage_failure : WorkerOutcome{0, absl::OkStatus()};
+    mutex_.Unlock();
+    if (stage_failure != nullptr || !staging_complete) {
+      // A worker failed staging (or did not confirm in time): cancel every
+      // staged bend -- including the ones armed on workers that staged OK --
+      // BEFORE the bend instant, so nothing is applied anywhere. The
+      // limiter was never touched (arming is not applying).
+      cancel_everything_staged();
+      if (!staging_complete) {
+        return reject(absl::StrCat("staging did not confirm on all ", expected,
+                                   " active worker(s) before the bend instant; the staged bends "
+                                   "were cancelled and nothing was applied"));
+      }
+      return reject(absl::StrCat("worker ", failure_copy.worker_id,
+                                 " failed to stage the live update: ",
+                                 failure_copy.status.message(),
+                                 "; all staged bends were cancelled and nothing was applied"));
+    }
+  }
+
+  // Apply wait: every worker's apply result fires at/after the bend instant.
+  {
+    mutex_.Lock();
+    mutex_.AwaitWithDeadline(absl::Condition(this, &LiveCapabilityFanOutApplier::ApplyOutcomesComplete),
+                             apply_deadline);
+    const bool apply_complete = apply_outcomes_.size() >= expected_workers_;
+    // Copy the outcomes out: the rollback below reuses the slots.
+    const std::vector<WorkerOutcome> outcomes = apply_outcomes_;
+    mutex_.Unlock();
+
+    const WorkerOutcome* apply_failure = nullptr;
+    for (const WorkerOutcome& outcome : outcomes) {
+      if (!outcome.status.ok()) {
+        apply_failure = &outcome;
+        break;
+      }
+    }
+    std::string failure_text;
+    if (apply_failure != nullptr) {
+      failure_text = absl::StrCat("worker ", apply_failure->worker_id,
+                                  " failed to apply the live update at the bend instant: ",
+                                  apply_failure->status.message());
+    } else if (!apply_complete) {
+      // The bend instant passed without every worker reporting (a worker
+      // dispatcher is stuck). Resolve honestly: cancel whatever is still
+      // staged (a no-op once a bend fired), roll the applied workers back.
+      failure_text = absl::StrCat("only ", outcomes.size(), " of ", expected,
+                                  " active worker(s) confirmed the apply in time");
+      cancel_everything_staged();
+    }
+
+    if (failure_text.empty()) {
+      // Committed: every active worker applied at the agreed bend instant.
+      // Advance the rollback tracker and the epoch the next rollback would
+      // restore.
+      absl::MutexLock lock(&mutex_);
+      if (delta.new_rps.has_value()) {
+        tracked_schedule_.new_rps = delta.new_rps;
+      }
+      if (delta.ramp.has_value()) {
+        RampShapeChange& tracked =
+            tracked_schedule_.ramp ? *tracked_schedule_.ramp : tracked_schedule_.ramp.emplace();
+        if (delta.ramp->ramp_time.has_value()) {
+          tracked.ramp_time = delta.ramp->ramp_time;
+        }
+        if (delta.ramp->target_rps.has_value()) {
+          tracked.target_rps = delta.ramp->target_rps;
+        }
+      }
+      prior_epoch_id_ = epoch_id;
+      result.set_applied(true);
+      result.set_epoch_id(epoch_id);
+      // The engine pair at the bend instant (8.5): the monotonic stamp is
+      // the agreed instant itself; the wall stamp follows it by the lead.
+      result.set_monotonic_ns(t_bend.time_since_epoch().count());
+      result.set_wall_time_unix_ns(bend_instant.wall_time_unix_ns + kLiveUpdateBendLead.count());
+      return result;
+    }
+
+    // --- The residual post-bend failure path: rollback at t_r. ---
+    // A re-anchored re-apply of the PRIOR schedule AT THE ROLLBACK INSTANT
+    // (the A2b design note's Q7 form: solve the prior schedule's origin so
+    // its integrated releases to t_r equal the acquired count at t_r --
+    // exactly what the limiter's apply does when invoked at t_r), never a
+    // naive re-apply at t_bend. Workers that did NOT apply (staged bends
+    // cancelled above) never mutated and are already on the prior schedule;
+    // they are not posted.
+    std::vector<int> rolled_back_workers;
+    {
+      LiveKnobDelta prior;
+      std::string prior_epoch;
+      Envoy::MonotonicTime t_r = context_.now();
+      {
+        absl::MutexLock lock(&mutex_);
+        prior = tracked_schedule_;
+        prior_epoch = prior_epoch_id_;
+      }
+      // The rollback results reuse the apply slots: clear the forward
+      // outcomes and set the expectation BEFORE the posts (a fake worker --
+      // or a real one -- may fire its rollback result inside the post).
+      {
+        absl::MutexLock lock(&mutex_);
+        apply_outcomes_.clear();
+      }
+      const auto rollback_stage = [](absl::Status) {};
+      const auto rollback_cb = [this](int worker_id) {
+        return [this, worker_id](absl::Status status) { RecordApplyOutcome(worker_id, status); };
+      };
+      for (const WorkerOutcome& outcome : outcomes) {
+        if (!outcome.status.ok()) {
+          continue; // never mutated: nothing to roll back
+        }
+        entries[outcome.worker_id].apply(t_r, prior_epoch, prior, rollback_stage,
+                                         rollback_cb(outcome.worker_id));
+        rolled_back_workers.push_back(outcome.worker_id);
+      }
+      std::string rollback_failures;
+      if (!rolled_back_workers.empty()) {
+        {
+          absl::MutexLock lock(&mutex_);
+          expected_workers_ = rolled_back_workers.size();
+        }
+        absl::MutexLock lock(&mutex_);
+        mutex_.AwaitWithDeadline(
+            absl::Condition(this, &LiveCapabilityFanOutApplier::ApplyOutcomesComplete), deadline);
+        for (const WorkerOutcome& outcome : apply_outcomes_) {
+          if (!outcome.status.ok()) {
+            absl::StrAppend(&rollback_failures, " worker ", outcome.worker_id,
+                            " failed the rollback re-apply: ", outcome.status.message(), ";");
+          }
+        }
+      }
+      if (!rollback_failures.empty()) {
+        // Honest, never silent: the ack names the double failure; the
+        // affected workers may still carry the attempted epoch on their
+        // snapshot stamps until the next successful apply.
+        ENVOY_LOG(warn, "live update rollback incomplete:{}", rollback_failures);
+        failure_text = absl::StrCat(failure_text, " ROLLBACK INCOMPLETE:", rollback_failures);
+      } else {
+        failure_text = absl::StrCat(
+            failure_text, "; rolled back to the prior schedule at the rollback instant (",
+            rolled_back_workers.size(), " applied worker(s) reverted)");
+      }
+    }
+    return reject(failure_text);
+  }
+}
+
+// FORK-ONLY (We-Amp): M3 Task 6 -- the boundary-drain live-update gate. Set
+// TRUE by the workers' sequencer-stop observer (on the worker dispatcher,
+// inside the stop hook: a phase boundary has begun, possibly EARLY via a
+// termination predicate), cleared by runPhases when the boundary's drain is
+// collected. An update arriving inside the window is rejected with a clear
+// reason.
+void ProcessImpl::setBoundaryDrainInProgress(bool in_progress) {
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  boundary_drain_in_progress_ = in_progress;
 }
 
 void ProcessImpl::setCurrentPhaseId(absl::string_view phase_id,
@@ -954,6 +1353,150 @@ InFlightRunShape ProcessImpl::liveUpdateRunShape() const {
 std::string ProcessImpl::currentPhaseId() const {
   std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
   return current_phase_id_;
+}
+
+// --- FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out context halves. All of
+// these are safe to call from the update orchestrator's ack thread: they
+// only read run state under current_phase_id_mutex_ (or the fence mutex),
+// never engine objects. ---
+
+absl::Status ProcessImpl::liveUpdateAdmissionStatus() const {
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  if (boundary_drain_in_progress_) {
+    return absl::FailedPreconditionError(
+        "the run is inside a phase boundary drain; live updates are rejected "
+        "there (the operating point is undefined mid-drain, and a bend is "
+        "never applied across a boundary)");
+  }
+  if (active_worker_count_ == 0) {
+    return absl::FailedPreconditionError(
+        "no workers are active yet; live updates need a begun phase with an "
+        "active worker subset");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ProcessImpl::bendInstantAdmissibleForUpdate(Envoy::MonotonicTime t_bend) const {
+  const int64_t t_bend_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t_bend.time_since_epoch()).count();
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  const bool has_phase_vector = options_.hasPhaseVector();
+  if (has_phase_vector) {
+    const int64_t phase_end_ns = current_phase_start_monotonic_ns_ + current_phase_duration_ns_;
+    if (t_bend_ns > phase_end_ns) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "the bend instant would land ", (t_bend_ns - phase_end_ns) / 1000000,
+          "ms past the current phase's end; a bend is never applied across a "
+          "phase boundary"));
+    }
+    return absl::OkStatus();
+  }
+  if (options_.noDuration()) {
+    return absl::OkStatus();
+  }
+  const int64_t run_end_ns =
+      run_start_monotonic_ns_ +
+      std::chrono::duration_cast<std::chrono::nanoseconds>(options_.duration()).count();
+  if (run_start_monotonic_ns_ > 0 && t_bend_ns > run_end_ns) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "the bend instant would land past the run's end; a bend is never "
+        "applied past the last instant the schedule can act on"));
+  }
+  return absl::OkStatus();
+}
+
+uint32_t ProcessImpl::currentPhaseIndexForUpdate() const {
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  return current_phase_index_;
+}
+
+uint32_t ProcessImpl::activeWorkerCountForUpdate() const {
+  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+  return active_worker_count_;
+}
+
+LiveKnobDelta ProcessImpl::currentPhaseScheduleDelta() const {
+  LiveKnobDelta schedule;
+  if (liveUpdateRunShape().ramp_plugin_configured) {
+    // The plugin path's schedule is the ramp: the declared ramp time (the
+    // plugin config is run-level) and the target frequency. The plugin
+    // factory ignores per-phase rps overrides, so the run-level option is
+    // the target on every phase.
+    nighthawk::rate_limiter::LinearRampingRateLimiterConfig config;
+    const auto& plugin = options_.rateLimiterPluginConfig();
+    if (plugin.has_value() && plugin->typed_config().UnpackTo(&config)) {
+      RampShapeChange change;
+      change.ramp_time = std::chrono::seconds(config.ramp_time().seconds()) +
+                         std::chrono::nanoseconds(config.ramp_time().nanos());
+      change.target_rps = options_.requestsPerSecond();
+      schedule.ramp = change;
+    }
+    return schedule;
+  }
+  // Non-plugin path: the CURRENT phase's declared rps (the per-phase
+  // sequencer is built at that rate; unset inherits the run-level option).
+  const auto& phases = options_.phases();
+  uint32_t rps = options_.requestsPerSecond();
+  if (options_.hasPhaseVector()) {
+    std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+    if (current_phase_index_ < phases.size() && phases[current_phase_index_].requests_per_second() > 0) {
+      rps = phases[current_phase_index_].requests_per_second();
+    }
+  }
+  schedule.new_rps = rps;
+  return schedule;
+}
+
+bool ProcessImpl::fanOutBegin() {
+  absl::MutexLock lock(&live_update_fence_mutex_);
+  if (live_updates_disabled_) {
+    return false;
+  }
+  ++in_flight_fan_outs_;
+  return true;
+}
+
+void ProcessImpl::fanOutEnd() {
+  absl::MutexLock lock(&live_update_fence_mutex_);
+  --in_flight_fan_outs_;
+}
+
+void ProcessImpl::drainLiveUpdateFanOuts() {
+  // Called from shutdown() BEFORE the workers are destroyed: disable new
+  // fan-outs, then wait (bounded -- appliers honor their deadlines) for the
+  // in-flight ones to register out, then clear the capability registry (the
+  // registry-outlives-sequencer ruling: a stale entry's sequencer is about
+  // to be gone).
+  {
+    absl::MutexLock lock(&live_update_fence_mutex_);
+    live_updates_disabled_ = true;
+    const bool drained = live_update_fence_mutex_.AwaitWithDeadline(
+        absl::Condition(this, &ProcessImpl::LiveUpdateFanOutsDrained),
+        absl::Now() + kLiveUpdateFenceDrainBound);
+    if (!drained) {
+      ENVOY_LOG(warn, "live update fan-out(s) still in flight ", in_flight_fan_outs_,
+                " after the drain bound; proceeding with worker teardown");
+    }
+  }
+  live_capability_registry_.Reset();
+}
+
+std::unique_ptr<LiveUpdateApplier> ProcessImpl::MakeLiveUpdateApplier() {
+  LiveFanOutContext context;
+  context.now = [this]() { return time_system_.monotonicTime(); };
+  context.update_admissible = [this]() { return liveUpdateAdmissionStatus(); };
+  context.bend_instant_admissible = [this](Envoy::MonotonicTime t_bend) {
+    return bendInstantAdmissibleForUpdate(t_bend);
+  };
+  context.current_phase_index = [this]() { return currentPhaseIndexForUpdate(); };
+  context.active_worker_count = [this]() { return activeWorkerCountForUpdate(); };
+  context.capability_for_phase = [this](int worker_id, uint32_t phase_index) {
+    return live_capability_registry_.CapabilityForPhase(worker_id, phase_index);
+  };
+  context.current_phase_schedule = [this]() { return currentPhaseScheduleDelta(); };
+  context.fan_out_begin = [this]() { return fanOutBegin(); };
+  context.fan_out_end = [this]() { fanOutEnd(); };
+  return std::make_unique<LiveCapabilityFanOutApplier>(std::move(context));
 }
 
 void ProcessImpl::emitPhaseEvent(const PhaseEvent& event) {
@@ -1067,6 +1610,16 @@ void ProcessImpl::runPhases() {
     // collected at the previous boundary.
     const PhaseWorkerSubset& subset = phase_worker_subsets_[phase_index];
     const uint32_t active_workers = subset.worker_count;
+    // FORK-ONLY (We-Amp): M3 Task 6 -- the fan-out targets exactly this
+    // phase's active subset at exactly this phase index; both are stamped
+    // before the begin-phase posts (the registry re-stamps happen on the
+    // worker dispatchers inside those posts, so a fan-out racing the
+    // boundary fails honestly at lookup, never half-targets).
+    {
+      std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
+      current_phase_index_ = phase_index;
+      active_worker_count_ = active_workers;
+    }
     const uint32_t prior_active =
         phase_index == 0 ? 0 : phase_worker_subsets_[phase_index - 1].worker_count;
     // Highest active count posted so far: workers beyond it have never begun
@@ -1131,8 +1684,14 @@ void ProcessImpl::runPhases() {
       // The boundary: sequencers stop without exiting the dispatcher
       // (worker side), then a bounded non-destructive wait for in-flight
       // completion per worker. A deadline miss is censored and recorded;
-      // the run continues into the next phase either way.
+      // the run continues into the next phase either way. FORK-ONLY (M3
+      // Task 6): the drain window is a live-update gate. The flag is set
+      // by the worker's own sequencer-stop observer (an early termination
+      // predicate can end the phase before its nominal duration, so the
+      // orchestrator cannot time the window itself) and cleared here, when
+      // the boundary's drain is fully collected.
       orchestrator.collectDrainAcks(drain_acks, drain_budget, phase_index);
+      setBoundaryDrainInProgress(false);
     }
   }
 
@@ -1173,7 +1732,11 @@ nighthawk::client::LiveSnapshot ProcessImpl::toLiveSnapshot() {
   for (nighthawk::client::WorkerLiveSnapshotPartial& partial : partials) {
     live_aggregator_.addPartial(std::move(partial));
   }
-  return live_aggregator_.snapshot(options_.executionId().value_or(""));
+  // FORK-ONLY (We-Amp): M3 Task 6 -- the snapshot's epoch_id is the run's
+  // current knob epoch, tracked from the per-worker partial stamps by the
+  // aggregator (empty before the run's first applied change; repurposed
+  // from the execution-id semantics per the A2 ruling in live.proto).
+  return live_aggregator_.snapshot();
 }
 
 void ProcessImpl::configureComponentLogLevels(spdlog::level::level_enum level) {

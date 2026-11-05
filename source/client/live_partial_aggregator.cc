@@ -2,6 +2,10 @@
 
 #include <algorithm>
 
+#include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/strip.h"
+
 namespace Nighthawk {
 namespace Client {
 
@@ -33,6 +37,10 @@ bool LivePartialAggregator::advancesLatest(const std::string& phase_id) const {
 
 void LivePartialAggregator::addPartial(nighthawk::client::WorkerLiveSnapshotPartial partial) {
   auto& worker_state = worker_states_[partial.worker_id()];
+  if (worker_state.epoch_id != partial.epoch_id()) {
+    worker_state.epoch_id = partial.epoch_id();
+    advanceEpochLabel(partial.epoch_id());
+  }
   if (worker_state.phase_id != partial.phase_id()) {
     // The worker advanced to a new slab: its old slab's statistics are done,
     // replace them wholesale so no pre-boundary statistic ever survives into
@@ -57,7 +65,54 @@ void LivePartialAggregator::addPartial(nighthawk::client::WorkerLiveSnapshotPart
   }
 }
 
-nighthawk::client::LiveSnapshot LivePartialAggregator::snapshot(const std::string& epoch_id) {
+// FORK-ONLY (We-Amp): the numeric suffix of an epoch id ("epoch-<n>");
+// -1 for the empty epoch (the pre-first-apply state sorts before everything)
+// and for anything that is not an "epoch-<n>" id.
+static int64_t epochNumber(const std::string& epoch_id) {
+  if (epoch_id.empty() || !absl::StartsWith(epoch_id, "epoch-")) {
+    return -1;
+  }
+  int64_t n = -1;
+  if (!absl::SimpleAtoi(absl::StripPrefix(epoch_id, "epoch-"), &n)) {
+    return -1;
+  }
+  return n;
+}
+
+void LivePartialAggregator::advanceEpochLabel(const std::string& worker_epoch) {
+  const int64_t stamped = epochNumber(worker_epoch);
+  const int64_t label = epochNumber(latest_epoch_id_);
+  if (stamped > label) {
+    // First-applied wins: a later epoch moves the label immediately.
+    latest_epoch_id_ = worker_epoch;
+    epoch_change_pending_ = true;
+    return;
+  }
+  if (stamped < label) {
+    // A stamp earlier than the label is a ROLLED-BACK update: demote only
+    // once no worker is still stamped at the demoted epoch (the last
+    // epoch-<n>-stamped worker's post-rollback partial). Retired/idle
+    // workers frozen on "" or an older epoch never block the demotion.
+    for (const auto& [worker_id, worker_state] : worker_states_) {
+      if (epochNumber(worker_state.epoch_id) >= label) {
+        return;
+      }
+    }
+    int64_t highest = -1;
+    std::string highest_id;
+    for (const auto& [worker_id, worker_state] : worker_states_) {
+      const int64_t n = epochNumber(worker_state.epoch_id);
+      if (n > highest) {
+        highest = n;
+        highest_id = worker_state.epoch_id;
+      }
+    }
+    latest_epoch_id_ = highest_id;
+    epoch_change_pending_ = true;
+  }
+}
+
+nighthawk::client::LiveSnapshot LivePartialAggregator::snapshot() {
   nighthawk::client::LiveSnapshot snapshot;
   // Counters are cumulative from run start: sum the per-worker latests over
   // all workers, regardless of their stamps.
@@ -106,7 +161,9 @@ nighthawk::client::LiveSnapshot LivePartialAggregator::snapshot(const std::strin
   last_live_snapshot_monotonic_ns_ = monotonic_ns;
   snapshot.set_monotonic_ns(monotonic_ns);
   snapshot.set_phase_id(latest_phase_id_);
-  snapshot.set_epoch_id(epoch_id);
+  snapshot.set_epoch_id(latest_epoch_id_);
+  snapshot.set_epoch_changed(epoch_change_pending_);
+  epoch_change_pending_ = false;
   return snapshot;
 }
 

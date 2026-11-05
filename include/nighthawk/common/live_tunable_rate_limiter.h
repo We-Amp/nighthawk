@@ -25,6 +25,14 @@ namespace Nighthawk {
 // (the sequencer's dispatcher-posted apply does).
 constexpr std::chrono::nanoseconds kLiveUpdateBendGrace{10000000};
 
+// The fan-out bend lead (M3 Task 6): the orchestrator picks t_bend = now +
+// this lead -- one engine-agreed instant, never each worker's "now". Large
+// enough that the per-worker staging posts confirm well before the bend
+// arrives (most failures surface with nothing applied), small enough to stay
+// a "small bounded lead" (spec 4 A2). Staging failures are resolved -- and
+// staged bends cancelled -- strictly before t_bend minus the dispatch grace.
+constexpr std::chrono::nanoseconds kLiveUpdateBendLead{250000000};
+
 // A live ramp-shape change for the ramping (plugin) limiter (M3 Task 5, A2b).
 // Absent fields preserve the current schedule's value: a target-only change
 // re-anchors the same ramp shape under the new target (the C1 rps-on-plugin
@@ -104,10 +112,23 @@ struct LiveKnobDelta {
 
 // The worker-side apply surface the Task 6 fan-out consumes: posts onto the
 // worker's own dispatcher (limiter state is dispatcher-confined, M0a Review
-// Focus 5 discipline) and applies the re-parameterization at t_bend. The
-// status callback fires on the worker dispatcher with the per-worker apply
-// result.
-using LiveApplyFn = std::function<void(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
-                                       std::function<void(absl::Status)> callback)>;
+// Focus 5 discipline) and applies the re-parameterization at t_bend.
+//
+// Two callbacks, both firing on the worker dispatcher (M3 Task 6, the
+// staging-confirm ruling): `stage_callback` fires at staging time -- BEFORE
+// t_bend for a future bend, when the arming checks run -- OkStatus meaning
+// the worker has armed the bend and confirms it can honor the delta, an
+// error meaning nothing was armed and nothing will be applied (the primary
+// failure path; the fan-out then cancels every staged bend, so nothing is
+// applied anywhere). `apply_callback` fires at/after t_bend with the actual
+// apply result; an error there is the residual post-bend failure path (the
+// fan-out rolls the affected workers back to the prior schedule at the
+// rollback instant). `epoch_id` rides the apply so a successful apply also
+// stamps the worker's knob epoch (snapshots carry it from the bend instant
+// on); a rolled-back apply re-stamps the PRIOR epoch id.
+using LiveApplyFn = std::function<void(Envoy::MonotonicTime t_bend, const std::string& epoch_id,
+                                       const LiveKnobDelta& delta,
+                                       std::function<void(absl::Status)> stage_callback,
+                                       std::function<void(absl::Status)> apply_callback)>;
 
 } // namespace Nighthawk
