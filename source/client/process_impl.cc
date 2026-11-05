@@ -1114,9 +1114,24 @@ void ProcessImpl::runPhases() {
                 phase_index, phase.name(), active_workers, prior_active - active_workers);
     }
     std::vector<std::future<PhaseDrainAck>> drain_acks;
+    // FORK-ONLY (M2 burstfix): the phase's declared rps is its GLOBAL rate:
+    // divide it across the phase's active workers so the paced total matches
+    // the declaration (the remainder goes to the lowest worker indexes; a
+    // declaration below the worker count paces 1 rps per worker rather than
+    // constructing a zero-rate limiter). Legacy runs are untouched: this is
+    // the phase path only -- without the division each active worker paced
+    // the full declared rps and a phase's offered load multiplied by its
+    // worker count.
+    const uint32_t declared_rps = phase.requests_per_second();
+    const uint32_t rps_base = declared_rps / active_workers;
+    const uint32_t rps_remainder = declared_rps % active_workers;
     for (uint32_t w = 0; w < active_workers; ++w) {
       worker_begun_phases_[w].push_back(phase_index);
-      drain_acks.push_back(workers_[w]->beginPhaseAsync(phase_index, effective_phase, final_phase));
+      nighthawk::client::PhaseSpec worker_phase = effective_phase;
+      worker_phase.set_requests_per_second(rps_base > 0 ? rps_base + (w < rps_remainder ? 1 : 0)
+                                                        : 1);
+      drain_acks.push_back(
+          workers_[w]->beginPhaseAsync(phase_index, worker_phase, final_phase));
     }
     activated_high_water = std::max(activated_high_water, active_workers);
     if (final_phase) {
@@ -1132,7 +1147,22 @@ void ProcessImpl::runPhases() {
       // (worker side), then a bounded non-destructive wait for in-flight
       // completion per worker. A deadline miss is censored and recorded;
       // the run continues into the next phase either way.
-      orchestrator.collectDrainAcks(drain_acks, drain_budget, phase_index);
+      // FORK-ONLY (M2 burstfix): the drain budget bounds the drain itself,
+      // measured from the sequencer STOP. The stop lands at the phase's
+      // declared duration (the duration termination predicate), so the wait
+      // for the drain acks must first cover the rest of the phase;
+      // bounding the whole wait by --timeout censored a healthy phase at
+      // the cap and began the successor while the predecessor's sequencer
+      // was still running -- its remaining load then landed in the
+      // successor's slab, reading as an rps overshoot (the T8
+      // close-blocker). +1 s slop for stop/teardown.
+      const std::chrono::nanoseconds phase_duration_ns =
+          std::chrono::seconds(phase.duration().seconds()) +
+          std::chrono::nanoseconds(phase.duration().nanos());
+      const std::chrono::milliseconds stop_grace(
+          std::chrono::duration_cast<std::chrono::milliseconds>(phase_duration_ns) +
+          std::chrono::milliseconds(1000));
+      orchestrator.collectDrainAcks(drain_acks, drain_budget, phase_index, stop_grace);
     }
   }
 

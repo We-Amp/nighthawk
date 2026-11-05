@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -681,9 +682,12 @@ TEST_F(PhaseRunTest, SubsetPhasesRunCorrectWorkers) {
   }
   EXPECT_EQ(4, worker_groups);
 
-  // Per-phase request traffic (per-worker rps 50, 2s per phase): phase 1
-  // runs twice the workers of phases 0 and 2, so it serves roughly twice the
-  // completions.
+  // Per-phase request traffic: the declared rps (50) is the phase's GLOBAL
+  // rate (divided across the phase's active workers), so every phase serves
+  // ~rps x duration completions regardless of its worker count (M2
+  // burstfix: without the division each worker paced the full declared rps
+  // and phase traffic scaled with the worker count). The subset itself is
+  // proven by the per-worker counters below.
   const int64_t p0_from = outcome.events[0].wall_time_unix_ns;
   const int64_t p0_to = outcome.events[1].wall_time_unix_ns;
   const int64_t p1_from = outcome.events[2].wall_time_unix_ns;
@@ -694,13 +698,19 @@ TEST_F(PhaseRunTest, SubsetPhasesRunCorrectWorkers) {
   const int p0_completions = completionsInWindow(spans, p0_from, p0_to);
   const int p1_completions = completionsInWindow(spans, p1_from, p1_to);
   const int p2_completions = completionsInWindow(spans, p2_from, p2_to);
+  // 50 rps x 2 s = ~100 per phase, on every subset size.
   EXPECT_GT(p0_completions, 50);
   EXPECT_GT(p1_completions, 50);
   EXPECT_GT(p2_completions, 50);
-  EXPECT_GT(p1_completions * 2, p0_completions * 3)
-      << "phase 1 did not serve ~2x the traffic of phase 0 (subset not applied)";
-  EXPECT_LT(p2_completions * 3, p1_completions * 2)
-      << "phase 2 did not shrink back to the [2]-worker subset";
+  EXPECT_LT(p0_completions, 160);
+  EXPECT_LT(p1_completions, 160);
+  EXPECT_LT(p2_completions, 160);
+  EXPECT_LT(p1_completions * 3, p0_completions * 5)
+      << "phase 1 traffic scaled with its worker count (declared rps is the "
+         "phase's global rate, not a per-worker rate)";
+  EXPECT_LT(p2_completions * 3, p1_completions * 5)
+      << "phase 2 traffic scaled with its worker count (declared rps is the "
+         "phase's global rate, not a per-worker rate)";
 
   // The workers beyond phase 2's subset sat it out: worker_0 ran all three
   // phases, worker_2 only the first two, on identical per-phase load.
@@ -723,13 +733,15 @@ TEST_F(PhaseRunTest, RemovedWorkerFoldsIntoLastPhase) {
   ASSERT_TRUE(outcome.success);
   ASSERT_EQ(4u, outcome.events.size());
 
-  // Phase 0 ran two workers at rps 50 for 2s (~200 completions); phase 1 ran
-  // the single remaining worker (~100). The removed worker's slab lands in
-  // phase 0's group only.
+  // Both phases declare rps 50 for 2s -- the phase's GLOBAL rate (M2
+  // burstfix: divided across the phase's active workers) -- so each phase's
+  // slab holds ~100 completions: phase 0 from its two workers, phase 1 from
+  // the single remaining worker. The removed worker's slab lands in phase
+  // 0's group only.
   const uint64_t p0 = sequencerCallbackCount(outcome.output, "phase_0_phase0");
   const uint64_t p1 = sequencerCallbackCount(outcome.output, "phase_1_phase1");
-  EXPECT_GT(p0, 150u) << "phase 0 group missing the removed worker's slab";
-  EXPECT_LT(p0, 300u);
+  EXPECT_GT(p0, 50u) << "phase 0 group missing the removed worker's slab";
+  EXPECT_LT(p0, 160u);
   EXPECT_GT(p1, 40u) << "phase 1 group missing entirely";
   EXPECT_LT(p1, 160u) << "phase 1 group holds more than the single active worker's slab";
 
