@@ -120,6 +120,14 @@ public:
   // on_update_result immediately before on_finished, as a feed-generated
   // result with rejection_reason prefixed "run-feed: " — never as an engine
   // ack, and never silently dropped.
+  //
+  // ONE OUTSTANDING UPDATE AT A TIME — a client-side discipline: wait for the
+  // ack before sending the next update. The service currently has NO
+  // one-in-flight guard on the update path, so two overlapping pendings
+  // could both claim the next knob epoch; guarding it service-side is a
+  // recorded M3 follow-up. The feed serializes its own sends and never
+  // issues a second update before the previous ack or the run's terminal
+  // event.
   absl::Status SendUpdate(const nighthawk::client::UpdateRequest& request);
 
   // Writes a CancellationRequest arm on the in-flight run's stream. Unlike
@@ -132,7 +140,10 @@ public:
   // flight.
   absl::Status SendCancellation();
 
-  // True while a started run has not yet delivered its on_finished.
+  // True while a started run is still in flight: from start() until the
+  // run's final output has been received and the stream half-closed (or the
+  // stream failed) — never past on_finished. Mid-run arms are rejected with
+  // kFailedPrecondition once this reads false.
   bool running() const;
 
 private:

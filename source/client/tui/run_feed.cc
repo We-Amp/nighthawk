@@ -184,6 +184,11 @@ void RunFeed::readLoop() {
       {
         std::lock_guard<std::mutex> lock(mutex_);
         stream_->WritesDone();
+        // Clear running_ under the same lock that half-closed the stream: an
+        // arm racing in from another thread then fails its running_ check
+        // (kFailedPrecondition) instead of attempting a post-half-close
+        // write that would fail as a misleading kInternal.
+        running_.store(false);
       }
     }
   }

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -58,6 +59,12 @@ public:
 
   std::string uri() const { return fmt::format("http://127.0.0.1:{}/", port_); }
 
+  // Number of upstream connections the benchmark client has made: the
+  // in-flight signal this test anchors its cancellation timing on (the
+  // remote path strips live snapshot streaming, so there is no snapshot to
+  // anchor on).
+  int connections() const { return connections_.load(std::memory_order_relaxed); }
+
 private:
   static constexpr int kNoSignalFlags =
 #ifdef MSG_NOSIGNAL
@@ -72,6 +79,7 @@ private:
       if (fd < 0) {
         return;
       }
+      connections_.fetch_add(1, std::memory_order_relaxed);
 #ifdef SO_NOSIGPIPE
       int one = 1;
       ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -117,6 +125,7 @@ private:
   int listen_fd_{-1};
   uint16_t port_{0};
   std::thread thread_;
+  std::atomic<int> connections_{0};
 };
 
 } // namespace
@@ -230,8 +239,16 @@ TEST_F(ClientTest, RemoteCancellationSendsArm) {
   std::thread run_thread([&process, &collector, &run_ok]() {
     run_ok = process.run(collector);
   });
-  // Let the run get demonstrably in flight before the arm lands.
-  std::this_thread::sleep_for(1s);
+  // Anchor on live upstream traffic (the feed tests' snapshot-anchored
+  // shape, adapted: the remote path strips live snapshot streaming, so the
+  // SUT listener's connection count is the in-flight signal) — a bounded
+  // wait, so the arm lands demonstrably mid-run at any machine speed.
+  const auto traffic_deadline = std::chrono::steady_clock::now() + 10s;
+  while (listener.connections() == 0) {
+    ASSERT_LT(std::chrono::steady_clock::now(), traffic_deadline)
+        << "the benchmark never reached the upstream listener";
+    std::this_thread::sleep_for(10ms);
+  }
 
   const auto cancel_time = std::chrono::steady_clock::now();
   EXPECT_TRUE(process.requestExecutionCancellation())
