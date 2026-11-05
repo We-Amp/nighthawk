@@ -65,17 +65,13 @@ absl::Status ValidateUpdateDeltas(const nighthawk::client::UpdateRequest& reques
       if (value < 1) {
         return invalid(absl::StrCat(where, ": ", kRpsField, ": rps must be >= 1, got ", value));
       }
-      if (run_shape.ramp_plugin_configured) {
-        // C1: on a ramp-plugin run the release schedule is a function of
-        // the ramp's target frequency, so a live rps change IS ramp
-        // re-parameterization. It must go through ramp re-anchoring, which
-        // is not wired yet -- reject honestly, never silently mis-apply.
-        return invalid(absl::StrCat(
-            where, ": ", kRpsField,
-            ": pending ramp re-anchoring; on a ramp-plugin run a live rps change sets the "
-            "ramp's target frequency (a ramp-shape change) and requires ramp re-anchoring, "
-            "which is not supported by this build yet"));
-      }
+      // C1 (superseded): on a ramp-plugin run the release schedule is a
+      // function of the ramp's target frequency, so a live rps change IS
+      // ramp re-parameterization. M3 Task 5 landed the re-anchoring
+      // (LinearRampingRateLimiterImpl::ApplyLiveRps, the A2b note's Q6
+      // corollary), so the interim `pending ramp re-anchoring` rejection is
+      // gone: an rps delta on a ramp-plugin run validates through and the
+      // apply path re-anchors the ramp under the new target.
       break;
     }
     case nighthawk::client::KnobDelta::kRamp: {

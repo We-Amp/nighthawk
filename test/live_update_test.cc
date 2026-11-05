@@ -25,6 +25,7 @@
 #include "source/client/live_update_orchestrator.h"
 #include "source/client/live_update_validator.h"
 #include "source/client/process_impl.h"
+#include "source/common/ramp_reanchor.h"
 #include "source/common/rate_limiter_impl.h"
 #include "source/common/sequencer_impl.h"
 #include "source/common/statistic_impl.h"
@@ -461,9 +462,10 @@ TEST(LiveUpdateValidatorTest, ZeroRpsRejected) {
 }
 
 // C1: an rps delta on a ramp-plugin run is a ramp-shape change (it sets the
-// ramp's target frequency), so it routes through the ramp-shape validation
-// path: a zero value fails the ramp invariant, and a valid value is rejected
-// with the pending ramp re-anchoring reason until re-anchoring lands.
+// ramp's target frequency). A zero value still fails the invariant; a valid
+// value VALIDATES through since M3 Task 5 landed the re-anchoring (the
+// interim `pending ramp re-anchoring` rejection is superseded -- the apply
+// path re-anchors via LinearRampingRateLimiterImpl::ApplyLiveRps).
 TEST(LiveUpdateValidatorTest, RpsOnRampPluginRunIsRampShapeValidation) {
   UpdateRequest zero_rps;
   zero_rps.add_deltas()->mutable_requests_per_second()->set_value(0);
@@ -475,17 +477,14 @@ TEST(LiveUpdateValidatorTest, RpsOnRampPluginRunIsRampShapeValidation) {
   UpdateRequest valid_rps;
   valid_rps.add_deltas()->mutable_requests_per_second()->set_value(5);
   const absl::Status status = ValidateUpdateDeltas(valid_rps, RampPluginRunShape(30s));
-  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
-  EXPECT_THAT(status.message(), HasSubstr("requests_per_second"));
-  EXPECT_THAT(status.message(), HasSubstr("pending ramp re-anchoring"));
+  EXPECT_TRUE(status.ok()) << status.message();
 }
 
 // Duplicates for the same knob in one request are rejected (ambiguous
-// order), for both knobs. (Distinct knobs in one request: while C1's interim
-// rule holds an rps+ramp mix can never PASS -- rps only passes on non-plugin
-// runs and ramp only on plugin runs -- so no distinct-knob acceptance test is
-// possible until Task 5 lands plugin-path rps; the mix's impossibility is
-// pinned by RpsOnRampPluginRunIsRampShapeValidation and RampWithoutPluginRejected.)
+// order), for both knobs. (Distinct knobs in one request: a mixed rps+ramp
+// request on a ramp-plugin run validates since M3 Task 5 landed plugin-path
+// rps -- the apply composes them rps-first, then ramp. The mix on a NON-plugin
+// run still fails at the ramp arm; pinned by RampWithoutPluginRejected.)
 TEST(LiveUpdateValidatorTest, DuplicateKnobDeltasRejected) {
   UpdateRequest double_rps;
   double_rps.add_deltas()->mutable_requests_per_second()->set_value(5);
@@ -527,18 +526,28 @@ TEST(LiveUpdateOrchestratorTest, WhitelistRejectionsResolveSynchronouslyWithoutA
 
   UpdateRequest rps_delta;
   rps_delta.add_deltas()->mutable_requests_per_second()->set_value(5);
-  orchestrator->HandleUpdate(rps_delta); // pending ramp re-anchoring on a ramp-plugin run.
+  // M3 Task 5 superseded the interim `pending ramp re-anchoring` rejection
+  // (C1): on a ramp-plugin run a valid rps delta IS a ramp-shape delta and
+  // validates through -- it is forwarded to the applier, not rejected here.
+  // The forward is async (the ack thread), so wait for it BEFORE ending the
+  // run: past OnRunEnded the no-ack-after-final-output gate drops it.
+  orchestrator->HandleUpdate(rps_delta);
+  const auto forward_deadline = std::chrono::steady_clock::now() + 2s;
+  while (applier.calls() < 1 && std::chrono::steady_clock::now() < forward_deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
 
   orchestrator->OnRunEnded();
   orchestrator->JoinPendingAcks();
 
-  EXPECT_EQ(applier.calls(), 0);
   ASSERT_EQ(recorder.size(), 2);
   const auto acks = recorder.acks();
   EXPECT_FALSE(acks[0].applied());
   EXPECT_NE(acks[0].rejection_reason().find("no knob field is set"), std::string::npos);
-  EXPECT_FALSE(acks[1].applied());
-  EXPECT_NE(acks[1].rejection_reason().find("pending ramp re-anchoring"), std::string::npos);
+  // The rps-on-plugin delta reached the applier (applied=true from the fake;
+  // the real fan-out is Task 6's).
+  EXPECT_EQ(applier.calls(), 1);
+  EXPECT_TRUE(acks[1].applied());
 }
 
 // A valid delta is forwarded to the applier (the Task-3+ engine apply seam):
@@ -574,6 +583,10 @@ public:
   absl::Status ApplyLiveRps(Envoy::MonotonicTime /*t_bend*/, uint32_t /*new_rps*/) override {
     return absl::OkStatus();
   }
+  absl::Status ApplyLiveRamp(Envoy::MonotonicTime /*t_bend*/,
+                             const RampShapeChange& /*change*/) override {
+    return absl::OkStatus();
+  }
 };
 
 // T2 parked minor: a ramp time with an absurd seconds value saturates in the
@@ -599,7 +612,7 @@ TEST(LiveCapabilityRegistryTest, CaptureRecapturedAtEachPhaseBegin) {
   int phase1_applies = 0;
 
   registry.Record(0, 0, &handle_phase0,
-                  [&phase0_applies](Envoy::MonotonicTime, uint32_t,
+                  [&phase0_applies](Envoy::MonotonicTime, const LiveKnobDelta&,
                                     std::function<void(absl::Status)> callback) {
                     phase0_applies++;
                     callback(absl::OkStatus());
@@ -611,7 +624,7 @@ TEST(LiveCapabilityRegistryTest, CaptureRecapturedAtEachPhaseBegin) {
 
   // Phase 1 begins: the worker re-stamps, and the phase-0 entry is gone.
   registry.Record(0, 1, &handle_phase1,
-                  [&phase1_applies](Envoy::MonotonicTime, uint32_t,
+                  [&phase1_applies](Envoy::MonotonicTime, const LiveKnobDelta&,
                                     std::function<void(absl::Status)> callback) {
                     phase1_applies++;
                     callback(absl::OkStatus());
@@ -628,7 +641,7 @@ TEST(LiveCapabilityRegistryTest, CaptureRecapturedAtEachPhaseBegin) {
   int applies = 0;
   auto current = registry.CapabilityForPhase(0, 1);
   ASSERT_TRUE(current.ok());
-  current->apply(std::chrono::steady_clock::now(), 5,
+  current->apply(std::chrono::steady_clock::now(), LiveKnobDelta{std::uint32_t{5}, std::nullopt},
                  [&applies](absl::Status) { applies++; });
   EXPECT_EQ(applies, 1);
   EXPECT_EQ(phase0_applies, 0);
@@ -754,10 +767,11 @@ TEST_F(SequencerCapabilityTest, CapabilityCapturedBeforePluginDecoratorChain) {
   EXPECT_EQ(dynamic_cast<ScheduledStartingRateLimiter*>(captured), nullptr);
 }
 
-// CAPTURE-ONLY interim (C1): applying an rps delta through the plugin-path
-// captured handle rejects with the honest `pending ramp re-anchoring` reason
-// and never touches the limiter.
-TEST_F(SequencerCapabilityTest, RpsDeltaOnRampPluginRunPendingRejection) {
+// C1 superseded (M3 Task 5): the plugin-path rps knob IS ramp
+// re-parameterization. Through the captured handle, an rps delta re-anchors
+// the ramping limiter -- count conserved at the bend, cadence follows the new
+// target -- through the same apply surface the Task 6 fan-out drives.
+TEST_F(SequencerCapabilityTest, RpsDeltaOnRampPluginRunReanchors) {
   std::optional<envoy::config::core::v3::TypedExtensionConfig> rate_limiter_plugin_config;
   const std::string rate_limiter_plugin_config_json =
       "{"
@@ -799,16 +813,96 @@ TEST_F(SequencerCapabilityTest, RpsDeltaOnRampPluginRunPendingRejection) {
   ASSERT_EQ(total, cf_total);
 
   const absl::Status status = captured->ApplyLiveRps(time_system_.monotonicTime(), 5);
-  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
-  EXPECT_THAT(status.message(), HasSubstr("pending ramp re-anchoring"));
+  ASSERT_TRUE(status.ok()) << status.message();
+  const uint64_t at_bend = total;
+  ASSERT_EQ(at_bend, cf_total); // conserved at the bend
 
-  // Untouched: the limiter still matches the counterfactual exactly.
+  // Post-bend: ~3 grants at the new 5 Hz, ~60 at the counterfactual's 100 Hz.
+  uint64_t post_bent = 0;
   for (int i = 0; i < 600; i++) {
+    post_bent += acquireAll(*inner);
+    cf_total += acquireAll(counterfactual);
+    time_system_.advanceTimeWait(1ms);
+  }
+  EXPECT_NEAR(post_bent, 3, 1);
+  EXPECT_NEAR(cf_total - at_bend, 60, 2);
+}
+
+// The ramp bend observed (A2b acceptance shape, sequencer leg): a ramp-plugin
+// run mid-ramp bends by COLLAPSING the ramp time; count conserved at the
+// bend, and the observed cadence follows the new shape immediately (the
+// snapshot/flamegraph leg of the acceptance demo is Task 6's fan-out).
+TEST_F(SequencerCapabilityTest, RampBendChangesObservedRps) {
+  std::optional<envoy::config::core::v3::TypedExtensionConfig> rate_limiter_plugin_config;
+  const std::string rate_limiter_plugin_config_json =
+      "{"
+      "name:\"nighthawk.linear-ramping-rate-limiter-plugin\","
+      "typed_config:{"
+      "\"@type\":\"type.googleapis.com/"
+      "nighthawk.rate_limiter.LinearRampingRateLimiterConfig\","
+      "ramp_time:{seconds:5}"
+      "}"
+      "}";
+  rate_limiter_plugin_config.emplace(envoy::config::core::v3::TypedExtensionConfig());
+  Envoy::MessageUtil::loadFromJson(rate_limiter_plugin_config_json,
+                                   rate_limiter_plugin_config.value(),
+                                   Envoy::ProtobufMessage::getStrictValidationVisitor());
+  EXPECT_CALL(options_, rateLimiterPluginConfig()).WillRepeatedly(ReturnRef(rate_limiter_plugin_config));
+  EXPECT_CALL(options_, requestsPerSecond()).WillRepeatedly(Return(100));
+  EXPECT_CALL(options_, noDuration()).WillRepeatedly(Return(false));
+  EXPECT_CALL(options_, duration()).WillRepeatedly(Return(std::chrono::seconds(30)));
+  EXPECT_CALL(options_, sequencerIdleStrategy())
+      .WillRepeatedly(Return(nighthawk::client::SequencerIdleStrategy::POLL));
+
+  LiveTunableRateLimiter* captured = nullptr;
+  auto sequencer = createSequencer(&captured);
+  ASSERT_NE(captured, nullptr);
+  auto* inner = dynamic_cast<LinearRampingRateLimiterImpl*>(captured);
+  ASSERT_NE(inner, nullptr);
+
+  // 500ms into the 5s ramp, in lockstep with an un-bent counterfactual.
+  LinearRampingRateLimiterImpl counterfactual(time_system_, 5s, 100_Hz);
+  uint64_t total = 0;
+  uint64_t cf_total = 0;
+  for (int i = 0; i < 500; i++) {
     total += acquireAll(*inner);
     cf_total += acquireAll(counterfactual);
     time_system_.advanceTimeWait(1ms);
   }
-  EXPECT_EQ(total, cf_total);
+  ASSERT_GT(total, 0u);
+  ASSERT_EQ(total, cf_total);
+  const uint64_t at_bend = total;
+
+  // Collapse the ramp to 1s, target preserved. The re-anchor lands mid-ramp
+  // under A yet inside the new ramp's segment (n = 3 <= f_B*T_B/2 = 50); the
+  // forced instantaneous rate at the bend is e_b*sqrt(f_A f_B / T_A T_B) =
+  // 0.5 * sqrt(100*100/(5*1)) ~= 24.5 rps (vs 10 on the way in) -- the closed
+  // form the A2b note pins.
+  const absl::Status status = captured->ApplyLiveRamp(
+      time_system_.monotonicTime(), RampShapeChange{std::chrono::seconds(1), std::nullopt});
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  // One second post-bend: the observed grants must match the SHARED math --
+  // the implementation is a transcription of the A2b note's equations, so
+  // the oracle is the pure library itself (plus walk quantization slack for
+  // the 1ms greedy drive).
+  uint64_t post_bent = 0;
+  for (int i = 0; i < 1000; i++) {
+    post_bent += acquireAll(*inner);
+    cf_total += acquireAll(counterfactual);
+    time_system_.advanceTimeWait(1ms);
+  }
+  EXPECT_EQ(total, at_bend); // conservation held up to the bend
+  auto reanchor = RampReanchor::Reanchor({5s, 100.0}, 500ms, at_bend, {1s, 100.0});
+  ASSERT_TRUE(reanchor.ok()) << reanchor.status();
+  const int64_t expected_bent =
+      RampReanchor::CumulativeReleases({1s, 100.0}, reanchor->new_origin_offset + 1s) -
+      static_cast<int64_t>(at_bend);
+  const int64_t expected_cf = RampReanchor::CumulativeReleases({5s, 100.0}, 1500ms) -
+                              static_cast<int64_t>(at_bend);
+  EXPECT_NEAR(post_bent, expected_bent, 2);
+  EXPECT_NEAR(cf_total - at_bend, expected_cf, 2);
+  EXPECT_GT(post_bent, (cf_total - at_bend) + 20); // the bend actually steepened
 }
 
 // Through-decoration semantics survive a bend: the Bursting and
@@ -950,7 +1044,7 @@ TEST_F(SequencerLiveUpdateTest, ApplyLiveUpdatePostsToOwnDispatcherAndApplies) {
   auto sequencer = makeSequencer(10, /*with_handle=*/true);
   absl::Status status = absl::InternalError("callback not run");
   std::atomic<bool> done{false};
-  sequencer->applyLiveUpdate(timeSource().monotonicTime(), 20,
+  sequencer->applyLiveUpdate(timeSource().monotonicTime(), LiveKnobDelta{std::uint32_t{20}, std::nullopt},
                              [&](absl::Status s) {
                                status = s;
                                done = true;
@@ -974,7 +1068,7 @@ TEST_F(SequencerLiveUpdateTest, FutureBendAppliedByBendTimer) {
   absl::Status status = absl::InternalError("callback not run");
   std::atomic<bool> done{false};
   const Envoy::MonotonicTime t_bend = timeSource().monotonicTime() + 100ms;
-  sequencer->applyLiveUpdate(t_bend, 20, [&](absl::Status s) {
+  sequencer->applyLiveUpdate(t_bend, LiveKnobDelta{std::uint32_t{20}, std::nullopt}, [&](absl::Status s) {
     status = s;
     done = true;
   });
@@ -1001,12 +1095,12 @@ TEST_F(SequencerLiveUpdateTest, SecondBendWhilePendingRejectedNotQueued) {
   std::atomic<bool> first_done{false};
   std::atomic<bool> second_done{false};
   const Envoy::MonotonicTime t_bend = timeSource().monotonicTime() + 100ms;
-  sequencer->applyLiveUpdate(t_bend, 20, [&](absl::Status s) {
+  sequencer->applyLiveUpdate(t_bend, LiveKnobDelta{std::uint32_t{20}, std::nullopt}, [&](absl::Status s) {
     first_status = s;
     first_done = true;
   });
   pump(10); // arm bend 1's timer
-  sequencer->applyLiveUpdate(t_bend, 30, [&](absl::Status s) {
+  sequencer->applyLiveUpdate(t_bend, LiveKnobDelta{std::uint32_t{30}, std::nullopt}, [&](absl::Status s) {
     second_status = s;
     second_done = true;
   });
@@ -1036,7 +1130,7 @@ TEST_F(SequencerLiveUpdateTest, SequentialBendsEachApplyTheirOwnRate) {
   std::atomic<bool> first_done{false};
   std::atomic<bool> second_done{false};
 
-  sequencer->applyLiveUpdate(timeSource().monotonicTime() + 100ms, 20, [&](absl::Status s) {
+  sequencer->applyLiveUpdate(timeSource().monotonicTime() + 100ms, LiveKnobDelta{std::uint32_t{20}, std::nullopt}, [&](absl::Status s) {
     first_calls++;
     first_status = s;
     first_done = true;
@@ -1049,7 +1143,7 @@ TEST_F(SequencerLiveUpdateTest, SequentialBendsEachApplyTheirOwnRate) {
   EXPECT_NEAR(mid, 10, 2);
 
   // Second sequential bend on the SAME timer object.
-  sequencer->applyLiveUpdate(timeSource().monotonicTime() + 100ms, 40, [&](absl::Status s) {
+  sequencer->applyLiveUpdate(timeSource().monotonicTime() + 100ms, LiveKnobDelta{std::uint32_t{40}, std::nullopt}, [&](absl::Status s) {
     second_calls++;
     second_status = s;
     second_done = true;
@@ -1070,7 +1164,7 @@ TEST_F(SequencerLiveUpdateTest, NoCapturedHandleFailsHonestly) {
   auto sequencer = makeSequencer(10, /*with_handle=*/false);
   absl::Status status = absl::OkStatus();
   std::atomic<bool> done{false};
-  sequencer->applyLiveUpdate(timeSource().monotonicTime(), 20, [&](absl::Status s) {
+  sequencer->applyLiveUpdate(timeSource().monotonicTime(), LiveKnobDelta{std::uint32_t{20}, std::nullopt}, [&](absl::Status s) {
     status = s;
     done = true;
   });

@@ -15,6 +15,7 @@
 #include "nighthawk/common/rate_limiter_plugin_config_factory.h"
 #include "source/common/common/assert.h"
 #include "source/common/protobuf/utility.h"
+#include "source/common/ramp_reanchor.h"
 
 namespace Nighthawk {
 
@@ -173,12 +174,20 @@ absl::Status LinearRateLimiter::ApplyLiveRps(const Envoy::MonotonicTime t_bend,
   return absl::OkStatus();
 }
 
+absl::Status LinearRateLimiter::ApplyLiveRamp(const Envoy::MonotonicTime /*t_bend*/,
+                                              const RampShapeChange& /*change*/) {
+  // FORK-ONLY (We-Amp): M3 Task 5 -- the ramp knob requires the ramp plugin.
+  // The Task-2 whitelist validator gates it; this is the capability-surface
+  // backstop (a live-tunable plain limiter has no ramp to bend).
+  return absl::InvalidArgumentError(
+      "ramp: ramp bends require the linear-ramping rate limiter plugin to be configured "
+      "for the run; only requests_per_second updates are available on this limiter");
+}
+
 LinearRampingRateLimiterImpl::LinearRampingRateLimiterImpl(Envoy::TimeSource& time_source,
                                                            const std::chrono::nanoseconds ramp_time,
                                                            const Frequency frequency)
-    : RateLimiterBaseImpl(time_source), ramp_time_(ramp_time), frequency_(frequency),
-      target_freq_ns_(frequency_.value() / 1e9),
-      total_ramp_requests_(std::round(ramp_time.count() * target_freq_ns_ / 2.0)) {
+    : RateLimiterBaseImpl(time_source), ramp_time_(ramp_time), frequency_(frequency) {
   if (frequency_.value() <= 0) {
     throw NighthawkException(fmt::format("frequency must be > 0, value: {}", frequency.value()));
   }
@@ -189,28 +198,32 @@ LinearRampingRateLimiterImpl::LinearRampingRateLimiterImpl(Envoy::TimeSource& ti
 }
 
 bool LinearRampingRateLimiterImpl::tryAcquireOne() {
-  if (acquireable_count_) {
+  // FORK-ONLY (We-Amp): M3 Task 5 truthiness fix -- the gate is strictly
+  // greater-than, so a negative balance is never truthy (the A2b note's R3;
+  // the white-box probe test pins the gate itself). The stock bare-truthiness
+  // form would grant an acquisition sourced from negative credit.
+  if (acquireable_count_ > 0) {
     acquired_count_++;
-    return acquireable_count_--;
+    acquireable_count_--;
+    return true;
   }
-  const std::chrono::nanoseconds elapsed_time = elapsed();
-  int64_t total = 0;
-
-  if (elapsed_time < ramp_time_) {
-    double elapsed_fraction = 1.0;
-    elapsed_fraction -= static_cast<double>(ramp_time_.count() - elapsed_time.count()) /
-                        static_cast<double>(ramp_time_.count());
-
-    const double current_frequency = elapsed_fraction * frequency_.value();
-    // If we'd be at a constant pace, we can expect elapsed seconds * frequency requests.
-    // However, as we are linearly ramping, we can expect half of that, hence we
-    // divide by two.
-    total = std::round((elapsed_time.count() / 1e9) * current_frequency / 2.0);
-  } else {
-    total =
-        total_ramp_requests_ + std::round((elapsed_time - ramp_time_).count() * target_freq_ns_);
-  }
-  acquireable_count_ = total - acquired_count_;
+  // FORK-ONLY (We-Amp): M3 Task 5 -- the release count comes from the shared
+  // RampReanchor forms (bit-identical to the stock expressions above, one
+  // source of truth for the limiter and the re-anchor solver). After a live
+  // bend the schedule is anchored at the re-anchor origin with the
+  // acquired-count baseline frozen at the bend (the A2b note Q1: cumulative
+  // conservation, no windfall, silence bounded, credit >= 0 invariant).
+  const Envoy::MonotonicTime now = time_source_.monotonicTime();
+  const std::chrono::nanoseconds since_origin =
+      live_origin_.has_value() ? now - *live_origin_ : elapsed();
+  const int64_t total =
+      RampReanchor::CumulativeReleases({ramp_time_, static_cast<double>(frequency_.value())},
+                                       since_origin);
+  // No baseline offset here, unlike the linear limiter's grid restart: the
+  // re-anchored ORIGIN carries the baseline (the solve placed the new
+  // schedule where N_B(tau) == acquired at the bend), so the schedule's own
+  // count already accounts for the pre-bend acquisitions -- plain credit.
+  acquireable_count_ = total - static_cast<int64_t>(acquired_count_);
   return acquireable_count_ > 0 ? tryAcquireOne() : false;
 }
 
@@ -219,18 +232,68 @@ void LinearRampingRateLimiterImpl::releaseOne() {
   acquired_count_--;
 }
 
-absl::Status LinearRampingRateLimiterImpl::ApplyLiveRps(Envoy::MonotonicTime /*t_bend*/,
-                                                        uint32_t /*new_rps*/) {
-  // FORK-ONLY (We-Amp): M3 Task 3 CAPTURE-ONLY interim (C1). On this limiter
-  // the cumulative release schedule is a function of the target frequency
-  // (both ramp regimes above integrate f), so a live rps change IS ramp
-  // re-parameterization: it must go through the Task 5 re-anchoring
-  // (ApplyLiveRamp / ApplyLiveRps there, implementing Task 4's equations).
-  // Reject honestly, mutate nothing -- never silently mis-apply.
-  return absl::UnimplementedError(
-      "pending ramp re-anchoring: on a ramp-plugin run a live rps change sets the ramp's "
-      "target frequency (a ramp-shape change) and requires ramp re-anchoring, which is not "
-      "supported by this build yet");
+absl::Status LinearRampingRateLimiterImpl::ApplyLiveRps(const Envoy::MonotonicTime t_bend,
+                                                        const uint32_t new_rps) {
+  // FORK-ONLY (We-Amp): C1 -- on this limiter the cumulative release schedule
+  // is a function of the target frequency, so a live rps change IS ramp
+  // re-parameterization: preserve the ramp time, re-anchor under the new
+  // target (the A2b note's Q6 linear corollary, Task 5's real plugin-path
+  // rps knob; the Task 3 capture-only interim is superseded).
+  return ApplyLiveRamp(t_bend, RampShapeChange{std::nullopt, new_rps});
+}
+
+absl::Status LinearRampingRateLimiterImpl::ApplyLiveRamp(const Envoy::MonotonicTime t_bend,
+                                                         const RampShapeChange& change) {
+  const RampReanchor::RampSchedule next{
+      change.ramp_time.value_or(ramp_time_),
+      static_cast<double>(change.target_rps.value_or(frequency_.value()))};
+  if (next.ramp_time <= 0ns) {
+    return absl::InvalidArgumentError(
+        fmt::format("ramp.ramp_time: ramp time must be positive, got {}", next.ramp_time.count()));
+  }
+  if (next.target_rps < 1) {
+    return absl::InvalidArgumentError(
+        fmt::format("ramp.target_rps: target rps must be >= 1, got {}", next.target_rps));
+  }
+  if (start_time_ == std::nullopt) {
+    // The schedule never started (no acquisition attempted): there is no
+    // operating point to conserve; adopt the new schedule directly.
+    ramp_time_ = next.ramp_time;
+    frequency_ = Frequency(static_cast<uint64_t>(next.target_rps));
+    acquireable_count_ = 0;
+    return absl::OkStatus();
+  }
+  const Envoy::MonotonicTime now = time_source_.monotonicTime();
+  if (now + kLiveUpdateBendGrace < t_bend) {
+    // Invoked meaningfully ahead of the agreed bend: reject without
+    // mutation. The caller must schedule the apply at t_bend (the
+    // sequencer's dispatcher-posted bend timer fires there).
+    return absl::InvalidArgumentError(fmt::format(
+        "bend instant is in the future (t_bend - now = {}ns); invoke ApplyLiveRamp at the "
+        "agreed bend instant t_bend",
+        (t_bend - now).count()));
+  }
+  const std::chrono::nanoseconds elapsed_now = elapsed();
+  const RampReanchor::RampSchedule current{ramp_time_, static_cast<double>(frequency_.value())};
+  auto reanchor = RampReanchor::Reanchor(current, elapsed_now, acquired_count_, next);
+  if (!reanchor.ok()) {
+    return reanchor.status();
+  }
+  const double old_rate = RampReanchor::InstantaneousRate(current, elapsed_now);
+  ramp_time_ = next.ramp_time;
+  frequency_ = Frequency(static_cast<uint64_t>(next.target_rps));
+  live_origin_ = now - reanchor->new_origin_offset;
+  // The acquired-count baseline is baked into the re-anchored origin itself
+  // (N_B(tau) == acquired_count_ at the bend), so tryAcquireOne reads plain
+  // credit against it -- no separate baseline member.
+  // The outgoing schedule's leftover credit is discarded, never handed out
+  // across the bend (carrying it would be a windfall: the 8.7(c) artifact).
+  acquireable_count_ = 0;
+  ENVOY_LOG(warn, "live ramp bend applied: re-anchored elapsed {}ns, instantaneous rate {} -> {} "
+                  "(count conserved at {})",
+            reanchor->new_origin_offset.count(), old_rate,
+            RampReanchor::InstantaneousRate(next, reanchor->new_origin_offset), acquired_count_);
+  return absl::OkStatus();
 }
 
 RateLimiterPtr LinearRampingRateLimiterImplFactory::createRateLimiterPlugin(

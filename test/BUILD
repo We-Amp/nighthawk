@@ -771,3 +771,17 @@ envoy_cc_test(
         "@envoy//test/test_common:utility_lib",
     ],
 )
+
+# FORK-ONLY (We-Amp): spec 8.7 re-anchoring property tests (M3 Task 5, Review
+# Focus 1). Plain cc_test: the math library is pure (chrono + absl, no Envoy),
+# so the heavy property investment needs no engine link.
+cc_test(
+    name = "ramp_reanchor_test",
+    srcs = ["ramp_reanchor_test.cc"],
+    deps = [
+        "//source/common:ramp_reanchor_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@googletest//:gtest_main",
+    ],
+)

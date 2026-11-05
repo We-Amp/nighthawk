@@ -107,7 +107,7 @@ public:
   // on their side get no callback (the run's final stop exits this
   // dispatcher); the Task 6 orchestrator bounds that window with its run-end
   // resolution.
-  void applyLiveUpdate(Envoy::MonotonicTime t_bend, uint32_t new_rps,
+  void applyLiveUpdate(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                        std::function<void(absl::Status)> callback);
 
 protected:
@@ -147,7 +147,7 @@ protected:
   void updateStartBlockingTimeIfNeeded();
   // FORK-ONLY (We-Amp): M3 Task 3 -- applyLiveUpdate's dispatcher-side half;
   // always runs on this sequencer's own dispatcher.
-  void applyLiveUpdateOnDispatcherThread(Envoy::MonotonicTime t_bend, uint32_t new_rps,
+  void applyLiveUpdateOnDispatcherThread(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                                          std::function<void(absl::Status)> callback);
   // FORK-ONLY (We-Amp): the bend timer's body. Reads the pending bend from
   // the members below at fire time (the timer lambda captures only `this`),
@@ -191,7 +191,7 @@ private:
   // successful arming overwrites the previous (bends are not queued, so
   // there is never more than one pending bend).
   Envoy::MonotonicTime pending_bend_time_;
-  uint32_t pending_bend_rps_{0};
+  LiveKnobDelta pending_bend_delta_;
   std::function<void(absl::Status)> pending_bend_callback_;
 };
 

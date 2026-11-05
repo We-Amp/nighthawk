@@ -69,9 +69,9 @@ ClientWorkerImpl::ClientWorkerImpl(
       SequencerImpl* sequencer_ptr = &sequencer_impl;
       live_capability_cb_(
           0, captured_live_tunable,
-          [sequencer_ptr](Envoy::MonotonicTime t_bend, uint32_t new_rps,
+          [sequencer_ptr](Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                           std::function<void(absl::Status)> callback) {
-            sequencer_ptr->applyLiveUpdate(t_bend, new_rps, std::move(callback));
+            sequencer_ptr->applyLiveUpdate(t_bend, delta, std::move(callback));
           });
     }
   }
@@ -337,9 +337,9 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
     SequencerImpl* sequencer_ptr = &sequencer_impl;
     live_capability_cb_(
         phase_index, captured_live_tunable,
-        [sequencer_ptr](Envoy::MonotonicTime t_bend, uint32_t new_rps,
+        [sequencer_ptr](Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                         std::function<void(absl::Status)> callback) {
-          sequencer_ptr->applyLiveUpdate(t_bend, new_rps, std::move(callback));
+          sequencer_ptr->applyLiveUpdate(t_bend, delta, std::move(callback));
         });
   }
   // The sequencer factory only ever produces SequencerImpl instances; the

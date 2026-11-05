@@ -72,6 +72,11 @@ public:
   bool tryAcquireOne() override;
   void releaseOne() override;
   absl::Status ApplyLiveRps(Envoy::MonotonicTime t_bend, uint32_t new_rps) override;
+  // FORK-ONLY (We-Amp): M3 Task 5 -- the ramp knob is plugin-path only. The
+  // Task-2 whitelist validator already gates a ramp delta on the ramp plugin
+  // being configured; this honest rejection is the defensive backstop at the
+  // capability surface (a live-tunable plain limiter has no ramp to bend).
+  absl::Status ApplyLiveRamp(Envoy::MonotonicTime t_bend, const RampShapeChange& change) override;
 
 protected:
   int64_t acquireable_count_{0};
@@ -93,13 +98,17 @@ protected:
 /**
  * A rate limiter which linearly ramps up to the desired frequency over the specified ramp_time.
  */
-// FORK-ONLY (We-Amp): implements LiveTunableRateLimiter since M3 Task 3 --
-// CAPTURE-ONLY (C1): the factory captures the handle to this inner limiter
-// before ScheduledStartingRateLimiter wraps it, but a live rps change here
-// IS ramp re-parameterization (the cumulative release schedule is a
-// function of the target frequency), so ApplyLiveRps rejects honestly with
-// the `pending ramp re-anchoring` reason and mutates nothing. Task 5 owns
-// ApplyLiveRamp and the real plugin-path ApplyLiveRps.
+// FORK-ONLY (We-Amp): fully live-tunable since M3 Task 5 (A2b) -- the factory
+// captures the handle to this inner limiter before ScheduledStartingRateLimiter
+// wraps it, and both knobs apply: ApplyLiveRps (the C1 ruling: on this limiter
+// a target-frequency change IS ramp re-parameterization -- the A2b note's Q6
+// linear corollary) and ApplyLiveRamp (the ramp-shape bend). Both implement
+// the A2b note's piecewise re-anchoring (source/common/ramp_reanchor.h): the
+// new schedule's origin is solved so its integrated releases equal the
+// acquired count exactly, cumulative count conserved at the bend, credit
+// restarted at zero (no windfall), silence bounded, credit invariantly
+// non-negative (the R3 ruling -- negative credit is unreachable under the
+// origin solve).
 class LinearRampingRateLimiterImpl : public RateLimiterBaseImpl,
                                      public LiveTunableRateLimiter,
                                      public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
@@ -109,17 +118,30 @@ public:
   bool tryAcquireOne() override;
   void releaseOne() override;
   absl::Status ApplyLiveRps(Envoy::MonotonicTime t_bend, uint32_t new_rps) override;
+  absl::Status ApplyLiveRamp(Envoy::MonotonicTime t_bend, const RampShapeChange& change) override;
 
 protected:
   // FORK-ONLY (We-Amp): protected (not private) since M3 Task 3, matching
-  // LinearRateLimiter -- lets the white-box test probe pin Task 5's
-  // truthiness/clamp obligation.
+  // LinearRateLimiter -- lets the white-box test probe pin the truthiness
+  // gate (the M3 Task 5 fix keeps this probe honest).
   int64_t acquireable_count_{0};
   uint64_t acquired_count_{0};
-  const std::chrono::nanoseconds ramp_time_;
-  const Frequency frequency_;
-  const double target_freq_ns_;
-  const int64_t total_ramp_requests_;
+  // FORK-ONLY (We-Amp): non-const since M3 Task 5 -- the live bend
+  // re-parameterizes the schedule in place. The cumulative release count is
+  // computed through RampReanchor::CumulativeReleases (the shared stock
+  // forms), so these two members are its only schedule state.
+  std::chrono::nanoseconds ramp_time_;
+  Frequency frequency_;
+  // FORK-ONLY (We-Amp): the re-anchor origin (M3 Task 5, the A2b note Q1).
+  // When set, the release count is computed at (now - live_origin_): the
+  // solve placed the new schedule's origin so that N_B(tau) == the acquired
+  // count AT the bend, so the schedule's own count already carries the
+  // pre-bend acquisitions (cumulative conservation) -- credit is plain
+  // total - acquired, the first post-bend release lands on the new
+  // schedule's own grid (no windfall), and silence is bounded by two of the
+  // new schedule's acquisition intervals. Unset keeps the stock schedule
+  // (anchored at the first acquisition attempt).
+  std::optional<Envoy::MonotonicTime> live_origin_;
 };
 
 // Factory class for creating LinearRampingRateLimiterImpl objects.

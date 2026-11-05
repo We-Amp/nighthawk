@@ -733,11 +733,13 @@ TEST_F(RateLimiterTest, ApplyLiveRpsRejectsNonPositiveRps) {
   EXPECT_THAT(status.message(), testing::HasSubstr(">= 1"));
 }
 
-// CAPTURE-ONLY interim (C1): the ramping limiter's ApplyLiveRps rejects with
-// the honest `pending ramp re-anchoring` reason and mutates nothing -- the
-// acquisition schedule matches an un-bent counterfactual exactly after the
-// rejected apply.
-TEST_F(RateLimiterTest, RampingLimiterApplyLiveRpsPendingRejection) {
+// C1 superseded (M3 Task 5): the plugin-path rps knob IS ramp
+// re-parameterization. Applying an rps delta through the ramping limiter
+// re-anchors the schedule: cumulative count conserved at the bend (the bent
+// limiter matches the counterfactual up to it), then the cadence follows the
+// new target (5 Hz over the next second, vs the counterfactual's 10 Hz) --
+// the same update surface as the non-plugin path (Review Focus 2, plugin leg).
+TEST_F(RateLimiterTest, RampingLimiterApplyLiveRpsReanchors) {
   Envoy::Event::SimulatedTimeSystem time_system;
   LinearRampingRateLimiterImpl bent(time_system, 200ms, 10_Hz);
   LinearRampingRateLimiterImpl counterfactual(time_system, 200ms, 10_Hz);
@@ -750,29 +752,123 @@ TEST_F(RateLimiterTest, RampingLimiterApplyLiveRpsPendingRejection) {
     time_system.advanceTimeWait(1ms);
   }
   ASSERT_GT(total_bent, 0u);
-  ASSERT_EQ(total_bent, total_cf);
+  ASSERT_EQ(total_bent, total_cf); // conserved up to the bend
+  const uint64_t at_bend = total_bent;
 
   const absl::Status status = bent.ApplyLiveRps(time_system.monotonicTime(), 5);
-  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
-  EXPECT_THAT(status.message(), testing::HasSubstr("pending ramp re-anchoring"));
+  ASSERT_TRUE(status.ok()) << status.message();
 
-  // Untouched: the bent limiter still matches the counterfactual exactly.
+  // Post-bend: the bent limiter releases at 5 Hz (3 grants in the next 600ms,
+  // plus/minus the grid), the counterfactual at its unchanged 10 Hz (6).
   for (int i = 0; i < 600; i++) {
     total_bent += acquireAll(bent);
     total_cf += acquireAll(counterfactual);
     time_system.advanceTimeWait(1ms);
   }
-  EXPECT_EQ(total_bent, total_cf);
+  EXPECT_NEAR(total_bent - at_bend, 3, 1);
+  EXPECT_NEAR(total_cf - at_bend, 6, 1);
 }
 
-// Task 5 obligation pin: the ramping limiter gates credit on BARE TRUTHINESS
-// (`if (acquireable_count_)`, rate_limiter_impl.cc), so negative credit --
-// which a Task 5 down-bend into the ramp regimes can produce -- would be
-// truthy and handed out as an acquisition. Task 5's truthiness fix owns
-// this. The body FAILS against the stock limiter: with credit forced to -5
-// the stock gate grants an acquisition sourced from the negative balance
-// (credit drops to -6). Enable together with the fix.
-TEST_F(RateLimiterTest, DISABLED_RampingLimiterNegativeCreditClamped) {
+// The ramp-shape bend itself (A2b): collapse a 2s ramp to 500ms mid-ramp at
+// the same 10 Hz target. Count conserved at the bend; afterwards the
+// instantaneous rate is the re-anchored new curve's (steepened: the collapse
+// multiplies the rate by sqrt(T_A/T_B) at the re-anchored point), and the
+// schedule reaches the full target much sooner than the counterfactual.
+TEST_F(RateLimiterTest, RampingBendPreservesCumulativeCountAndRate) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRampingRateLimiterImpl bent(time_system, 2s, 10_Hz);
+  LinearRampingRateLimiterImpl counterfactual(time_system, 2s, 10_Hz);
+
+  uint64_t total_bent = 0;
+  uint64_t total_cf = 0;
+  for (int i = 0; i < 500; i++) { // 500ms into the 2s ramp
+    total_bent += acquireAll(bent);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_GT(total_bent, 0u);
+  ASSERT_EQ(total_bent, total_cf); // conserved up to the bend
+  const uint64_t at_bend = total_bent;
+
+  const absl::Status status =
+      bent.ApplyLiveRamp(time_system.monotonicTime(), RampShapeChange{500ms, std::nullopt});
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  // Post-bend over 1750ms: the collapsed ramp completes at 500ms re-anchored
+  // elapsed, so the bent limiter is at its full 10 Hz long before the
+  // counterfactual (still ramping until its 2s mark). The design note's
+  // closed form: r_B(tau) = e_b * sqrt(f_A f_B / (T_A T_B)) ~= 2.5x the old
+  // instantaneous rate at the bend.
+  for (int i = 0; i < 1750; i++) {
+    total_bent += acquireAll(bent);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  EXPECT_GT(total_bent - at_bend, 15); // well into the new curve
+  EXPECT_GT(total_cf - at_bend, 0);
+  EXPECT_LT(total_cf - at_bend, total_bent - at_bend); // the bend actually steepened
+}
+
+// The R3 ruling through the real limiter: a hard down-bend conserves the
+// count, never grants from negative credit (credit >= 0 at every probe), and
+// the post-bend silence is bounded by two of the new schedule's intervals.
+TEST_F(RateLimiterTest, RampingDownBendConservesAndHoldsAtZeroCredit) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  CreditProbeRampingRateLimiter bent(time_system, 200ms, 50_Hz);
+  LinearRampingRateLimiterImpl counterfactual(time_system, 200ms, 50_Hz);
+
+  uint64_t total_bent = 0;
+  uint64_t total_cf = 0;
+  for (int i = 0; i < 600; i++) {
+    total_bent += acquireAll(bent);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_GT(total_bent, 0u);
+  ASSERT_EQ(total_bent, total_cf); // conserved up to the bend
+
+  const absl::Status status =
+      bent.ApplyLiveRps(time_system.monotonicTime(), 5); // 50 Hz -> 5 Hz
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  int min_credit = 0;
+  uint64_t grants_after_bend = 0;
+  uint64_t grants_cf = 0;
+  bool first_grant_seen = false;
+  std::chrono::nanoseconds first_grant_gap{0};
+  for (int i = 0; i < 1000; i++) { // 1s at the new 5 Hz: ~5 grants
+    const int64_t credit_before = bent.credit();
+    min_credit = std::min(min_credit, static_cast<int>(credit_before));
+    if (bent.tryAcquireOne()) {
+      grants_after_bend++;
+      if (!first_grant_seen) {
+        first_grant_seen = true;
+        first_grant_gap = std::chrono::milliseconds(i);
+      }
+    }
+    grants_cf += counterfactual.tryAcquireOne() ? 1 : 0;
+    time_system.advanceTimeWait(1ms);
+  }
+  // Credit never sourced from, or left at, a negative balance (R3: the
+  // origin solve makes negative credit unreachable under the re-anchor).
+  EXPECT_EQ(min_credit, 0);
+  // The first post-bend grant is bounded by two of the new schedule's
+  // intervals (200ms each): 400ms plus slack.
+  EXPECT_TRUE(first_grant_seen);
+  EXPECT_LE(first_grant_gap, 500ms);
+  // ~5 grants at the new rate, ~50 at the counterfactual's unchanged 50 Hz.
+  EXPECT_NEAR(grants_after_bend, 5, 2);
+  EXPECT_NEAR(grants_cf, 50, 2);
+}
+
+// The truthiness-fix pin (M3 Task 5, the A2b note's R3): the ramping
+// limiter's credit gate must be strictly greater-than, so an acquisition is
+// never sourced from a negative balance. The stock bare-truthiness form
+// (`if (acquireable_count_)`) granted from forced negative credit (credit
+// dropped to -6); the fixed gate rejects it. The re-anchor mechanism makes
+// negative credit unreachable in practice -- this pins the gate itself as
+// defense in depth.
+TEST_F(RateLimiterTest, RampingLimiterNegativeCreditClamped) {
   Envoy::Event::SimulatedTimeSystem time_system;
   CreditProbeRampingRateLimiter limiter(time_system, 2s, 10_Hz);
   acquireAll(limiter); // start the schedule
@@ -783,6 +879,65 @@ TEST_F(RateLimiterTest, DISABLED_RampingLimiterNegativeCreditClamped) {
   EXPECT_TRUE(!granted || limiter.credit() >= 0)
       << "an acquisition was sourced from negative acquireable_count_";
   EXPECT_EQ(limiter.acquired(), granted ? 1u : 0u);
+}
+
+// The bend contract: an apply invoked meaningfully AHEAD of t_bend is
+// rejected without mutation; invalid schedule deltas are rejected.
+TEST_F(RateLimiterTest, RampingApplyLiveRampRejectsFutureBendAndInvalidDelta) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRampingRateLimiterImpl limiter(time_system, 2s, 10_Hz);
+  acquireAll(limiter);
+  time_system.advanceTimeWait(100ms);
+
+  const absl::Status future =
+      limiter.ApplyLiveRamp(time_system.monotonicTime() + std::chrono::hours(1),
+                            RampShapeChange{std::nullopt, 20u});
+  EXPECT_EQ(future.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(future.message(), HasSubstr("bend instant is in the future"));
+
+  const absl::Status zero_target =
+      limiter.ApplyLiveRamp(time_system.monotonicTime(), RampShapeChange{std::nullopt, 0u});
+  EXPECT_EQ(zero_target.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(zero_target.message(), HasSubstr("target rps must be >= 1"));
+
+  const absl::Status zero_ramp =
+      limiter.ApplyLiveRamp(time_system.monotonicTime(), RampShapeChange{0ns, 20u});
+  EXPECT_EQ(zero_ramp.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(zero_ramp.message(), HasSubstr("ramp time must be positive"));
+
+  const absl::Status zero_rps = limiter.ApplyLiveRps(time_system.monotonicTime(), 0);
+  EXPECT_EQ(zero_rps.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(zero_rps.message(), HasSubstr("target rps must be >= 1"));
+}
+
+// An un-started schedule has no operating point to conserve: the bend adopts
+// the new schedule directly (stock anchoring applies from the first attempt).
+TEST_F(RateLimiterTest, RampingApplyLiveRampAdoptsUnstartedSchedule) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRampingRateLimiterImpl limiter(time_system, 2s, 10_Hz);
+  const absl::Status status =
+      limiter.ApplyLiveRamp(time_system.monotonicTime(), RampShapeChange{std::nullopt, 20u});
+  ASSERT_TRUE(status.ok()) << status.message();
+  uint64_t total = 0;
+  for (int i = 0; i < 1000; i++) { // one second at the new 20 Hz ramp
+    total += acquireAll(limiter);
+    time_system.advanceTimeWait(1ms);
+  }
+  EXPECT_NEAR(total, 5, 2); // 20 Hz ramping to full over 2s: round(1s * 10Hz / 2) = 5
+}
+
+// The ramp knob is plugin-path only: the plain linear limiter's capability
+// surface rejects a ramp delta honestly (the validator gates it first; this
+// is the backstop).
+TEST_F(RateLimiterTest, LinearLimiterApplyLiveRampRejected) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRateLimiter limiter(time_system, 10_Hz);
+  acquireAll(limiter);
+  time_system.advanceTimeWait(100ms);
+  const absl::Status status =
+      limiter.ApplyLiveRamp(time_system.monotonicTime(), RampShapeChange{1s, 20u});
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), HasSubstr("linear-ramping rate limiter plugin"));
 }
 
 } // namespace Nighthawk

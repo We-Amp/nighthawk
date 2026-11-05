@@ -3,6 +3,7 @@ load(
     "envoy_cc_library",
     "envoy_package",
 )
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 licenses(["notice"])  # Apache 2
 
@@ -104,6 +105,20 @@ envoy_cc_library(
     ],
 )
 
+# FORK-ONLY (We-Amp): the spec 8.7 ramp re-anchoring math (M3 Task 5).
+# Deliberately a plain cc_library with no Envoy deps: the math is pure
+# (chrono + absl only) and its property tests drive it without an engine.
+cc_library(
+    name = "ramp_reanchor_lib",
+    srcs = ["ramp_reanchor.cc"],
+    hdrs = ["ramp_reanchor.h"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 envoy_cc_library(
     name = "nighthawk_common_lib",
     srcs = [
@@ -139,6 +154,7 @@ envoy_cc_library(
         "//api/client:grpc_service_lib",
         "//api/rate_limiter:rate_limiter_plugin_cc_proto",
         "//include/nighthawk/client:client_includes",
+        ":ramp_reanchor_lib",
         "//include/nighthawk/common:base_includes",
         "//internal_proto/statistic:statistic_cc_proto",
         "@com_google_absl//absl/random",

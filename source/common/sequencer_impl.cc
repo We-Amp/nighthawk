@@ -186,15 +186,33 @@ void SequencerImpl::waitForCompletion() {
 // per-phase registry entry with a fresh sequencer at each boundary, so a
 // bend racing a boundary can only land on the phase it targeted (and a
 // bend past the boundary is Task 6's pre-fan-out rejection, not ours).
-void SequencerImpl::applyLiveUpdate(Envoy::MonotonicTime t_bend, uint32_t new_rps,
+namespace {
+// Applies a normalized knob delta to the captured limiter. Mixed deltas
+// compose in a fixed order (live_tunable_rate_limiter.h): the rps knob
+// first, then the ramp change on the resulting schedule.
+absl::Status ApplyLiveKnobDelta(LiveTunableRateLimiter* limiter, const Envoy::MonotonicTime t_bend,
+                                const LiveKnobDelta& delta) {
+  absl::Status status = absl::OkStatus();
+  if (delta.new_rps.has_value()) {
+    status = limiter->ApplyLiveRps(t_bend, *delta.new_rps);
+  }
+  if (status.ok() && delta.ramp.has_value()) {
+    status = limiter->ApplyLiveRamp(t_bend, *delta.ramp);
+  }
+  return status;
+}
+} // namespace
+
+void SequencerImpl::applyLiveUpdate(Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
                                     std::function<void(absl::Status)> callback) {
-  dispatcher_.post([this, t_bend, new_rps, callback = std::move(callback)]() {
-    applyLiveUpdateOnDispatcherThread(t_bend, new_rps, std::move(callback));
+  dispatcher_.post([this, t_bend, delta, callback = std::move(callback)]() {
+    applyLiveUpdateOnDispatcherThread(t_bend, delta, std::move(callback));
   });
 }
 
 void SequencerImpl::applyLiveUpdateOnDispatcherThread(
-    Envoy::MonotonicTime t_bend, uint32_t new_rps, std::function<void(absl::Status)> callback) {
+    Envoy::MonotonicTime t_bend, const LiveKnobDelta& delta,
+    std::function<void(absl::Status)> callback) {
   if (live_tunable_rate_limiter_ == nullptr) {
     callback(absl::InternalError(
         "this worker's current phase has no captured live-update capability "
@@ -224,23 +242,23 @@ void SequencerImpl::applyLiveUpdateOnDispatcherThread(
       live_update_timer_ = dispatcher_.createTimer([this]() { firePendingBend(); });
     }
     pending_bend_time_ = t_bend;
-    pending_bend_rps_ = new_rps;
+    pending_bend_delta_ = delta;
     pending_bend_callback_ = std::move(callback);
     bend_timer_pending_ = true;
     live_update_timer_->enableHRTimer(
         std::chrono::duration_cast<std::chrono::milliseconds>(t_bend - now));
     return;
   }
-  callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
+  callback(ApplyLiveKnobDelta(live_tunable_rate_limiter_, t_bend, delta));
 }
 
 void SequencerImpl::firePendingBend() {
   bend_timer_pending_ = false;
   const Envoy::MonotonicTime t_bend = pending_bend_time_;
-  const uint32_t new_rps = pending_bend_rps_;
+  const LiveKnobDelta delta = pending_bend_delta_;
   auto callback = std::move(pending_bend_callback_);
   pending_bend_callback_ = nullptr;
-  callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
+  callback(ApplyLiveKnobDelta(live_tunable_rate_limiter_, t_bend, delta));
 }
 
 StatisticPtrMap SequencerImpl::statistics() const {
