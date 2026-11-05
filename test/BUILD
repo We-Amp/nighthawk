@@ -806,3 +806,32 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+# FORK-ONLY (We-Amp): the TUI regression set as ONE label. Every tui_* test
+# target must stay listed here, so a whole-suite regression run can never
+# silently skip a target that a task forgot to run (the missed-target class:
+# tui_session_pipeline_test stopped compiling after a record-type change and
+# nobody noticed because the target was not in the run list).
+test_suite(
+    name = "tui_regression_tests",
+    tests = [
+        ":tui_app_test",
+        ":tui_charts_test",
+        ":tui_flamegraph_pipeline_test",
+        ":tui_flamegraph_test",
+        ":tui_knob_pane_test",
+        ":tui_knob_steering_test",
+        ":tui_layout_test",
+        ":tui_phase_timeline_test",
+        ":tui_pprof_fold_test",
+        ":tui_profile_fetcher_test",
+        ":tui_profile_session_test",
+        ":tui_profile_windows_test",
+        ":tui_run_feed_test",
+        ":tui_session_pipeline_test",
+        ":tui_session_test",
+        ":tui_start_run_dialog_test",
+        ":tui_sut_stats_test",
+        ":tui_view_model_test",
+    ],
+)

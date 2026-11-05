@@ -1198,6 +1198,10 @@ TEST_F(SessionPipelineTest, PhaseBoundariesStreamAndPersist) {
       // This run opens no profile windows.
       ADD_FAILURE() << "unexpected profile_window frame";
       break;
+    case SessionRecord::kKnobEpoch:
+      // This run sends no knob turns.
+      ADD_FAILURE() << "unexpected knob_epoch frame";
+      break;
     case SessionRecord::RECORD_NOT_SET:
       ADD_FAILURE() << "unset record frame";
       break;
