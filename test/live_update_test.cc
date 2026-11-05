@@ -1521,14 +1521,115 @@ TEST_F(LiveCapabilityFanOutTest, FanOutTargetsActiveWorkersInOrderAtOneInstant) 
   // Worker-id-ordered posts, one per worker, one shared t_bend.
   ASSERT_EQ(post_order_.size(), 3u);
   EXPECT_EQ(post_order_, (std::vector<int>{0, 1, 2}));
+  for (size_t i = 0; i < workers_.size(); i++) {
+    const FakeFanOutWorker& worker = *workers_[i];
+    ASSERT_EQ(worker.applies.size(), 1u);
+    EXPECT_EQ(worker.applies[0].epoch_id, "epoch-1");
+    EXPECT_EQ(worker.applies[0].t_bend.time_since_epoch().count(), t_bend_ns);
+    ASSERT_EQ(worker.applies[0].delta.new_rps.has_value(), true);
+    // Task 8a: the delta speaks GLOBAL rps -- each worker gets its share of
+    // 20 across 3 active workers (base 6, remainder to the lowest indexes),
+    // pinned in detail by BendDeltaRemainderGoesToLowestWorkerIndexes below.
+    EXPECT_EQ(*worker.applies[0].delta.new_rps, i < 2 ? 7u : 6u);
+    EXPECT_EQ(worker.cancel_calls, 0);
+  }
+}
+
+// Task 8a: the knob speaks GLOBAL rps. A no-op bend AT the phase's declared
+// rps must leave every worker's limiter at its phase-begin share (the total
+// observed rate unchanged -- not N x the declaration), and a bend to 2x the
+// declaration must exactly double the total. The division happens at the
+// fan-out, mirroring the phase-begin rule.
+TEST_F(LiveCapabilityFanOutTest, BendDeltaDividesAcrossWorkersLikePhaseStart) {
+  for (int i = 0; i < 4; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  // The phase declared a global 8 rps; phase begin paced 2 per worker.
+  declared_schedule_.new_rps = 8;
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+
+  // The no-op bend: every worker keeps its phase-begin share of 2, so the
+  // total observed rate is unchanged (8, never 4 x 8).
+  const UpdateResult noop = applier.ApplyDeltas(RpsRequest(8), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(noop.applied()) << noop.rejection_reason();
+  uint32_t total = 0;
   for (const std::unique_ptr<FakeFanOutWorker>& worker : workers_) {
     ASSERT_EQ(worker->applies.size(), 1u);
-    EXPECT_EQ(worker->applies[0].epoch_id, "epoch-1");
-    EXPECT_EQ(worker->applies[0].t_bend.time_since_epoch().count(), t_bend_ns);
-    ASSERT_EQ(worker->applies[0].delta.new_rps.has_value(), true);
-    EXPECT_EQ(*worker->applies[0].delta.new_rps, 20u);
-    EXPECT_EQ(worker->cancel_calls, 0);
+    ASSERT_TRUE(worker->applies[0].delta.new_rps.has_value());
+    EXPECT_EQ(*worker->applies[0].delta.new_rps, 2u);
+    total += *worker->applies[0].delta.new_rps;
   }
+  EXPECT_EQ(total, 8u) << "a no-op bend at the declared rps must not multiply the load";
+
+  // Bend to 2x the declaration (16 global): exactly 4 per worker, 16 total.
+  const EngineInstant second_instant{2000, fake_now_.time_since_epoch().count() + 1000000000};
+  const UpdateResult double_bend =
+      applier.ApplyDeltas(RpsRequest(16), "epoch-2", second_instant, Deadline());
+  ASSERT_TRUE(double_bend.applied()) << double_bend.rejection_reason();
+  total = 0;
+  for (const std::unique_ptr<FakeFanOutWorker>& worker : workers_) {
+    ASSERT_EQ(worker->applies.size(), 2u);
+    ASSERT_TRUE(worker->applies[1].delta.new_rps.has_value());
+    EXPECT_EQ(*worker->applies[1].delta.new_rps, 4u);
+    total += *worker->applies[1].delta.new_rps;
+  }
+  EXPECT_EQ(total, 16u) << "bending to 2x the declaration must exactly double the total";
+}
+
+// The remainder goes to the LOWEST worker indexes, exactly like phase begin:
+// 20 global across 3 active workers paces 7/7/6. The ramp knob's target rps
+// is divided by the same rule.
+TEST_F(LiveCapabilityFanOutTest, BendDeltaRemainderGoesToLowestWorkerIndexes) {
+  for (int i = 0; i < 3; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(result.applied()) << result.rejection_reason();
+  EXPECT_EQ(*workers_[0]->applies[0].delta.new_rps, 7u);
+  EXPECT_EQ(*workers_[1]->applies[0].delta.new_rps, 7u);
+  EXPECT_EQ(*workers_[2]->applies[0].delta.new_rps, 6u);
+
+  // The ramp knob's target is a GLOBAL rate too: 100 across 3 workers is
+  // 34/33/33; the ramp time (a shape, not a rate) passes through undivided.
+  // One KnobDelta carries both ramp fields (the oneof must not be duplicated).
+  UpdateRequest ramp_bend;
+  nighthawk::client::RampShapeDelta* ramp_delta = ramp_bend.add_deltas()->mutable_ramp();
+  ramp_delta->mutable_ramp_time()->set_seconds(5);
+  ramp_delta->mutable_target_rps()->set_value(100);
+  const EngineInstant second_instant{2000, fake_now_.time_since_epoch().count() + 1000000000};
+  const UpdateResult ramp_result =
+      applier.ApplyDeltas(ramp_bend, "epoch-2", second_instant, Deadline());
+  ASSERT_TRUE(ramp_result.applied()) << ramp_result.rejection_reason();
+  const uint32_t expected_targets[3] = {34u, 33u, 33u};
+  for (size_t i = 0; i < workers_.size(); i++) {
+    ASSERT_EQ(workers_[i]->applies.size(), 2u);
+    ASSERT_TRUE(workers_[i]->applies[1].delta.ramp.has_value());
+    ASSERT_TRUE(workers_[i]->applies[1].delta.ramp->target_rps.has_value());
+    EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->target_rps, expected_targets[i]);
+    // The ramp time passes through undivided (identical on every worker --
+    // the shape is global; only the target rps divides). NOTE: the absolute
+    // value is NormalizeDelta's nanoseconds-of-proto-seconds conversion, a
+    // pre-existing quirk parked out of this task's scope.
+    ASSERT_TRUE(workers_[i]->applies[1].delta.ramp->ramp_time.has_value());
+    EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->ramp_time,
+              *workers_[0]->applies[1].delta.ramp->ramp_time);
+  }
+}
+
+// A single-worker phase is the identity: the declared global rate IS the
+// worker's rate.
+TEST_F(LiveCapabilityFanOutTest, BendDeltaSingleWorkerPhaseIsIdentity) {
+  workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result = applier.ApplyDeltas(RpsRequest(20), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(result.applied()) << result.rejection_reason();
+  ASSERT_EQ(workers_[0]->applies.size(), 1u);
+  ASSERT_TRUE(workers_[0]->applies[0].delta.new_rps.has_value());
+  EXPECT_EQ(*workers_[0]->applies[0].delta.new_rps, 20u);
 }
 
 // The staging-confirm ruling (the PRIMARY failure path): a worker that
@@ -1594,7 +1695,11 @@ TEST_F(LiveCapabilityFanOutTest, PartialFanOutRollsBackHonestlyAtTR) {
   EXPECT_GT(rollback.t_bend.time_since_epoch().count(), t_bend_ns)
       << "the rollback re-apply must run at t_r > t_bend, never a naive re-apply at the bend";
   ASSERT_TRUE(rollback.delta.new_rps.has_value());
-  EXPECT_EQ(*rollback.delta.new_rps, 10u) << "the PRIOR schedule is restored";
+  // The tracked prior schedule is the declared GLOBAL rps; the rollback
+  // re-apply carries each worker's share of it (10 across 2 workers), the
+  // same division the forward apply used (Task 8a) -- never the full global
+  // value re-applied per worker (the M2-burstfix multiplication class).
+  EXPECT_EQ(*rollback.delta.new_rps, 5u) << "the PRIOR schedule is restored";
   EXPECT_EQ(rollback.epoch_id, "") << "the prior (empty) epoch id is restored";
 
   // Worker 1 never applied: no rollback post (it is already on the prior
@@ -1623,11 +1728,12 @@ TEST_F(LiveCapabilityFanOutTest, SequentialBendsRollBackToPreviousScheduleAndEpo
   const UpdateResult second =
       applier.ApplyDeltas(RpsRequest(30), "epoch-2", second_instant, Deadline());
   ASSERT_FALSE(second.applied());
-  // The rollback restores the FIRST bend's state: schedule 20, epoch-1.
+  // The rollback restores the FIRST bend's state: schedule 20 global
+  // (epoch-1), each worker re-applied its own share of it (Task 8a).
   ASSERT_EQ(workers_[0]->applies.size(), 3u);
   const FakeFanOutWorker::ApplyRecord& rollback = workers_[0]->applies[2];
   EXPECT_EQ(rollback.epoch_id, "epoch-1");
-  EXPECT_EQ(*rollback.delta.new_rps, 20u);
+  EXPECT_EQ(*rollback.delta.new_rps, 10u);
 }
 
 // The rollback prior-state for a MIXED applied bend carries the full prior
@@ -1668,10 +1774,13 @@ TEST_F(LiveCapabilityFanOutTest, MixedBendRollbackCarriesFullPriorSchedule) {
   ASSERT_EQ(workers_[1]->applies.size(), 3u);
   const FakeFanOutWorker::ApplyRecord& rollback = workers_[1]->applies[2];
   ASSERT_TRUE(rollback.delta.new_rps.has_value());
-  EXPECT_EQ(*rollback.delta.new_rps, 20u);
+  // The FULL prior schedule is restored, in each worker's share of the
+  // global values (Task 8a): 20 -> 10, 90 -> 45 across 2 workers; the ramp
+  // time passes through undivided.
+  EXPECT_EQ(*rollback.delta.new_rps, 10u);
   ASSERT_TRUE(rollback.delta.ramp.has_value());
   ASSERT_TRUE(rollback.delta.ramp->target_rps.has_value());
-  EXPECT_EQ(*rollback.delta.ramp->target_rps, 90u);
+  EXPECT_EQ(*rollback.delta.ramp->target_rps, 45u);
   ASSERT_TRUE(rollback.delta.ramp->ramp_time.has_value());
   EXPECT_EQ(*rollback.delta.ramp->ramp_time, std::chrono::seconds(1));
 }

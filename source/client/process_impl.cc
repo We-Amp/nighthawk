@@ -948,6 +948,38 @@ constexpr absl::Duration kLiveUpdateRollbackReserve = absl::Seconds(2);
 // says so).
 constexpr absl::Duration kLiveUpdateFenceDrainBound = absl::Seconds(8);
 
+// FORK-ONLY (M3 Task 8a): the live knob speaks GLOBAL rps -- "set rate to X"
+// means the phase's total, exactly like a phase's declared requests_per_second
+// since the M2 burstfix. The fan-out divides a delta across the ACTIVE
+// workers with the same deterministic rule the phase-begin loop uses: base =
+// declared / active, the remainder to the lowest worker indexes, and a
+// declaration below the worker count paces 1 rps per worker rather than
+// constructing a zero-rate limiter. The ramp knob's target rps is a global
+// rate too and divides by the same rule; the ramp time (a shape, not a rate)
+// passes through undivided. The baseline (the rollback prior-state tracker)
+// stays declared-global: every apply post -- forward AND rollback -- divides
+// at this one point, so a no-op bend at the declared rps is a true no-op on
+// every worker and a rollback restores each worker's true per-worker
+// operating point (never the full global value re-applied N times).
+LiveKnobDelta PerWorkerDelta(const LiveKnobDelta& global_delta, uint32_t worker_id,
+                             uint32_t active_workers) {
+  ASSERT(active_workers > 0);
+  ASSERT(worker_id < active_workers);
+  LiveKnobDelta per_worker = global_delta;
+  const auto divide = [worker_id, active_workers](uint32_t declared) -> uint32_t {
+    const uint32_t base = declared / active_workers;
+    const uint32_t remainder = declared % active_workers;
+    return base > 0 ? base + (worker_id < remainder ? 1u : 0u) : 1u;
+  };
+  if (per_worker.new_rps.has_value()) {
+    per_worker.new_rps = divide(*per_worker.new_rps);
+  }
+  if (per_worker.ramp.has_value() && per_worker.ramp->target_rps.has_value()) {
+    per_worker.ramp->target_rps = divide(*per_worker.ramp->target_rps);
+  }
+  return per_worker;
+}
+
 } // namespace
 
 LiveCapabilityFanOutApplier::LiveCapabilityFanOutApplier(LiveFanOutContext context)
@@ -1101,7 +1133,11 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
     return [this, worker_id](absl::Status status) { RecordApplyOutcome(worker_id, status); };
   };
   for (uint32_t worker_id = 0; worker_id < active_workers; ++worker_id) {
-    entries[worker_id].apply(t_bend, epoch_id, delta, stage_cb(worker_id), apply_cb(worker_id));
+    // Task 8a: the delta is GLOBAL; each worker is posted its own share (the
+    // phase-begin division), so a no-op bend at the declared rps re-arms
+    // every worker at exactly the rate it is already pacing.
+    entries[worker_id].apply(t_bend, epoch_id, PerWorkerDelta(delta, worker_id, active_workers),
+                             stage_cb(worker_id), apply_cb(worker_id));
   }
 
   // Deadline budget: the forward waits hold back a reserve for the residual
@@ -1260,8 +1296,9 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
         if (!outcome.status.ok()) {
           continue; // never mutated: nothing to roll back
         }
-        entries[outcome.worker_id].apply(t_r, prior_epoch, prior, rollback_stage,
-                                         rollback_cb(outcome.worker_id));
+        entries[outcome.worker_id].apply(t_r, prior_epoch,
+                                         PerWorkerDelta(prior, outcome.worker_id, active_workers),
+                                         rollback_stage, rollback_cb(outcome.worker_id));
         rolled_back_workers.push_back(outcome.worker_id);
       }
       std::string rollback_failures;
