@@ -563,9 +563,18 @@ envoy_cc_test(
     name = "live_update_test",
     srcs = ["live_update_test.cc"],
     deps = [
+        "//source/client:nighthawk_client_lib",
         "//source/client:nighthawk_service_lib",
+        "//test/mocks/client:mock_options",
+        "//test/mocks/common:mock_platform_util",
+        "//test/mocks/common:mock_termination_predicate",
         "//test/test_common:environment_lib",
+        "@envoy//test/mocks/event:event_mocks",
+        "@envoy//test/mocks/stats:stats_mocks",
+        "@envoy//test/mocks/tracing:tracing_mocks",
         "@envoy//test/test_common:network_utility_lib",
+        "@envoy//test/test_common:simulated_time_system_lib",
+        "@envoy//test/test_common:utility_lib",
     ],
 )
 

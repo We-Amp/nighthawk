@@ -27,7 +27,10 @@ ClientWorkerImpl::ClientWorkerImpl(
     std::vector<UserDefinedOutputNamePluginPair> user_defined_output_plugins,
     const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)>&
         live_snapshot_partial_cb,
-    std::chrono::milliseconds live_snapshot_interval, bool phase_driven_run)
+    std::chrono::milliseconds live_snapshot_interval, bool phase_driven_run,
+    std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
+                       Nighthawk::LiveApplyFn)>
+        live_capability_cb)
     : WorkerImpl(api, tls, store), api_(api),
       time_source_(std::make_unique<CachedTimeSourceImpl>(*dispatcher_)),
       termination_predicate_factory_(termination_predicate_factory),
@@ -44,21 +47,35 @@ ClientWorkerImpl::ClientWorkerImpl(
       sequencer_target_([this](CompletionCallback f) -> bool {
         return benchmark_client_->tryStartRequest(std::move(f));
       }),
-      phase_(
-          phase_driven_run
-              ? nullptr
-              : std::make_unique<PhaseImpl>(
-                    "main",
-                    sequencer_factory_.create(
-                        *time_source_, *dispatcher_, sequencer_target_,
-                        termination_predicate_factory_.create(*time_source_, *worker_number_scope_,
-                                                              starting_time),
-                        *worker_number_scope_, starting_time, api),
-                    true)),
       hardcoded_warmup_style_(hardcoded_warmup_style),
       live_snapshot_partial_cb_(live_snapshot_partial_cb),
-      live_snapshot_interval_(live_snapshot_interval), phase_driven_run_(phase_driven_run),
-      ready_future_(ready_promise_.get_future()) {}
+      live_snapshot_interval_(live_snapshot_interval),
+      live_capability_cb_(live_capability_cb), phase_driven_run_(phase_driven_run),
+      ready_future_(ready_promise_.get_future()) {
+  if (!phase_driven_run) {
+    // FORK-ONLY (We-Amp): a legacy run's main sequencer is built here
+    // (previously in the member-init list above) so its live-update
+    // capability is captured exactly like the per-phase sequencers capture
+    // theirs (M3 Task 3): after construction, before decoration, and
+    // published through the capability callback (phase index 0).
+    LiveTunableRateLimiter* captured_live_tunable = nullptr;
+    auto sequencer = sequencer_factory_.create(
+        *time_source_, *dispatcher_, sequencer_target_,
+        termination_predicate_factory_.create(*time_source_, *worker_number_scope_, starting_time),
+        *worker_number_scope_, starting_time, api, std::nullopt, &captured_live_tunable);
+    SequencerImpl& sequencer_impl = static_cast<SequencerImpl&>(*sequencer);
+    phase_ = std::make_unique<PhaseImpl>("main", std::move(sequencer), /*measure=*/true);
+    if (live_capability_cb_) {
+      SequencerImpl* sequencer_ptr = &sequencer_impl;
+      live_capability_cb_(
+          0, captured_live_tunable,
+          [sequencer_ptr](Envoy::MonotonicTime t_bend, uint32_t new_rps,
+                          std::function<void(absl::Status)> callback) {
+            sequencer_ptr->applyLiveUpdate(t_bend, new_rps, std::move(callback));
+          });
+    }
+  }
+}
 
 void ClientWorkerImpl::simpleWarmup() {
   ENVOY_LOG(debug, "> worker {}: warmup start.", worker_number_);
@@ -304,11 +321,27 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   auto termination_predicate = termination_predicate_factory_.create(
       *time_source_, *worker_number_scope_, phase_start,
       std::chrono::seconds(phase_spec.duration().seconds()));
+  // FORK-ONLY (We-Amp): M3 Task 3 -- the fresh per-phase sequencer's inner
+  // limiter is captured BEFORE decoration and published to the process-side
+  // per-phase registry through the capability callback: at each begin-phase
+  // the previous phase's stale handle is replaced by this phase's (the
+  // registry ruling). Runs on this worker's dispatcher.
+  LiveTunableRateLimiter* captured_live_tunable = nullptr;
   auto sequencer =
       sequencer_factory_.create(*time_source_, *dispatcher_, sequencer_target_,
                                 std::move(termination_predicate), *worker_number_scope_,
-                                phase_start, api_, phase_spec.requests_per_second());
+                                phase_start, api_, phase_spec.requests_per_second(),
+                                &captured_live_tunable);
   SequencerImpl& sequencer_impl = static_cast<SequencerImpl&>(*sequencer);
+  if (live_capability_cb_) {
+    SequencerImpl* sequencer_ptr = &sequencer_impl;
+    live_capability_cb_(
+        phase_index, captured_live_tunable,
+        [sequencer_ptr](Envoy::MonotonicTime t_bend, uint32_t new_rps,
+                        std::function<void(absl::Status)> callback) {
+          sequencer_ptr->applyLiveUpdate(t_bend, new_rps, std::move(callback));
+        });
+  }
   // The sequencer factory only ever produces SequencerImpl instances; the
   // multi-phase stop-mode surface is SequencerImpl-only (the Sequencer
   // interface is untouched).

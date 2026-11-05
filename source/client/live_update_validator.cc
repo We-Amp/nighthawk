@@ -26,7 +26,15 @@ absl::Status duplicateDelta(int index, absl::string_view knob) {
 }
 
 std::chrono::nanoseconds durationProtoToNanos(const google::protobuf::Duration& duration) {
-  return std::chrono::seconds(duration.seconds()) + std::chrono::nanoseconds(duration.nanos());
+  // FORK-ONLY (We-Amp): T2 parked minor -- saturation guard. seconds() is an
+  // int64 wire field; the chrono sum overflows for absurd values. Saturate
+  // at nanoseconds::max()/min() so the callers' bound checks reject honestly
+  // instead of wrapping into a bogus small value.
+  constexpr int64_t kNanosPerSecond = 1000000000LL;
+  constexpr int64_t kMaxSeconds =
+      (std::chrono::nanoseconds::max().count() - (kNanosPerSecond - 1)) / kNanosPerSecond;
+  const int64_t seconds = std::clamp<int64_t>(duration.seconds(), -kMaxSeconds, kMaxSeconds);
+  return std::chrono::seconds(seconds) + std::chrono::nanoseconds(duration.nanos());
 }
 
 } // namespace
@@ -110,6 +118,14 @@ absl::Status ValidateUpdateDeltas(const nighthawk::client::UpdateRequest& reques
       }
       break;
     }
+    default:
+      // FORK-ONLY (We-Amp): T2 parked minor -- runtime fail-closed. Unreachable
+      // on this proto's wire today (a delta case this build does not know
+      // presents as DELTA_NOT_SET), but a future enum arm must land in the
+      // same whitelist gate, never silently default.
+      return invalid(absl::StrCat(
+          where, ": unknown knob delta; it is not in the live-knob whitelist "
+                 "({requests_per_second, ramp shape})"));
     }
   }
   return absl::OkStatus();

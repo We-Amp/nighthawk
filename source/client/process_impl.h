@@ -22,6 +22,7 @@
 #include "nighthawk/client/options.h"
 #include "nighthawk/client/output_collector.h"
 #include "nighthawk/client/process.h"
+#include "nighthawk/common/live_tunable_rate_limiter.h"
 #include "nighthawk/common/statistic.h"
 
 #include "source/client/live_partial_aggregator.h"
@@ -60,6 +61,50 @@ namespace Nighthawk {
 namespace Client {
 
 class ClusterManagerFactory;
+
+// FORK-ONLY (We-Amp): M3 Task 3 -- one worker's CURRENT-PHASE live-update
+// capability. Recorded by the worker's begin-phase task ON the worker
+// dispatcher (fresh sequencer + fresh limiter per phase, M2 T3), so a stale
+// pre-boundary handle never survives a begin-phase.
+struct LiveCapabilityEntry {
+  uint32_t phase_index{0};
+  // The captured pre-decorator inner limiter: identity for staleness checks
+  // and Task 6 staging probes. May be null (a limiter without the
+  // capability); apply then fails honestly.
+  LiveTunableRateLimiter* handle{nullptr};
+  // Binds the worker's current-phase sequencer: posts the apply onto the
+  // worker's own dispatcher (thread confinement).
+  LiveApplyFn apply;
+};
+
+// FORK-ONLY (We-Amp): M3 Task 3 -- the per-PHASE capability registry:
+// worker-id -> the worker's current-phase capability. The limiter is
+// per-phase (M2 T3 builds a fresh sequencer per phase), so entries are
+// (re)captured at each begin-phase; fan-out to a worker whose current phase
+// carries no stamp for the targeted phase (never begun, retired by the M2
+// worker subsets, or raced by a boundary) fails the update honestly at
+// lookup -- never a silent skip, never a mutation through a dead handle.
+// Task 6 consumes this registry for its ordered fan-out.
+class LiveCapabilityRegistry {
+public:
+  // Called from the worker's begin-phase task on the WORKER dispatcher (and
+  // once for a legacy run's main sequencer): (re)stamps the worker's entry.
+  void Record(int worker_id, uint32_t phase_index, LiveTunableRateLimiter* handle,
+              LiveApplyFn apply);
+  // Reader side (the Task 6 fan-out): the worker's capability stamped for
+  // `phase_index`, or an error when the worker has no stamp for that phase
+  // (no entry at all, or a stale pre-boundary one). Thread-safe.
+  absl::StatusOr<LiveCapabilityEntry> CapabilityForPhase(int worker_id,
+                                                         uint32_t phase_index) const;
+  // A new run starts from an empty registry (workers are recreated per run;
+  // this guards a re-run on a long-lived process).
+  void Reset();
+
+private:
+  mutable std::mutex mutex_;
+  absl::flat_hash_map<int, LiveCapabilityEntry> entries_;
+};
+
 /**
  * Only a single instance is allowed at a time machine-wide in this implementation.
  * Running multiple instances at the same might introduce noise into the measurements.
@@ -131,6 +176,13 @@ public:
    * on the stream reader thread).
    */
   InFlightRunShape liveUpdateRunShape() const;
+
+  // FORK-ONLY (We-Amp): the per-PHASE live-update capability registry (M3
+  // Task 3). Read-only accessor for the update fan-out's consumer (Task 6);
+  // workers record entries themselves at each begin-phase.
+  const LiveCapabilityRegistry& liveCapabilityRegistry() const {
+    return live_capability_registry_;
+  }
 
   // FORK-ONLY (We-Amp): multi-phase support (M2 A1). The callback fires on
   // the run-calling thread at each phase boundary the orchestrator marks;
@@ -309,6 +361,9 @@ private:
   Envoy::Api::ApiPtr api_;
   Envoy::Event::DispatcherPtr dispatcher_;
   std::vector<ClientWorkerPtr> workers_;
+  // FORK-ONLY (We-Amp): M3 Task 3 -- per-PHASE live-update capability
+  // registry, see LiveCapabilityRegistry above.
+  LiveCapabilityRegistry live_capability_registry_;
   const BenchmarkClientFactoryImpl benchmark_client_factory_;
   const TerminationPredicateFactoryImpl termination_predicate_factory_;
   const SequencerFactoryImpl sequencer_factory_;

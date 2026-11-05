@@ -49,7 +49,9 @@ public:
                       TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope,
                       const Envoy::MonotonicTime scheduled_starting_time, Envoy::Api::Api& api,
                       std::optional<uint32_t> requests_per_second_override =
-                          std::nullopt) const override;
+                          std::nullopt,
+                      LiveTunableRateLimiter** captured_live_tunable =
+                          nullptr) const override;
 
 private:
   /**

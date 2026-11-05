@@ -14,7 +14,8 @@ SequencerImpl::SequencerImpl(
     Envoy::TimeSource& time_source, RateLimiterPtr&& rate_limiter, SequencerTarget target,
     StatisticPtr&& latency_statistic, StatisticPtr&& blocked_statistic,
     nighthawk::client::SequencerIdleStrategy::SequencerIdleStrategyOptions idle_strategy,
-    TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope)
+    TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope,
+    LiveTunableRateLimiter* live_tunable_rate_limiter)
     : target_(std::move(target)), platform_util_(platform_util), dispatcher_(dispatcher),
       time_source_(time_source), rate_limiter_(std::move(rate_limiter)),
       latency_statistic_(std::move(latency_statistic)),
@@ -22,7 +23,9 @@ SequencerImpl::SequencerImpl(
       termination_predicate_(std::move(termination_predicate)),
       last_termination_status_(TerminationPredicate::Status::PROCEED),
       scope_(scope.createScope("sequencer.")),
-      sequencer_stats_({ALL_SEQUENCER_STATS(POOL_COUNTER(*scope_))}) {
+      sequencer_stats_({ALL_SEQUENCER_STATS(POOL_COUNTER(*scope_))}),
+      // FORK-ONLY (We-Amp): M3 Task 3 -- the captured pre-decorator handle.
+      live_tunable_rate_limiter_(live_tunable_rate_limiter) {
   ASSERT(target_ != nullptr, "No SequencerTarget");
   ASSERT(termination_predicate_ != nullptr, "null termination predicate");
   periodic_timer_ = dispatcher_.createTimer([this]() { run(true); });
@@ -175,6 +178,52 @@ void SequencerImpl::waitForCompletion() {
   }
   // We should guarantee the flow terminates, so:
   ASSERT(!running_);
+}
+
+// FORK-ONLY (We-Amp): M3 Task 3, see sequencer_impl.h. The apply runs on
+// this sequencer's own dispatcher: the captured limiter's state is
+// dispatcher-confined, and the worker's begin-phase re-stamps the
+// per-phase registry entry with a fresh sequencer at each boundary, so a
+// bend racing a boundary can only land on the phase it targeted (and a
+// bend past the boundary is Task 6's pre-fan-out rejection, not ours).
+void SequencerImpl::applyLiveUpdate(Envoy::MonotonicTime t_bend, uint32_t new_rps,
+                                    std::function<void(absl::Status)> callback) {
+  dispatcher_.post([this, t_bend, new_rps, callback = std::move(callback)]() {
+    applyLiveUpdateOnDispatcherThread(t_bend, new_rps, std::move(callback));
+  });
+}
+
+void SequencerImpl::applyLiveUpdateOnDispatcherThread(
+    Envoy::MonotonicTime t_bend, uint32_t new_rps, std::function<void(absl::Status)> callback) {
+  if (live_tunable_rate_limiter_ == nullptr) {
+    callback(absl::InternalError(
+        "this worker's current phase has no captured live-update capability "
+        "(no live-tunable rate limiter handle)"));
+    return;
+  }
+  const Envoy::MonotonicTime now = time_source_.monotonicTime();
+  if (t_bend > now + kLiveUpdateBendGrace) {
+    // Schedule the apply at the agreed bend instant. Bends are not queued
+    // (Task 4 Q4 ruling): while a bend is pending, a new one fails honestly.
+    // (Pending-ness is a flag, not a null timer pointer: destroying the
+    // timer from inside its own firing callback is use-after-free.)
+    if (bend_timer_pending_) {
+      callback(absl::InvalidArgumentError(
+          "a live-update bend is already pending for this worker; bends are not queued"));
+      return;
+    }
+    if (live_update_timer_ == nullptr) {
+      live_update_timer_ = dispatcher_.createTimer([this, t_bend, new_rps, callback]() mutable {
+        bend_timer_pending_ = false;
+        callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
+      });
+    }
+    bend_timer_pending_ = true;
+    live_update_timer_->enableHRTimer(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t_bend - now));
+    return;
+  }
+  callback(live_tunable_rate_limiter_->ApplyLiveRps(t_bend, new_rps));
 }
 
 StatisticPtrMap SequencerImpl::statistics() const {

@@ -13,6 +13,7 @@ envoy_basic_cc_library(
     hdrs = [
         "exception.h",
         "factories.h",
+        "live_tunable_rate_limiter.h",
         "operation_callback.h",
         "phase.h",
         "platform_util.h",

@@ -2,10 +2,12 @@
 
 #include <functional>
 
+#include "absl/status/status.h"
 #include "envoy/common/pure.h"
 #include "envoy/common/time.h"
 #include "envoy/event/dispatcher.h"
 
+#include "nighthawk/common/live_tunable_rate_limiter.h"
 #include "nighthawk/common/platform_util.h"
 #include "nighthawk/common/rate_limiter.h"
 #include "nighthawk/common/sequencer.h"
@@ -49,7 +51,10 @@ public:
       Envoy::TimeSource& time_source, RateLimiterPtr&& rate_limiter, SequencerTarget target,
       StatisticPtr&& latency_statistic, StatisticPtr&& blocked_statistic,
       nighthawk::client::SequencerIdleStrategy::SequencerIdleStrategyOptions idle_strategy,
-      TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope);
+      TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope,
+      // FORK-ONLY (We-Amp): M3 Task 3 -- the captured pre-decorator
+      // live-tunable handle (may be null: a live update then fails honestly).
+      LiveTunableRateLimiter* live_tunable_rate_limiter = nullptr);
 
   /**
    * Starts the Sequencer. Should be followed up with a call to waitForCompletion().
@@ -91,6 +96,20 @@ public:
   // to chain the boundary drain watch; legacy runs leave it unset.
   void setStopHook(std::function<void(bool timed_out)> hook) { stop_hook_ = std::move(hook); }
 
+  // FORK-ONLY (We-Amp): live rps re-parameterization (M3 Task 3). Posts onto
+  // this sequencer's OWN dispatcher (limiter state is dispatcher-confined,
+  // M0a Review Focus 5 discipline) and applies at t_bend: a future bend is
+  // applied by a one-shot timer firing at the bend instant, an at-or-past
+  // bend applies immediately. Bends are NOT queued (Task 4 Q4 ruling): a
+  // second apply before the first fires fails the new update honestly
+  // without touching the limiter. `callback` fires on the worker dispatcher
+  // with the per-worker apply status. Callers without a dispatcher running
+  // on their side get no callback (the run's final stop exits this
+  // dispatcher); the Task 6 orchestrator bounds that window with its run-end
+  // resolution.
+  void applyLiveUpdate(Envoy::MonotonicTime t_bend, uint32_t new_rps,
+                       std::function<void(absl::Status)> callback);
+
 protected:
   /**
    * Run is called initially by start() and thereafter by two timers:
@@ -126,6 +145,10 @@ protected:
   void stop(bool timed_out, bool exit_dispatcher);
   void unblockAndUpdateStatisticIfNeeded(const Envoy::MonotonicTime& now);
   void updateStartBlockingTimeIfNeeded();
+  // FORK-ONLY (We-Amp): M3 Task 3 -- applyLiveUpdate's dispatcher-side half;
+  // always runs on this sequencer's own dispatcher.
+  void applyLiveUpdateOnDispatcherThread(Envoy::MonotonicTime t_bend, uint32_t new_rps,
+                                         std::function<void(absl::Status)> callback);
 
 private:
   SequencerTarget target_;
@@ -150,6 +173,14 @@ private:
   // FORK-ONLY (We-Amp): multi-phase stop-mode state, see setExitDispatcherOnStop().
   bool exit_dispatcher_on_stop_{true};
   std::function<void(bool timed_out)> stop_hook_;
+  // FORK-ONLY (We-Amp): M3 Task 3 -- the captured pre-decorator handle and
+  // the pending future-bend timer (null when no bend is armed). Both are
+  // touched on this sequencer's own dispatcher only.
+  LiveTunableRateLimiter* live_tunable_rate_limiter_{nullptr};
+  Envoy::Event::TimerPtr live_update_timer_;
+  // True while a future bend is armed (the timer object is reused, so the
+  // pointer alone cannot say whether a bend is pending).
+  bool bend_timer_pending_{false};
 };
 
 } // namespace Nighthawk

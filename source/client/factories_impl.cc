@@ -97,9 +97,13 @@ SequencerPtr SequencerFactoryImpl::create(
     Envoy::TimeSource& time_source, Envoy::Event::Dispatcher& dispatcher,
     const SequencerTarget& sequencer_target, TerminationPredicatePtr&& termination_predicate,
     Envoy::Stats::Scope& scope, const Envoy::MonotonicTime scheduled_starting_time,
-    Envoy::Api::Api& api, std::optional<uint32_t> requests_per_second_override) const {
+    Envoy::Api::Api& api, std::optional<uint32_t> requests_per_second_override,
+    LiveTunableRateLimiter** captured_live_tunable) const {
   StatisticFactoryImpl statistic_factory(options_);
   RateLimiterPtr rate_limiter;
+  // FORK-ONLY (We-Amp): M3 Task 3 -- the captured pre-decorator capability
+  // handle; exported through the caller's out-param below.
+  LiveTunableRateLimiter* captured_handle = nullptr;
 
   // Check if there is a rate limiter plugin to load and use.
   if (options_.rateLimiterPluginConfig().has_value()) {
@@ -110,6 +114,15 @@ SequencerPtr SequencerFactoryImpl::create(
           absl::StrCat("Rate Limiter plugin loading error: ", plugin_or.status().message()));
     }
     rate_limiter = std::move(plugin_or.value());
+    // FORK-ONLY (We-Amp): M3 Task 3 -- capture the live-tunable capability
+    // handle to the constructed INNER limiter BEFORE the decorator chain
+    // wraps it. A plugin limiter that does not implement the interface (or a
+    // load that produced something else) captures null: the registry then
+    // fails a live update honestly at lookup, never silently.
+    if (captured_live_tunable != nullptr) {
+      *captured_live_tunable = dynamic_cast<LiveTunableRateLimiter*>(rate_limiter.get());
+      captured_handle = *captured_live_tunable;
+    }
     rate_limiter = std::make_unique<ScheduledStartingRateLimiter>(std::move(rate_limiter),
                                                                   scheduled_starting_time);
 
@@ -118,8 +131,16 @@ SequencerPtr SequencerFactoryImpl::create(
     // FORK-ONLY (We-Amp): a multi-phase run builds its per-phase sequencer at
     // the phase's declared rate; unset, the run-level option applies.
     Frequency frequency(requests_per_second_override.value_or(options_.requestsPerSecond()));
-    rate_limiter = std::make_unique<ScheduledStartingRateLimiter>(
-        std::make_unique<LinearRateLimiter>(time_source, frequency), scheduled_starting_time);
+    // FORK-ONLY (We-Amp): M3 Task 3 -- capture the handle to the constructed
+    // INNER LinearRateLimiter BEFORE ScheduledStartingRateLimiter (and the
+    // optional Bursting/DistributionSampling decorators below) wrap it.
+    auto linear_rate_limiter = std::make_unique<LinearRateLimiter>(time_source, frequency);
+    if (captured_live_tunable != nullptr) {
+      *captured_live_tunable = linear_rate_limiter.get();
+    }
+    captured_handle = linear_rate_limiter.get();
+    rate_limiter = std::make_unique<ScheduledStartingRateLimiter>(std::move(linear_rate_limiter),
+                                                                  scheduled_starting_time);
     const uint64_t burst_size = options_.burstSize();
 
     if (burst_size) {
@@ -137,7 +158,11 @@ SequencerPtr SequencerFactoryImpl::create(
   return std::make_unique<SequencerImpl>(
       platform_util_, dispatcher, time_source, std::move(rate_limiter), sequencer_target,
       statistic_factory.create(), statistic_factory.create(), options_.sequencerIdleStrategy(),
-      std::move(termination_predicate), scope);
+      std::move(termination_predicate), scope,
+      // FORK-ONLY (We-Amp): M3 Task 3 -- the sequencer holds the captured
+      // pre-decorator handle and routes live updates through it, posted on
+      // its own dispatcher.
+      captured_handle);
 }
 
 absl::StatusOr<RateLimiterPtr> SequencerFactoryImpl::LoadRateLimiterPlugin(

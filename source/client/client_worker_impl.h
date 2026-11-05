@@ -18,6 +18,7 @@
 #include "nighthawk/client/client_worker.h"
 #include "nighthawk/client/factories.h"
 #include "nighthawk/common/factories.h"
+#include "nighthawk/common/live_tunable_rate_limiter.h"
 #include "nighthawk/common/phase.h"
 #include "nighthawk/common/request_source.h"
 #include "nighthawk/common/sequencer.h"
@@ -103,7 +104,18 @@ public:
                    const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)>&
                        live_snapshot_partial_cb = {},
                    std::chrono::milliseconds live_snapshot_interval = {},
-                   bool phase_driven_run = false);
+                   bool phase_driven_run = false,
+                   // FORK-ONLY (We-Amp): M3 Task 3 -- invoked ON this worker's
+                   // dispatcher each time a fresh sequencer + rate limiter are
+                   // built (once for a legacy run's main sequencer at
+                   // construction, then at every begin-phase) with the
+                   // captured pre-decorator live-update capability: the phase
+                   // index, the handle to the inner limiter, and the apply
+                   // surface bound to the sequencer (posts on this worker's
+                   // dispatcher).
+                   std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
+                                      Nighthawk::LiveApplyFn)>
+                       live_capability_cb = {});
   StatisticPtrMap statistics() const override;
 
   const std::map<std::string, uint64_t>& threadLocalCounterValues() override {
@@ -187,6 +199,12 @@ private:
   const HardCodedWarmupStyle hardcoded_warmup_style_;
   const std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)> live_snapshot_partial_cb_;
   const std::chrono::milliseconds live_snapshot_interval_;
+  // FORK-ONLY (We-Amp): M3 Task 3 -- publish-each-phase-capability callback,
+  // see the constructor argument. Fixed at construction; invoked on this
+  // worker's dispatcher only.
+  const std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
+                           Nighthawk::LiveApplyFn)>
+      live_capability_cb_;
   Envoy::Event::TimerPtr live_snapshot_timer_;
   // FORK-ONLY (We-Amp): multi-phase run state. Everything here is touched on
   // the worker dispatcher thread only, except ready_future_ (fixed at

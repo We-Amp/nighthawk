@@ -14,7 +14,9 @@
 
 #include "absl/random/random.h"
 #include "absl/random/zipf_distribution.h"
+#include "absl/status/status.h"
 #include "api/rate_limiter/linear_ramping_rate_limiter.pb.h"
+#include "nighthawk/common/live_tunable_rate_limiter.h"
 #include "nighthawk/common/rate_limiter_plugin_config_factory.h"
 
 namespace Nighthawk {
@@ -42,9 +44,14 @@ public:
     return first_acquisition_time_;
   }
 
-private:
+protected:
+  // FORK-ONLY (We-Amp): protected since M3 Task 3 -- the live re-
+  // parameterization needs to know whether the limiter's schedule has
+  // started (an un-started limiter has no operating point to conserve).
   Envoy::TimeSource& time_source_;
   std::optional<Envoy::MonotonicTime> start_time_;
+
+private:
   std::optional<Envoy::SystemTime> first_acquisition_time_;
 };
 
@@ -53,29 +60,55 @@ private:
  * The average rate is computed over a timeframe that starts at
  * the first call to tryAcquireOne().
  */
+// FORK-ONLY (We-Amp): implements LiveTunableRateLimiter since M3 Task 3 --
+// the non-plugin path captures this limiter pre-decoration and re-
+// parameterizes it live (spec 8.7 linear degenerate case: re-anchored
+// origin, cumulative count conserved at the bend, rate steps at the bend).
 class LinearRateLimiter : public RateLimiterBaseImpl,
+                          public LiveTunableRateLimiter,
                           public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
   LinearRateLimiter(Envoy::TimeSource& time_source, const Frequency frequency);
   bool tryAcquireOne() override;
   void releaseOne() override;
+  absl::Status ApplyLiveRps(Envoy::MonotonicTime t_bend, uint32_t new_rps) override;
 
 protected:
   int64_t acquireable_count_{0};
   uint64_t acquired_count_{0};
-  const Frequency frequency_;
+  // FORK-ONLY (We-Amp): non-const since M3 Task 3 -- ApplyLiveRps
+  // re-parameterizes the target rate live.
+  Frequency frequency_;
+  // FORK-ONLY (We-Amp): the re-anchor origin (M3 Task 3). When set, credit
+  // is computed against (now - live_origin_) with the acquired-count baseline
+  // frozen at the bend instant, so cumulative acquisitions are conserved
+  // across the bend and the phase-shifted acquisition grid restarts from it
+  // (first acquisition half a new interval after the bend: no windfall, no
+  // drought beyond one acquisition interval). Unset keeps the stock schedule
+  // (anchored at the first acquisition attempt).
+  std::optional<Envoy::MonotonicTime> live_origin_;
+  uint64_t live_origin_acquired_{0};
 };
 
 /**
  * A rate limiter which linearly ramps up to the desired frequency over the specified ramp_time.
  */
+// FORK-ONLY (We-Amp): implements LiveTunableRateLimiter since M3 Task 3 --
+// CAPTURE-ONLY (C1): the factory captures the handle to this inner limiter
+// before ScheduledStartingRateLimiter wraps it, but a live rps change here
+// IS ramp re-parameterization (the cumulative release schedule is a
+// function of the target frequency), so ApplyLiveRps rejects honestly with
+// the `pending ramp re-anchoring` reason and mutates nothing. Task 5 owns
+// ApplyLiveRamp and the real plugin-path ApplyLiveRps.
 class LinearRampingRateLimiterImpl : public RateLimiterBaseImpl,
+                                     public LiveTunableRateLimiter,
                                      public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
   LinearRampingRateLimiterImpl(Envoy::TimeSource& time_source,
                                const std::chrono::nanoseconds ramp_time, const Frequency frequency);
   bool tryAcquireOne() override;
   void releaseOne() override;
+  absl::Status ApplyLiveRps(Envoy::MonotonicTime t_bend, uint32_t new_rps) override;
 
 private:
   int64_t acquireable_count_{0};

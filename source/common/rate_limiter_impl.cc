@@ -103,6 +103,9 @@ LinearRateLimiter::LinearRateLimiter(Envoy::TimeSource& time_source, const Frequ
 
 bool LinearRateLimiter::tryAcquireOne() {
   // TODO(oschaaf): consider adding an explicit start() call to the interface.
+  // The gate is strictly greater-than: negative credit is never truthy here
+  // (M3 Task 3 down-bend clamp contract; see also the ramping limiter's
+  // pending Task 5 truthiness fix).
   if (acquireable_count_ > 0) {
     acquireable_count_--;
     acquired_count_++;
@@ -113,15 +116,61 @@ bool LinearRateLimiter::tryAcquireOne() {
   // acquisitions timed at one second boundaries will be avoided.
   // For example, at three rps our timings should look like [0.16667s, 0.5s, 0.83333s,...].
   // This helps produce more intuitive/steady counter values.
-  const auto phase_shifted = elapsed() + (frequency_.interval() / 2);
-  acquireable_count_ =
-      static_cast<int64_t>(std::floor(phase_shifted / frequency_.interval())) - acquired_count_;
+  // FORK-ONLY (We-Amp): M3 Task 3 -- after a live re-parameterization the
+  // schedule is anchored at the re-anchor origin with the acquired-count
+  // baseline frozen at the bend (signed: a pre-bend acquisition released
+  // after the bend must return its credit, never wrap). Unset, the stock
+  // first-acquisition anchoring applies unchanged.
+  const Envoy::MonotonicTime now = time_source_.monotonicTime();
+  const std::chrono::nanoseconds since_origin =
+      live_origin_.has_value() ? now - *live_origin_ : elapsed();
+  const int64_t acquired_at_origin =
+      live_origin_.has_value() ? static_cast<int64_t>(live_origin_acquired_) : 0;
+  const auto phase_shifted = since_origin + (frequency_.interval() / 2);
+  acquireable_count_ = static_cast<int64_t>(std::floor(phase_shifted / frequency_.interval())) -
+                       (static_cast<int64_t>(acquired_count_) - acquired_at_origin);
   return acquireable_count_ > 0 ? tryAcquireOne() : false;
 }
 
 void LinearRateLimiter::releaseOne() {
   acquireable_count_++;
   acquired_count_--;
+}
+
+absl::Status LinearRateLimiter::ApplyLiveRps(const Envoy::MonotonicTime t_bend,
+                                             const uint32_t new_rps) {
+  if (new_rps < 1) {
+    return absl::InvalidArgumentError(
+        fmt::format("requests_per_second: rps must be >= 1, got {}", new_rps));
+  }
+  const Frequency new_frequency(new_rps);
+  if (start_time_ == std::nullopt) {
+    // The schedule never started (no acquisition attempted): there is no
+    // operating point to conserve; adopt the new rate directly.
+    frequency_ = new_frequency;
+    return absl::OkStatus();
+  }
+  const Envoy::MonotonicTime now = time_source_.monotonicTime();
+  if (now + kLiveUpdateBendGrace < t_bend) {
+    // Invoked meaningfully ahead of the agreed bend: reject without
+    // mutation. The caller must schedule the apply at t_bend (the
+    // sequencer's dispatcher-posted apply fires a bend timer).
+    return absl::InvalidArgumentError(fmt::format(
+        "bend instant is in the future (t_bend - now = {}ns); invoke ApplyLiveRps at the "
+        "agreed bend instant t_bend",
+        (t_bend - now).count()));
+  }
+  // Re-anchor (spec 8.7 linear degenerate case): freeze the acquired-count
+  // baseline at the actual apply instant (conservation is exact here) and
+  // restart the phase-shifted grid from it under the new rate. Any credit
+  // left over from the OLD schedule is discarded: carrying it across the
+  // bend would hand out the remainder of the old second as a burst.
+  live_origin_ = now;
+  live_origin_acquired_ = acquired_count_;
+  frequency_ = new_frequency;
+  acquireable_count_ = 0;
+  ENVOY_LOG(debug, "live rps re-parameterization applied: new rps {}", new_rps);
+  return absl::OkStatus();
 }
 
 LinearRampingRateLimiterImpl::LinearRampingRateLimiterImpl(Envoy::TimeSource& time_source,
@@ -168,6 +217,20 @@ bool LinearRampingRateLimiterImpl::tryAcquireOne() {
 void LinearRampingRateLimiterImpl::releaseOne() {
   acquireable_count_++;
   acquired_count_--;
+}
+
+absl::Status LinearRampingRateLimiterImpl::ApplyLiveRps(Envoy::MonotonicTime /*t_bend*/,
+                                                        uint32_t /*new_rps*/) {
+  // FORK-ONLY (We-Amp): M3 Task 3 CAPTURE-ONLY interim (C1). On this limiter
+  // the cumulative release schedule is a function of the target frequency
+  // (both ramp regimes above integrate f), so a live rps change IS ramp
+  // re-parameterization: it must go through the Task 5 re-anchoring
+  // (ApplyLiveRamp / ApplyLiveRps there, implementing Task 4's equations).
+  // Reject honestly, mutate nothing -- never silently mis-apply.
+  return absl::UnimplementedError(
+      "pending ramp re-anchoring: on a ramp-plugin run a live rps change sets the ramp's "
+      "target frequency (a ramp-shape change) and requires ramp re-anchoring, which is not "
+      "supported by this build yet");
 }
 
 RateLimiterPtr LinearRampingRateLimiterImplFactory::createRateLimiterPlugin(

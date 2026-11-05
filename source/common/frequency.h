@@ -13,8 +13,10 @@ public:
   const std::chrono::duration<double> interval() const { return interval_; }
 
 private:
-  const uint64_t hertz_;
-  const std::chrono::duration<double> interval_;
+  // FORK-ONLY (We-Amp): non-const since M3 Task 3 -- ApplyLiveRps
+  // re-parameterizes a live-tunable limiter's target rate in place.
+  uint64_t hertz_;
+  std::chrono::duration<double> interval_;
 };
 
 constexpr Frequency operator""_Hz(unsigned long long hz) { return Frequency{hz}; }

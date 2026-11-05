@@ -805,6 +805,11 @@ std::chrono::nanoseconds ProcessImpl::computeInterWorkerDelay(const uint32_t con
 absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
                                         const std::optional<Envoy::SystemTime>& scheduled_start) {
   ASSERT(workers_.empty());
+  // FORK-ONLY (We-Amp): M3 Task 3 -- each run starts from an empty
+  // capability registry (before the workers are constructed: a legacy run's
+  // main-sequencer capability is recorded by the worker constructor itself);
+  // phase-driven runs re-stamp at every begin-phase.
+  live_capability_registry_.Reset();
   const Envoy::MonotonicTime first_worker_start =
       computeFirstWorkerStart(time_system_, scheduled_start, concurrency);
   const std::chrono::nanoseconds inter_worker_delay =
@@ -833,6 +838,15 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
     if (!plugins.ok()) {
       return plugins.status();
     }
+    // FORK-ONLY (We-Amp): M3 Task 3 -- workers publish each phase's captured
+    // pre-decorator live-update capability to this process's per-phase
+    // registry; the callback fires on the worker's own dispatcher at each
+    // begin-phase (and once for a legacy run's main sequencer).
+    auto live_capability_cb = [this,
+                               worker_number](uint32_t phase_index, LiveTunableRateLimiter* handle,
+                                              LiveApplyFn apply) {
+      live_capability_registry_.Record(worker_number, phase_index, handle, std::move(apply));
+    };
     workers_.push_back(std::make_unique<ClientWorkerImpl>(
         *api_, tls_, cluster_manager_, benchmark_client_factory_, termination_predicate_factory_,
         sequencer_factory_, request_generator_factory_, store_root_, worker_number,
@@ -840,7 +854,7 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
         options_.simpleWarmup() ? ClientWorkerImpl::HardCodedWarmupStyle::ON
                                 : ClientWorkerImpl::HardCodedWarmupStyle::OFF,
         std::move(*plugins), live_partial_cb, live_snapshot_interval,
-        /*phase_driven_run=*/options_.hasPhaseVector()));
+        /*phase_driven_run=*/options_.hasPhaseVector(), std::move(live_capability_cb)));
     if (options_.hasPhaseVector()) {
       // FORK-ONLY (We-Amp): the phase orchestrator waits on these before
       // posting the first begin-phase: begin-phase must not land while a
@@ -858,6 +872,40 @@ void ProcessImpl::recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapsho
     std::lock_guard<std::mutex> lock(live_partials_mutex_);
     live_partials_.push_back(std::move(partial));
   }
+}
+
+// FORK-ONLY (We-Amp): M3 Task 3, see process_impl.h. Record runs on the
+// worker's dispatcher thread (inside the worker's begin-phase task); the
+// mutex is the only cross-thread surface and is never held while doing
+// engine work.
+void LiveCapabilityRegistry::Record(int worker_id, uint32_t phase_index,
+                                    LiveTunableRateLimiter* handle, LiveApplyFn apply) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  entries_[worker_id] = LiveCapabilityEntry{phase_index, handle, std::move(apply)};
+}
+
+absl::StatusOr<LiveCapabilityEntry>
+LiveCapabilityRegistry::CapabilityForPhase(int worker_id, uint32_t phase_index) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = entries_.find(worker_id);
+  if (it == entries_.end()) {
+    return absl::NotFoundError(fmt::format(
+        "worker {} has no captured live-update capability (no phase begun)", worker_id));
+  }
+  if (it->second.phase_index != phase_index) {
+    // Stale-handle case: the worker's stamp is for another phase (a boundary
+    // raced the fan-out, or the worker was retired by the M2 subsets).
+    return absl::FailedPreconditionError(fmt::format(
+        "worker {}'s live-update capability is stale: stamped for phase index {}, "
+        "not the targeted {}",
+        worker_id, it->second.phase_index, phase_index));
+  }
+  return it->second;
+}
+
+void LiveCapabilityRegistry::Reset() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  entries_.clear();
 }
 
 void ProcessImpl::setCurrentPhaseId(absl::string_view phase_id,

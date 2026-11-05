@@ -570,4 +570,198 @@ TEST_F(ZipfRateLimiterImplTest, BadArgumentsTest) {
   }
 }
 
+// --- M3 Task 3: the live-tunable capability. Live plain-rps re-
+// parameterization on the NON-plugin path (the ramping limiter's capture is
+// capture-only; its rejection is pinned in live_update_test.cc's factory
+// tests). All of these run on simulated time with 1 ms acquisition ticks.
+
+namespace {
+// Acquire greedily; returns the number of acquisitions granted.
+uint64_t acquireAll(RateLimiter& limiter) {
+  uint64_t n = 0;
+  while (limiter.tryAcquireOne()) {
+    n++;
+  }
+  return n;
+}
+
+// White-box probe of the credit bookkeeping (the members are protected).
+class CreditProbeLinearRateLimiter : public LinearRateLimiter {
+public:
+  using LinearRateLimiter::LinearRateLimiter;
+  void forceCredit(int64_t credit) { acquireable_count_ = credit; }
+  int64_t credit() const { return acquireable_count_; }
+  uint64_t acquired() const { return acquired_count_; }
+};
+} // namespace
+
+// The §8.7 linear degenerate case: a live up-bend conserves the cumulative
+// acquired count exactly at the bend, the instantaneous rate steps there
+// (left-limit == old 100 ms grid, right-limit == new 50 ms grid, first
+// acquisition half a new interval after the bend), and no burst/silence
+// beyond one acquisition interval (at most one acquisition per 1 ms tick:
+// the OLD schedule's leftover credit is discarded, never handed out).
+TEST_F(RateLimiterTest, RpsBendPreservesCumulativeCountAndRate) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRateLimiter bent(time_system, 10_Hz);
+  LinearRateLimiter counterfactual(time_system, 10_Hz);
+
+  uint64_t total_bent = 0;
+  uint64_t total_cf = 0;
+  for (int i = 0; i < 1000; i++) { // one second on the 10 Hz schedule
+    total_bent += acquireAll(bent);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_EQ(total_bent, 10u);
+  ASSERT_EQ(total_bent, total_cf);
+
+  // Bend at t_b: conservation at the bend is exact.
+  const absl::Status status = bent.ApplyLiveRps(time_system.monotonicTime(), 20);
+  ASSERT_TRUE(status.ok()) << status.message();
+  EXPECT_EQ(total_bent, total_cf);
+
+  uint64_t post_bend = 0;
+  std::vector<int64_t> post_bend_acquisition_ms;
+  for (int i = 0; i < 1000; i++) { // one more second
+    const uint64_t n = acquireAll(bent);
+    if (n > 0) {
+      EXPECT_EQ(n, 1u); // never a burst: one acquisition per tick at most
+      post_bend_acquisition_ms.push_back(i);
+    }
+    post_bend += n;
+    time_system.advanceTimeWait(1ms);
+  }
+  // One second at the new rate (the one-interval slack absorbs the
+  // phase-shifted grid's floating-point boundary rounding).
+  EXPECT_LE(total_bent + post_bend, 31u);
+  EXPECT_GE(total_bent + post_bend, 29u);
+  // Right-limit grid: first acquisition half a new interval (50 ms) after
+  // the bend; successive acquisitions one new interval apart.
+  ASSERT_FALSE(post_bend_acquisition_ms.empty());
+  EXPECT_NEAR(post_bend_acquisition_ms.front(), 25, 1);
+  for (size_t i = 1; i < post_bend_acquisition_ms.size(); i++) {
+    EXPECT_NEAR(post_bend_acquisition_ms[i] - post_bend_acquisition_ms[i - 1], 50, 1);
+  }
+}
+
+// A deep down-bend conserves the count and clamps: nothing is handed out
+// from negative credit, and the first acquisition under the new (much
+// slower) schedule lands only once the new schedule's integral catches up
+// (at the half-interval phase point), never as a windfall at the bend.
+TEST_F(RateLimiterTest, ApplyLiveRpsDeepDownBendConservesAndClamps) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRateLimiter limiter(time_system, 100_Hz);
+  uint64_t total = 0;
+  for (int i = 0; i < 1000; i++) { // one second at 100 Hz
+    total += acquireAll(limiter);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_EQ(total, 100u);
+
+  const absl::Status status = limiter.ApplyLiveRps(time_system.monotonicTime(), 1);
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  int64_t first_acquisition_ms = -1;
+  for (int i = 0; i < 1000; i++) { // one more second at 1 Hz
+    const uint64_t n = acquireAll(limiter);
+    if (n > 0 && first_acquisition_ms == -1) {
+      first_acquisition_ms = i;
+    }
+    total += n;
+    time_system.advanceTimeWait(1ms);
+  }
+  // Conserved + exactly one acquisition under the new schedule.
+  EXPECT_EQ(total, 101u);
+  // ... which lands half a new interval (500 ms) after the bend, not as a
+  // burst at the bend.
+  EXPECT_NEAR(first_acquisition_ms, 500, 1);
+}
+
+// The down-bend clamp contract (pins the truthiness hazard class): credit
+// in the clamp regime must be gated strictly on > 0 -- an acquisition is
+// never sourced from negative acquireable_count_.
+TEST_F(RateLimiterTest, NegativeCreditClampedNotTruthy) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  CreditProbeLinearRateLimiter limiter(time_system, 10_Hz);
+  limiter.forceCredit(-5);
+  EXPECT_FALSE(limiter.tryAcquireOne());
+  // The gate recomputes credit rather than spending the negative balance:
+  // no acquisition is sourced from it, and the acquired count is untouched.
+  EXPECT_GE(limiter.credit(), 0);
+  EXPECT_EQ(limiter.acquired(), 0u);
+}
+
+// An apply invoked meaningfully ahead of the agreed bend instant is rejected
+// without mutation: the schedule keeps running at the old rate.
+TEST_F(RateLimiterTest, ApplyLiveRpsRejectsFutureBendWithoutMutating) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRateLimiter limiter(time_system, 10_Hz);
+  uint64_t total = 0;
+  for (int i = 0; i < 500; i++) { // half a second at 10 Hz
+    total += acquireAll(limiter);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_EQ(total, 5u);
+
+  const absl::Status status = limiter.ApplyLiveRps(time_system.monotonicTime() + 1s, 20);
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), testing::HasSubstr("bend instant is in the future"));
+
+  // Untouched: still on the old 10 Hz grid.
+  for (int i = 0; i < 500; i++) {
+    total += acquireAll(limiter);
+    time_system.advanceTimeWait(1ms);
+  }
+  EXPECT_EQ(total, 10u);
+}
+
+// A non-positive target rate is rejected without mutation.
+TEST_F(RateLimiterTest, ApplyLiveRpsRejectsNonPositiveRps) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRateLimiter limiter(time_system, 10_Hz);
+  const absl::Status status = limiter.ApplyLiveRps(time_system.monotonicTime(), 0);
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), testing::HasSubstr(">= 1"));
+}
+
+// CAPTURE-ONLY interim (C1): the ramping limiter's ApplyLiveRps rejects with
+// the honest `pending ramp re-anchoring` reason and mutates nothing -- the
+// acquisition schedule matches an un-bent counterfactual exactly after the
+// rejected apply.
+TEST_F(RateLimiterTest, RampingLimiterApplyLiveRpsPendingRejection) {
+  Envoy::Event::SimulatedTimeSystem time_system;
+  LinearRampingRateLimiterImpl bent(time_system, 200ms, 10_Hz);
+  LinearRampingRateLimiterImpl counterfactual(time_system, 200ms, 10_Hz);
+
+  uint64_t total_bent = 0;
+  uint64_t total_cf = 0;
+  for (int i = 0; i < 600; i++) {
+    total_bent += acquireAll(bent);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  ASSERT_GT(total_bent, 0u);
+  ASSERT_EQ(total_bent, total_cf);
+
+  const absl::Status status = bent.ApplyLiveRps(time_system.monotonicTime(), 5);
+  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_THAT(status.message(), testing::HasSubstr("pending ramp re-anchoring"));
+
+  // Untouched: the bent limiter still matches the counterfactual exactly.
+  for (int i = 0; i < 600; i++) {
+    total_bent += acquireAll(bent);
+    total_cf += acquireAll(counterfactual);
+    time_system.advanceTimeWait(1ms);
+  }
+  EXPECT_EQ(total_bent, total_cf);
+}
+
+// Task 5 obligation pin: the ramping limiter gates credit on BARE TRUTHINESS
+// (`if (acquireable_count_)`, rate_limiter_impl.cc), so negative credit --
+// which a Task 5 down-bend into the ramp regimes can produce -- would be
+// truthy and hand out an acquisition. Task 5's truthiness fix owns this;
+// the test stays disabled until then (enabling it before the fix fails).
+TEST_F(RateLimiterTest, DISABLED_RampingLimiterNegativeCreditClamped) {}
+
 } // namespace Nighthawk

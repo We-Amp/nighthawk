@@ -16,7 +16,8 @@ public:
                const SequencerTarget& sequencer_target,
                TerminationPredicatePtr&& termination_predicate, Envoy::Stats::Scope& scope,
                const Envoy::MonotonicTime scheduled_starting_time, Envoy::Api::Api& api,
-               std::optional<uint32_t> requests_per_second_override),
+               std::optional<uint32_t> requests_per_second_override,
+               LiveTunableRateLimiter** captured_live_tunable),
               (const, override));
 };
 

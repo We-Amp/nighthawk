@@ -10,6 +10,7 @@
 #include "envoy/event/dispatcher.h"
 #include "envoy/upstream/cluster_manager.h"
 
+#include "nighthawk/common/live_tunable_rate_limiter.h"
 #include "nighthawk/common/platform_util.h"
 #include "nighthawk/common/request_source.h"
 #include "nighthawk/common/sequencer.h"
@@ -25,6 +26,14 @@ public:
   // build a per-phase sequencer at the phase's declared rate; unset, the
   // run-level option is used exactly as before. Only the default linear rate
   // limiter honors the override.
+  // FORK-ONLY (We-Amp): captured_live_tunable (M3 Task 3) -- when non-null,
+  // receives the live-tunable capability handle captured AFTER the inner
+  // limiter is constructed and BEFORE any decorator
+  // (ScheduledStartingRateLimiter/Bursting/DistributionSampling) wraps it.
+  // Null when the constructed limiter exposes no live-tunable capability
+  // (e.g. a third-party rate limiter plugin that does not implement the
+  // interface): a null handle must fail a live update honestly, never
+  // silently.
   virtual SequencerPtr create(Envoy::TimeSource& time_source, Envoy::Event::Dispatcher& dispatcher,
                               const SequencerTarget& sequencer_target,
                               TerminationPredicatePtr&& termination_predicate,
@@ -32,7 +41,8 @@ public:
                               const Envoy::MonotonicTime scheduled_starting_time,
                               Envoy::Api::Api& api,
                               std::optional<uint32_t> requests_per_second_override =
-                                  std::nullopt) const PURE;
+                                  std::nullopt,
+                              LiveTunableRateLimiter** captured_live_tunable = nullptr) const PURE;
 };
 
 class StatisticFactory {
