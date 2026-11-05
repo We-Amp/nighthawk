@@ -366,6 +366,51 @@ TEST_F(PhaseRunTest, BoundaryDrainIsNonDestructive) {
   EXPECT_GE(outcome.boundary_timings[0].idle_gap_ns, 0);
 }
 
+// FORK-ONLY (m3-drain-pair repro): the M3 acceptance re-observed the 30 s
+// censored drain at 16 workers (strip: `drain 30.0s gap 0.0s cens`) that the
+// M2 burstfix re-anchor fixed at 2-4 workers. The drain observable is the
+// benchmark client's in-flight count, and only onComplete moved it: a
+// request that fails at the connection pool (onPoolFailure) never left the
+// count, so one pool failure left inFlightRequests() above zero FOREVER and
+// the boundary drain watched a number that could never reach zero -- the
+// boundary censored at the full budget. The acceptance run's metadata
+// corroborates exactly that: initiated-completed stuck at 16 (one per
+// worker, the leaked pool-failed attempts). This repro makes the pool
+// failure deterministic (a dead port: every attempt fails at the pool)
+// against the full 16-worker fleet. Pin the healthy shape: even with every
+// request failing at the pool, the boundary drains uncensored and
+// sub-second.
+TEST_F(PhaseRunTest, BoundaryDrainSurvivesPoolFailures) {
+  nighthawk::client::CommandLineOptions cmd;
+  // A port nothing listens on: every connect fails at the connection pool.
+  cmd.mutable_uri()->set_value("http://127.0.0.1:1/");
+  cmd.mutable_connections()->set_value(4);
+  // A 500 ms request/connect timeout: the dropped-port connect failure (the
+  // WSL2 rig silently drops dead ports instead of refusing them) then lands
+  // within half a second, so a healthy drain completes sub-second while a
+  // leaked in-flight count still censors the boundary at the full budget.
+  cmd.mutable_timeout()->set_seconds(0);
+  cmd.mutable_timeout()->set_nanos(500000000);
+  cmd.mutable_no_default_failure_predicates()->set_value(true);
+  const std::vector<std::array<uint32_t, 3>> phases{{2, 50, 16}, {2, 50, 16}};
+  for (uint32_t i = 0; i < phases.size(); ++i) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(fmt::format("phase{}", i));
+    phase->mutable_duration()->set_seconds(phases[i][0]);
+    phase->set_requests_per_second(phases[i][1]);
+    phase->mutable_concurrency()->set_value(fmt::format("{}", phases[i][2]));
+  }
+  RunOutcome outcome = runPhases(cmd);
+  ASSERT_EQ(1, outcome.boundary_timings.size());
+  EXPECT_EQ("phase0", outcome.boundary_timings[0].phase_id);
+  EXPECT_FALSE(outcome.boundary_timings[0].drain_censored)
+      << "boundary censored with pool failures on the books (drain_duration_ns="
+      << outcome.boundary_timings[0].drain_duration_ns << ")";
+  EXPECT_LT(outcome.boundary_timings[0].drain_duration_ns, 1000000000)
+      << "drain took " << outcome.boundary_timings[0].drain_duration_ns / 1000000
+      << " ms at 16 workers with pool-failing requests";
+}
+
 // FORK-ONLY (M2 close-blocker repro): the phase vector's declared rps is the
 // phase's GLOBAL rate, and every phase must run its declared duration before
 // the boundary drains. These two tests pin the acceptance shape at test
