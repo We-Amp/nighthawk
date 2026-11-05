@@ -75,7 +75,10 @@ public:
   // phase id match, non-empty deltas) and then the knob whitelist (M3 Task
   // 2, judged against the engine's declared run shape); a targeting or
   // whitelist rejection resolves synchronously with an ack written before
-  // return, and never reaches the applier. Otherwise the update goes
+  // return, and never reaches the applier. A second update arriving while
+  // one is in flight is likewise rejected synchronously with a structured
+  // ack (the Task-8a service-side one-in-flight guard; bends are never
+  // queued and never applied concurrently). Otherwise the update goes
   // pending: the deltas are handed to the applier on a short-lived thread
   // which writes the ack. Returns promptly either way.
   void HandleUpdate(const nighthawk::client::UpdateRequest& request);
@@ -128,6 +131,13 @@ private:
   // counter, its own namespace — never compared with phase ids). A rejected
   // or dropped attempt does not consume the number.
   uint64_t applied_epoch_count_ ABSL_GUARDED_BY(mutex_) = 0;
+  // The service-side one-in-flight guard (Task 8a): true from the moment an
+  // update goes pending until its ack thread resolved (the epoch commit and
+  // the release share one critical section, so the next candidate epoch can
+  // never collide with a just-consumed number). An update arriving while
+  // this is set is rejected with a structured ack — never queued, never a
+  // concurrent applier thread.
+  bool update_in_flight_ ABSL_GUARDED_BY(mutex_) = false;
   bool run_finished_ ABSL_GUARDED_BY(mutex_) = false;
   bool cancelled_ ABSL_GUARDED_BY(mutex_) = false;
   std::vector<std::thread> ack_threads_ ABSL_GUARDED_BY(mutex_);

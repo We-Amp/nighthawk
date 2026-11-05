@@ -123,7 +123,7 @@ void LiveUpdateOrchestrator::HandleUpdate(const nighthawk::client::UpdateRequest
   // thread, and return immediately so the reader loop keeps reading (a
   // cancellation queued behind this update is never stalled by its ack wait).
   const EngineInstant bend_instant = DefaultEngineInstant();
-  uint64_t candidate_epoch;
+  bool reject_in_flight = false;
   {
     // Registered-and-checked spawn: the run-end / cancel flags are tested in
     // the same critical section that stores the thread, so no ack thread can
@@ -134,10 +134,30 @@ void LiveUpdateOrchestrator::HandleUpdate(const nighthawk::client::UpdateRequest
       // The run is winding down; the update resolves without a stream write.
       return;
     }
-    candidate_epoch = applied_epoch_count_ + 1;
-    ack_threads_.push_back(std::thread(&LiveUpdateOrchestrator::AckThreadMain, this, request,
-                                       candidate_epoch, absl::StrCat("epoch-", candidate_epoch),
-                                       bend_instant, absl::Now() + ack_wait_bound_));
+    if (update_in_flight_) {
+      // The SERVICE-side one-in-flight guard (Task 8a): a second update while
+      // one is pending is rejected here — honestly, with a structured ack —
+      // never queued, and never spawned as a concurrent applier thread (two
+      // overlapping pendings could both read applied_epoch_count_ and claim
+      // the same epoch-N). T7's client serializes its own sends, but the
+      // service must not depend on well-behaved clients. The fan-out keeps
+      // its own in-flight guard as defense in depth.
+      reject_in_flight = true;
+    } else {
+      update_in_flight_ = true;
+      const uint64_t candidate_epoch = applied_epoch_count_ + 1;
+      ack_threads_.push_back(std::thread(&LiveUpdateOrchestrator::AckThreadMain, this, request,
+                                         candidate_epoch, absl::StrCat("epoch-", candidate_epoch),
+                                         bend_instant, absl::Now() + ack_wait_bound_));
+    }
+  }
+  if (reject_in_flight) {
+    // The write happens outside the critical section (the ack gate reads the
+    // same flags); the stream-write gate still applies.
+    nighthawk::client::UpdateResult result;
+    result.set_applied(false);
+    result.set_rejection_reason("another live update is still in flight; bends are not queued");
+    WriteAckSync(result);
   }
 }
 
@@ -159,10 +179,18 @@ void LiveUpdateOrchestrator::AckThreadMain(nighthawk::client::UpdateRequest requ
     if (result.monotonic_ns() == 0) {
       result.set_monotonic_ns(bend_instant.monotonic_ns);
     }
-    // Commit the candidate epoch number: one epoch per APPLIED update — a
-    // rejected or dropped attempt does not consume the number.
+  }
+  {
+    // Commit the candidate epoch number (one epoch per APPLIED update — a
+    // rejected or dropped attempt does not consume the number) and release
+    // the one-in-flight guard in the SAME critical section: the commit is
+    // visible before the next pending update can be spawned, so the next
+    // candidate can never collide with a just-consumed epoch number.
     absl::MutexLock lock(&mutex_);
-    applied_epoch_count_ = std::max(applied_epoch_count_, epoch_number);
+    if (result.applied()) {
+      applied_epoch_count_ = std::max(applied_epoch_count_, epoch_number);
+    }
+    update_in_flight_ = false;
   }
   // The no-ack-after-final-output rule: resolve against the flags, not the
   // stream — once the run ended or a cancellation was accepted, this ack is

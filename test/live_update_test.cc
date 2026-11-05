@@ -115,6 +115,7 @@ class BlockingApplier : public LiveUpdateOrchestrator::Applier {
 public:
   UpdateResult ApplyDeltas(const UpdateRequest& /*request*/, const std::string& epoch_id,
                            const EngineInstant& bend_instant, absl::Time deadline) override {
+    calls_.fetch_add(1);
     while (!released_.load() && absl::Now() < deadline) {
       std::this_thread::sleep_for(10ms);
     }
@@ -128,10 +129,12 @@ public:
   }
   void Release() { released_.store(true); }
   bool blockedToDeadline() const { return blocked_to_deadline_.load(); }
+  int calls() const { return calls_.load(); }
 
 private:
   std::atomic<bool> released_{false};
   std::atomic<bool> blocked_to_deadline_{false};
+  std::atomic<int> calls_{0};
 };
 
 UpdateRequest MakeDeltasUpdate() {
@@ -266,6 +269,56 @@ TEST(LiveUpdateOrchestratorTest, CancellationNotBlockedByPendingAckWait) {
   orchestrator->OnRunEnded();
   orchestrator->JoinPendingAcks();
   EXPECT_EQ(recorder.size(), 0);
+}
+
+// Task 8a: the SERVICE-side one-in-flight guard. A second update arriving
+// while one is pending is rejected here with a structured ack -- never
+// spawned as a concurrent applier thread, so two overlapping pendings can
+// never both claim the same epoch number. The rejected attempt consumes no
+// epoch: the next applied update gets the next number.
+TEST(LiveUpdateOrchestratorTest, SecondUpdateWhileInFlightRejectedExactlyOneEpochClaim) {
+  BlockingApplier applier;
+  AckRecorder recorder;
+  auto orchestrator = MakeOrchestrator(&applier, &recorder);
+
+  // The first update goes pending (its applier blocks until released).
+  orchestrator->HandleUpdate(MakeDeltasUpdate());
+  // The second, arriving while the first is in flight: an honest structured
+  // rejection, resolved synchronously, and NO second applier invocation.
+  orchestrator->HandleUpdate(MakeDeltasUpdate());
+
+  applier.Release();
+  orchestrator->JoinPendingAcks();
+
+  EXPECT_EQ(applier.calls(), 1) << "the overlapping second update must never reach the applier";
+  const std::vector<UpdateResult> acks = recorder.acks();
+  ASSERT_EQ(acks.size(), 2u);
+  size_t applied_acks = 0;
+  size_t rejected_acks = 0;
+  for (const UpdateResult& ack : acks) {
+    if (ack.applied()) {
+      applied_acks++;
+      // Exactly one epoch claim from the overlapping pair: epoch-1, never a
+      // second pending sharing it.
+      EXPECT_EQ(ack.epoch_id(), "epoch-1");
+    } else {
+      rejected_acks++;
+      EXPECT_THAT(ack.rejection_reason(), HasSubstr("in flight"));
+      EXPECT_THAT(ack.rejection_reason(), HasSubstr("bends are not queued"));
+    }
+  }
+  EXPECT_EQ(applied_acks, 1u);
+  EXPECT_EQ(rejected_acks, 1u);
+
+  // The rejected attempt consumed no epoch number: the next applied update
+  // is epoch-2, never a second epoch-1.
+  orchestrator->HandleUpdate(MakeDeltasUpdate());
+  orchestrator->JoinPendingAcks();
+  EXPECT_EQ(applier.calls(), 2);
+  const std::vector<UpdateResult> acks_after = recorder.acks();
+  ASSERT_EQ(acks_after.size(), 3u);
+  EXPECT_TRUE(acks_after.back().applied());
+  EXPECT_EQ(acks_after.back().epoch_id(), "epoch-2");
 }
 
 // M4: a pending update whose run ends resolves without a stream write.
