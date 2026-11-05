@@ -278,13 +278,17 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
     // The excluded-and-marked parts ALWAYS land (store + session, purity 0.0,
     // the rule-naming reason) — the fix-round rule: a marked part must never
     // vanish just because a pure sibling exists; only the note changes shape.
+    // Snapshot the part counts BEFORE the move: the notes below classify the
+    // split result, and reading a moved-from vector there would always look
+    // empty — clearing windows the splitter had just produced.
+    const size_t pure_count = split.pure.size();
     outcome.windows = std::move(split.pure);
     for (ProfileWindow& excluded : split.excluded) {
       outcome.windows.push_back(std::move(excluded));
     }
     std::string note;
-    if (!split.pure.empty()) {
-      note = absl::StrCat("window split at the boundary: ", split.pure.size(), " pure part(s)");
+    if (pure_count > 0) {
+      note = absl::StrCat("window split at the boundary: ", pure_count, " pure part(s)");
       for (const std::string& reason : split.reasons) {
         absl::StrAppend(&note, " | ", reason);
       }
