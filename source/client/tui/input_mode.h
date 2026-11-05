@@ -21,6 +21,11 @@ enum class InputMode {
   // phase vector is fixed at start; the preview exists so the M3 steering
   // surface has its state machine already exercised).
   kEditingStagedPhase,
+  // M3 (Task 8): the live rps knob turn (knobs tab, live run only). Same
+  // suspension rule: while the turn value is typed, pane refresh is
+  // suspended; enter sends the update (the ack resolves the pending state
+  // through the feed's callback), esc cancels.
+  kEditingKnob,
 };
 
 // True while an input mode owns the keyboard and the pane refresh cadence is
@@ -30,7 +35,7 @@ enum class InputMode {
 // Task 6's dialog close; Task 7 exercises it by hand.
 inline bool RefreshSuspended(InputMode mode) {
   return mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch ||
-         mode == InputMode::kEditingStagedPhase;
+         mode == InputMode::kEditingStagedPhase || mode == InputMode::kEditingKnob;
 }
 
 } // namespace Tui

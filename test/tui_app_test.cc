@@ -50,6 +50,7 @@ TEST(KeyMapTest, BindingsMatchTheDocumentedTable) {
       {"d", "differential (default: last two pure)"},
       {"N", "noise-floor view (plain n stays dialog)"},
       {"e", "stage an edit for the next phase (knobs tab; esc discards)"},
+      {"u", "turn the rps knob (knobs tab, live run; the PHASE TOTAL)"},
   };
   ASSERT_EQ(bindings.size(), expected.size());
   for (size_t i = 0; i < expected.size(); ++i) {
@@ -204,6 +205,55 @@ TEST_F(KeyMapDispatchTest, StagedEditRefusesNonNumericDraft) {
   EXPECT_TRUE(state_.staged_next_phase.name().empty());
   EXPECT_NE(controller_->flameNote().find("positive integer"), std::string::npos)
       << controller_->flameNote();
+}
+
+// The live rps turn (M3): the u key routes through the knobs tab + a live
+// run; the editing mode suspends refresh (RefreshSuspended), the draft
+// edits like every other field, esc cancels, and a non-numeric draft is
+// refused with a note (the value is the PHASE TOTAL). The send itself needs
+// a live run — the controller refuses honestly here (no run in flight).
+TEST_F(KeyMapDispatchTest, KnobTurnKeyRoutesAndEdits) {
+  EXPECT_TRUE(Press(ftxui::Event::Character('k')));
+  // No live run: an honest note, never a silent no-op, mode stays navigate.
+  EXPECT_TRUE(Press(ftxui::Event::Character('u')));
+  EXPECT_EQ(state_.mode, InputMode::kNavigate);
+  EXPECT_NE(controller_->flameNote().find("no run to steer"), std::string::npos)
+      << controller_->flameNote();
+
+  // The wrong tab routes with a note too.
+  EXPECT_TRUE(Press(ftxui::Event::Character('c')));
+  EXPECT_TRUE(Press(ftxui::Event::Character('u')));
+  EXPECT_EQ(state_.mode, InputMode::kNavigate);
+  EXPECT_NE(controller_->flameNote().find("knobs tab (k, then u)"), std::string::npos)
+      << controller_->flameNote();
+
+  // The editing mode's draft machine (entered directly; the live-run gate
+  // is the controller's).
+  state_.mode = InputMode::kEditingKnob;
+  EXPECT_TRUE(RefreshSuspended(state_.mode));
+  EXPECT_TRUE(Press(ftxui::Event::Character('3')));
+  EXPECT_TRUE(Press(ftxui::Event::Character('0')));
+  EXPECT_TRUE(Press(ftxui::Event::Backspace));
+  EXPECT_EQ(state_.knob_draft, "3");
+  // A non-numeric draft is refused; the mode stays until esc/enter resolves.
+  EXPECT_TRUE(Press(ftxui::Event::Character('x')));
+  EXPECT_TRUE(Press(ftxui::Event::Return));
+  EXPECT_NE(controller_->flameNote().find("positive integer"), std::string::npos)
+      << controller_->flameNote();
+  EXPECT_EQ(state_.mode, InputMode::kEditingKnob);
+  // Esc cancels: one forced redraw, back to navigate, draft discarded.
+  EXPECT_TRUE(Press(ftxui::Event::Escape));
+  EXPECT_EQ(state_.mode, InputMode::kNavigate);
+  EXPECT_TRUE(state_.knob_draft.empty());
+  // A VALID draft sends the update; with no live run the controller refuses
+  // honestly (rps turn refused), the draft clears, and the mode exits.
+  state_.mode = InputMode::kEditingKnob;
+  EXPECT_TRUE(Press(ftxui::Event::Character('4')));
+  EXPECT_TRUE(Press(ftxui::Event::Return));
+  EXPECT_NE(controller_->flameNote().find("rps turn refused"), std::string::npos)
+      << controller_->flameNote();
+  EXPECT_EQ(state_.mode, InputMode::kNavigate);
+  EXPECT_TRUE(state_.knob_draft.empty());
 }
 
 } // namespace

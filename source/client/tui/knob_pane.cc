@@ -1,10 +1,12 @@
 #include "source/client/tui/knob_pane.h"
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/numbers.h"
@@ -16,10 +18,14 @@ namespace {
 
 constexpr const char* kUnsetValue = "unset";
 constexpr const char* kRampUnconfigured = "not configured";
-constexpr const char* kLiveTag = "LIVE (M3)";
+constexpr const char* kLiveTag = "LIVE";
 constexpr const char* kPhaseGatedTag = "PHASE-GATED";
 constexpr const char* kStagedTag = "STAGED";
 constexpr const char* kInheritSuffix = " (inherit)";
+// The phase-total disclosure riding on every rps surface (the knob speaks
+// GLOBAL rps: the engine divides the value across the active workers at
+// fan-out — turning rps to X means X total, not X per worker).
+constexpr const char* kPhaseTotalSuffix = " (phase total)";
 // Column the value starts at (the name field's fixed width); the steering tag
 // trails the value after a second fixed-width column.
 constexpr int kNameColumn = 14;
@@ -119,12 +125,112 @@ ftxui::Element RenderKnobPane(const std::vector<KnobDisplay>& knobs, int width, 
     return ftxui::emptyElement();
   }
   std::vector<ftxui::Element> rows;
-  // The display-only banner: the pane states the steering milestone so no
-  // hidden timing semantics can masquerade as implemented controls (spec §3).
-  rows.push_back(ftxui::text("knobs (display-only; steering lands in M3)"));
+  // The M3 header: the pane is live — the banner names the live knob and the
+  // turn key, and states the phase-total semantics of every rps value (the
+  // global-rps copy discipline; the M0b display-only banner is gone).
+  rows.push_back(ftxui::text(
+      "knobs (live: rps - press u to turn; every rps value is the phase total)"));
   for (const KnobDisplay& knob : knobs) {
     rows.push_back(ftxui::text(knobLine(knob)));
   }
+  return ftxui::vbox(std::move(rows));
+}
+
+// ---------------------------------------------------------------------------
+// M3 Task 8: the live knob-turn state machine.
+// ---------------------------------------------------------------------------
+
+absl::string_view KnobTurnStateMarker(KnobTurnState state) {
+  switch (state) {
+  case KnobTurnState::kCurrentAcked:
+    return "acked";
+  case KnobTurnState::kPendingApply:
+    return "pending";
+  case KnobTurnState::kRejected:
+    return "rejected";
+  case KnobTurnState::kFailedPending:
+    return "failed";
+  case KnobTurnState::kStaged:
+    return kStagedTag;
+  }
+  return "acked";
+}
+
+void KnobTurnTracker::SeedAckedValue(uint32_t rps) {
+  if (turn_.state != KnobTurnState::kPendingApply) {
+    turn_.acked_value = absl::StrCat(rps);
+  }
+}
+
+void KnobTurnTracker::BeginRpsTurn(uint32_t new_rps) {
+  if (turn_.state == KnobTurnState::kPendingApply) {
+    // One outstanding turn (the caller refuses earlier still).
+    return;
+  }
+  turn_.pending_value = absl::StrCat(new_rps);
+  turn_.note.clear();
+  turn_.state = KnobTurnState::kPendingApply;
+}
+
+void KnobTurnTracker::OnUpdateResult(const nighthawk::client::UpdateResult& result) {
+  if (turn_.state != KnobTurnState::kPendingApply) {
+    // Nothing in flight: an unsolicited ack resolves nothing (and never
+    // overwrites the acked value — the timeline truth rule needs the turn's
+    // own ack).
+    return;
+  }
+  if (result.applied()) {
+    turn_.acked_value = turn_.pending_value;
+    turn_.pending_value.clear();
+    turn_.note.clear();
+    turn_.state = KnobTurnState::kCurrentAcked;
+    return;
+  }
+  // The feed-generated pending surfacing carries the "run-feed: " prefix
+  // (run_feed.h's contract) — never an engine verdict: failed-pending, not
+  // a rejection (spec §4 B honesty rule).
+  const bool feed_generated = absl::StartsWith(result.rejection_reason(), "run-feed: ");
+  turn_.note = result.rejection_reason();
+  turn_.state = feed_generated ? KnobTurnState::kFailedPending : KnobTurnState::kRejected;
+}
+
+void KnobTurnTracker::DismissOutcome() {
+  if (turn_.state == KnobTurnState::kRejected || turn_.state == KnobTurnState::kFailedPending) {
+    turn_.note.clear();
+    turn_.pending_value.clear();
+    turn_.state = KnobTurnState::kCurrentAcked;
+  }
+}
+
+ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height) {
+  if (width <= 0 || height <= 0) {
+    return ftxui::emptyElement();
+  }
+  std::vector<ftxui::Element> rows;
+  // The acked value carries the phase-total disclosure; a pending/rejected/
+  // failed turn shows the attempted value in the transition.
+  std::string value = rps_turn.acked_value.empty() ? std::string(kUnsetValue)
+                                                   : rps_turn.acked_value + kPhaseTotalSuffix;
+  std::string line = absl::StrCat("rps", ": ", value);
+  switch (rps_turn.state) {
+  case KnobTurnState::kCurrentAcked:
+    absl::StrAppend(&line, " [acked]");
+    break;
+  case KnobTurnState::kPendingApply:
+    absl::StrAppend(&line, " -> ", rps_turn.pending_value, " [pending...]");
+    break;
+  case KnobTurnState::kRejected:
+    absl::StrAppend(&line, " [rejected -> ", rps_turn.pending_value, "] ", rps_turn.note,
+                    " (u dismisses)");
+    break;
+  case KnobTurnState::kFailedPending:
+    absl::StrAppend(&line, " -> ", rps_turn.pending_value, " [failed] ", rps_turn.note,
+                    " (u dismisses)");
+    break;
+  default:
+    break;
+  }
+  rows.push_back(ftxui::text(line.substr(0, static_cast<size_t>(std::max(1, width)))));
   return ftxui::vbox(std::move(rows));
 }
 

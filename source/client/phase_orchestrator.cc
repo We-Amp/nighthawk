@@ -196,6 +196,11 @@ BuildPhaseMetadata(uint32_t phase_index, const nighthawk::client::PhaseSpec& pha
   metadata.set_worker_count(worker_subset.worker_count);
   metadata.set_workers_changed_vs_prior_phase(worker_subset.workers_changed_vs_prior_phase);
   metadata.set_new_workers_cold_started(worker_subset.new_workers_cold_started);
+  // FORK-ONLY (We-Amp): the censoring mark rides into the post-run metadata.
+  // The streamed boundary event carries it live; without this stamp the
+  // post-run strip rebuild (which prefers the metadata) would silently lose
+  // the mark (M2-close panel major: counted, not hidden — 8.6).
+  metadata.set_drain_censored(boundary != nullptr && boundary->drain_censored);
   metadata.set_initiated(initiated);
   // Straggler completions inherited from a censored predecessor boundary are
   // excluded: the predecessor already counted them in its reset_or_timed_out

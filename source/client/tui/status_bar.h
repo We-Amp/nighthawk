@@ -9,6 +9,7 @@
 #include "api/client/live.pb.h"
 #include "api/client/output.pb.h"
 #include "api/client/options.pb.h"
+#include "api/client/session.pb.h"
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/run_view_model.h"
 
@@ -99,6 +100,11 @@ struct PhaseTimelineSegment {
   double completion_ratio = 0.0;
   bool has_gate = false;
   uint64_t gate_exceeded = 0;
+  // M3: the applied knob epochs that landed in this phase, in ack order —
+  // the strip renders each as " +<epoch_id>" after the phase's span. Marks
+  // arrive ONLY from engine acks (WithEpochMarks); a pending turn marks
+  // nothing (spec §4 B timeline-truth rule).
+  std::vector<std::string> epoch_ids;
 };
 
 // Builds the timeline segments from the run's phase specs (durations) and
@@ -136,6 +142,24 @@ std::vector<PhaseTimelineSegment> BuildPhaseTimeline(
     const std::vector<nighthawk::client::PhaseMetadata>& metadata,
     absl::string_view current_phase_id);
 
+// ---------------------------------------------------------------------------
+// M3: the timeline's epoch marks (spec §4 B timeline-truth rule). One mark
+// per APPLIED live change — the engine's ack is the ONLY thing that puts a
+// mark on the timeline: a user edit marks nothing, a rejected attempt marks
+// nothing, and a feed-generated pending-timeout marks nothing. Each mark
+// lands on the segment whose phase id matches the ack record's phase_id
+// (a record whose phase no segment carries — e.g. a legacy run without a
+// phase vector — appends its epoch id to the LAST segment's marks rather
+// than vanishing; with no segments at all the marks are dropped, which is
+// the honest legacy shape). Pure.
+// ---------------------------------------------------------------------------
+
+// Applies the applied-change records to the segments. `epochs` are the
+// engine-acked KnobEpochRecords, in ack order.
+std::vector<PhaseTimelineSegment> WithEpochMarks(
+    const std::vector<PhaseTimelineSegment>& segments,
+    const std::vector<nighthawk::client::KnobEpochRecord>& epochs);
+
 // The compact one-row strip, ASCII only:
 //   [warm 2s | drain 0.5s gap 0.2s pool: created=+0 active=8 | *spike 2s*
 //   ratio=0.98 gate=7]
@@ -144,7 +168,10 @@ std::vector<PhaseTimelineSegment> BuildPhaseTimeline(
 // a visible gap segment with the pool line in the plan's
 // `pool: created=+N active=M` vocabulary (negative deltas render -N); a
 // worker-count change adds the "cmp!" non-comparable mark, a cold start
-// adds "cold". Empty input renders "" (nothing staged to show).
+// adds "cold", a censored drain keeps its "cens" mark (live AND post-run:
+// the metadata path carries drain_censored since the fork's output.proto
+// field), and each applied knob epoch in the phase adds " +<epoch_id>".
+// Empty input renders "" (nothing staged to show).
 // Exact-render pinned by tests, like the charts.
 std::string PhaseTimelineStrip(const std::vector<PhaseTimelineSegment>& segments);
 

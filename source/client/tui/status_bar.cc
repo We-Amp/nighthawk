@@ -39,6 +39,8 @@ std::string modeName(InputMode mode) {
     return "editing (search)";
   case InputMode::kEditingStagedPhase:
     return "editing (staged phase)";
+  case InputMode::kEditingKnob:
+    return "editing (rps turn)";
   }
   return "unknown";
 }
@@ -115,15 +117,16 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
   // placeholder phase cell; the strip is built from the streamed boundary
   // events while the run is live and from the final Output's metadata after
   // it — BuildPhaseTimeline picks the source), else the phase/epoch row.
-  // Pre-A1 the phase id is the constant "main" and no steering exists, so
-  // the fields are placeholders — labeled as such; the placeholder marker
-  // drops when real phase ids flow (M2).
+  // Pre-A1 the phase id is the constant "main"; the placeholder marker
+  // dropped at M2 for real phase ids. M3: the epoch cell carries the REAL
+  // current knob epoch (the schedule the latest samples were produced
+  // under) — no placeholder suffix since the M3 ack path landed.
   const std::string phase = model.last_snapshot.phase_id();
   const std::string epoch = model.last_snapshot.epoch_id();
   const bool phase_id_real = !phase.empty() && phase != "main";
   const std::string epoch_cell = absl::StrCat(
-      " | epoch: ", epoch.empty() ? "(none)" : epoch,
-      epoch.empty() ? "" : " [placeholder]", " | flush ", kStatusBarFlushIntervalSeconds, "s");
+      " | epoch: ", epoch.empty() ? "(none)" : epoch, " | flush ",
+      kStatusBarFlushIntervalSeconds, "s");
   // m1: the strip clips to the bar width minus the tail via
   // RenderPhaseTimeline's truncation — the bar's no-overflow contract.
   // bar_width <= 0 means "unclipped" (callers without a width): pass a
@@ -146,7 +149,8 @@ ftxui::Element RenderStatusBar(const RunViewModel& model, InputMode mode,
   const std::string row2_prefix =
       absl::StrCat("session: ", session_path.empty() ? "(none)" : session_path, " | mode: ");
   ftxui::Element mode_cell = ftxui::text(modeName(mode));
-  if (mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch) {
+  if (mode == InputMode::kEditingStartRun || mode == InputMode::kEditingSearch ||
+      mode == InputMode::kEditingKnob) {
     mode_cell = mode_cell | ftxui::inverted;
   }
   std::vector<ftxui::Element> row2 = {ftxui::text(row2_prefix), mode_cell};
@@ -203,6 +207,10 @@ std::vector<PhaseTimelineSegment> PhaseTimelineSegments(
     segment.completion_ratio = phase.completion_ratio();
     segment.has_gate = true;
     segment.gate_exceeded = phase.gate_exceeded();
+    // 8.6 counted-not-hidden (M2-close panel major): the metadata path now
+    // carries the censoring mark too — the mark must survive the post-run
+    // rebuild, not vanish with the streamed events.
+    segment.drain_censored = phase.drain_censored();
 
     // Pool aggregates are the per-worker sums of this phase's entries.
     const bool has_pool = phase.pool_health_size() > 0;
@@ -250,6 +258,12 @@ std::string PhaseTimelineStrip(const std::vector<PhaseTimelineSegment>& segments
       absl::StrAppend(&strip, "*", segment.phase_id, " ", duration, "*");
     } else {
       absl::StrAppend(&strip, segment.phase_id, " ", duration);
+    }
+    // The applied knob epochs that landed in this phase (M3): one "+<id>"
+    // mark per engine ack, in ack order — the timeline truth rule (marks
+    // arrive only from WithEpochMarks, never from a user action).
+    for (const std::string& epoch_id : segment.epoch_ids) {
+      absl::StrAppend(&strip, " +", epoch_id);
     }
     // Claim-discipline pair next to the current phase (spec 8.2).
     if (segment.is_current) {
@@ -367,6 +381,38 @@ std::vector<PhaseTimelineSegment> BuildPhaseTimeline(
     return PhaseTimelineSegments(specs, metadata, current_phase_id);
   }
   return PhaseTimelineSegmentsFromEvents(specs, events, current_phase_id);
+}
+
+std::vector<PhaseTimelineSegment> WithEpochMarks(
+    const std::vector<PhaseTimelineSegment>& segments,
+    const std::vector<nighthawk::client::KnobEpochRecord>& epochs) {
+  std::vector<PhaseTimelineSegment> result = segments;
+  if (result.empty()) {
+    // No timeline to mark (a legacy run without a phase vector): the marks
+    // would have nowhere honest to land — dropped, not faked onto a row.
+    return result;
+  }
+  for (const nighthawk::client::KnobEpochRecord& record : epochs) {
+    if (record.epoch_id().empty()) {
+      // A rejected attempt carries an empty epoch id — it marks nothing
+      // (the controller filters too; both layers keep the timeline truth).
+      continue;
+    }
+    bool landed = false;
+    for (PhaseTimelineSegment& segment : result) {
+      if (segment.phase_id == record.phase_id()) {
+        segment.epoch_ids.push_back(record.epoch_id());
+        landed = true;
+        break;
+      }
+    }
+    if (!landed) {
+      // The bend's phase has no segment (e.g. a phase id the specs never
+      // carried): the mark lands on the LAST segment rather than vanishing.
+      result.back().epoch_ids.push_back(record.epoch_id());
+    }
+  }
+  return result;
 }
 
 } // namespace Tui

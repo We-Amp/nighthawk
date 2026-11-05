@@ -246,6 +246,26 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): M3 Task 8 knob-steering tests — the §4 knob state
+# machine, the timeline-truth rule (epoch marks on engine acks only), the
+# pending-timeout honesty rule, and the KnobEpochRecord session path. Plain
+# cc_test, same quarantine reasoning as tui_view_model_test.
+cc_test(
+    name = "tui_knob_steering_test",
+    srcs = ["tui_knob_steering_test.cc"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//source/client/tui:tui_lib",
+        "@ftxui//:dom",
+        "@ftxui//:screen",
+        "@googletest//:gtest_main",
+        # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 # FORK-ONLY (We-Amp): M2 phase timeline + PhaseBoundaryRecord tests (Task 7
 # phase 1: the pure render/conversion halves). Plain cc_test, same quarantine
 # reasoning as tui_view_model_test.

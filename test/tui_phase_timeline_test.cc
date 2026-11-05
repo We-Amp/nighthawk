@@ -608,6 +608,108 @@ TEST(PhaseTimelineTest, StatusBarRendersTimelineRowAndDropsPlaceholderWhenRealId
   EXPECT_NE(legacy[1].find("pre-phase-engine placeholder"), std::string::npos) << legacy[1];
 }
 
+// ---------------------------------------------------------------------------
+// M2-close panel major: the censored-drain mark must survive the post-run
+// metadata rebuild. Live, the strip renders "cens" from the streamed
+// boundary event; post-run, BuildPhaseTimeline prefers the metadata-built
+// segments — which now carry drain_censored (the fork's output.proto field)
+// — so the mark does not silently vanish.
+// ---------------------------------------------------------------------------
+
+TEST(PhaseTimelineTest, CensoredDrainMarkSurvivesTheMetadataRebuild) {
+  std::vector<PhaseSpec> specs = twoPhaseSpecs();
+  CommandLineOptions options;
+  *options.add_phases() = makeSpec("warm", 2, "2");
+  *options.add_phases() = makeSpec("spike", 2, "4");
+
+  // Live: the streamed boundary event carries the censor flag.
+  PhaseBoundaryEvent censored = makeBoundaryEvent("warm", 0, "spike", /*cold=*/false);
+  censored.set_drain_censored(true);
+  const std::vector<PhaseTimelineSegment> live_segments =
+      PhaseTimelineSegmentsFromEvents(specs, {censored}, /*current_phase_id=*/"spike");
+  const std::string live_strip = PhaseTimelineStrip(live_segments);
+  ASSERT_NE(live_strip.find("cens"), std::string::npos) << live_strip;
+
+  // Post-run: the Output's metadata is the completeness source; its
+  // drain_censored stamp (BuildPhaseMetadata, engine side) keeps the mark.
+  std::vector<PhaseMetadata> metadata = twoPhaseMetadata();
+  ASSERT_FALSE(metadata.empty());
+  metadata[0].set_drain_censored(true);
+  const std::vector<PhaseTimelineSegment> post_run_segments =
+      BuildPhaseTimeline(options, {censored}, metadata, /*current_phase_id=*/"spike");
+  const std::string post_run_strip = PhaseTimelineStrip(post_run_segments);
+  EXPECT_NE(post_run_strip.find("cens"), std::string::npos)
+      << "the censored mark must survive the post-run rebuild: " << post_run_strip;
+
+  // Uncensored metadata keeps the strip clean.
+  std::vector<PhaseMetadata> clean = twoPhaseMetadata();
+  const std::vector<PhaseTimelineSegment> clean_segments =
+      BuildPhaseTimeline(options, {censored}, clean, /*current_phase_id=*/"spike");
+  EXPECT_EQ(PhaseTimelineStrip(clean_segments).find("cens"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// M3: the timeline's epoch marks (WithEpochMarks + the strip). Marks land
+// ONLY on applied acks; each renders "+<epoch_id>" on its phase's segment.
+// ---------------------------------------------------------------------------
+
+TEST(PhaseTimelineTest, EpochMarksLandOnlyFromAppliedAcksAndRenderPerPhase) {
+  CommandLineOptions options;
+  *options.add_phases() = makeSpec("warm", 2, "2");
+  *options.add_phases() = makeSpec("spike", 2, "4");
+  const std::vector<PhaseTimelineSegment> base =
+      BuildPhaseTimeline(options, {}, {}, /*current_phase_id=*/"spike");
+  ASSERT_EQ(base.size(), 2u);
+
+  // No acks: no marks.
+  const std::vector<PhaseTimelineSegment> unmarked = WithEpochMarks(base, {});
+  EXPECT_TRUE(unmarked[0].epoch_ids.empty());
+  EXPECT_TRUE(unmarked[1].epoch_ids.empty());
+
+  // Two applied acks in phase "warm", one in "spike": marks land on their
+  // phase's segment, in ack order.
+  nighthawk::client::KnobEpochRecord first;
+  first.set_epoch_id("epoch-1");
+  first.set_phase_id("warm");
+  nighthawk::client::KnobEpochRecord second;
+  second.set_epoch_id("epoch-2");
+  second.set_phase_id("warm");
+  nighthawk::client::KnobEpochRecord third;
+  third.set_epoch_id("epoch-3");
+  third.set_phase_id("spike");
+
+  const std::vector<PhaseTimelineSegment> marked =
+      WithEpochMarks(base, {first, second, third});
+  ASSERT_EQ(marked[0].epoch_ids.size(), 2u);
+  EXPECT_EQ(marked[0].epoch_ids[0], "epoch-1");
+  EXPECT_EQ(marked[0].epoch_ids[1], "epoch-2");
+  ASSERT_EQ(marked[1].epoch_ids.size(), 1u);
+  EXPECT_EQ(marked[1].epoch_ids[0], "epoch-3");
+
+  // A rejected attempt (empty epoch id — the controller never forwards one,
+  // and WithEpochMarks double-checks) marks nothing.
+  nighthawk::client::KnobEpochRecord rejected;
+  rejected.set_rejection_note("max_pending_requests: not in the live-knob whitelist");
+  const std::vector<PhaseTimelineSegment> still =
+      WithEpochMarks(base, {first, rejected});
+  ASSERT_EQ(still[0].epoch_ids.size(), 1u);
+
+  // A record whose phase no segment carries lands on the LAST segment
+  // rather than vanishing.
+  nighthawk::client::KnobEpochRecord stray;
+  stray.set_epoch_id("epoch-9");
+  stray.set_phase_id("no-such-phase");
+  const std::vector<PhaseTimelineSegment> stray_marked =
+      WithEpochMarks(base, {stray});
+  ASSERT_EQ(stray_marked[1].epoch_ids.size(), 1u);
+  EXPECT_EQ(stray_marked[1].epoch_ids[0], "epoch-9");
+
+  // The strip renders "+<id>".
+  const std::string strip = PhaseTimelineStrip(marked);
+  EXPECT_NE(strip.find("+epoch-1"), std::string::npos) << strip;
+  EXPECT_NE(strip.find("+epoch-3"), std::string::npos) << strip;
+}
+
 } // namespace
 } // namespace Tui
 } // namespace Client
