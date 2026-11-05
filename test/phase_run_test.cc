@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -365,6 +366,177 @@ TEST_F(PhaseRunTest, BoundaryDrainIsNonDestructive) {
   EXPECT_GE(outcome.boundary_timings[0].idle_gap_ns, 0);
 }
 
+// FORK-ONLY (M2 close-blocker repro): the phase vector's declared rps is the
+// phase's GLOBAL rate, and every phase must run its declared duration before
+// the boundary drains. These two tests pin the acceptance shape at test
+// scale: per-second SUT-side initiation counts track the declared rps within
+// tolerance, the boundary drain is uncensored and short, the phase lasts its
+// declared duration, and nothing is shed (gate-exceeded stays zero).
+//
+// The --timeout < phase-duration shape matters: the boundary's drain wait
+// must be bounded by --timeout measured from the sequencer STOP, never from
+// the phase begin (a budget applied at begin-phase censors a healthy phase
+// at the cap and begins the successor while the predecessor's sequencer is
+// still running -- the T8 close-blocker).
+
+namespace {
+
+// Builds a two-phase vector: [duration, rps, workers] per phase.
+nighthawk::client::CommandLineOptions makePhaseOptions(const std::string& uri, int64_t timeout_s,
+                                                       const std::vector<
+                                                           std::array<uint32_t, 3>>& phases) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(uri);
+  cmd.mutable_connections()->set_value(4);
+  cmd.mutable_timeout()->set_seconds(timeout_s);
+  for (uint32_t i = 0; i < phases.size(); ++i) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(fmt::format("phase{}", i));
+    phase->mutable_duration()->set_seconds(phases[i][0]);
+    phase->set_requests_per_second(phases[i][1]);
+    phase->mutable_concurrency()->set_value(fmt::format("{}", phases[i][2]));
+  }
+  return cmd;
+}
+
+} // namespace
+
+// Pacing at one worker: each phase's per-second initiation count tracks its
+// declared rps, the boundary is uncensored, nothing is shed.
+TEST_F(PhaseRunTest, PhaseScheduleIsPacedNotBurst) {
+  RunOutcome outcome = runPhases(makePhaseOptions(listener().uri(), 5, {{4, 50, 1}, {4, 100, 1}}));
+  ASSERT_TRUE(outcome.success);
+
+  // The boundary drain is uncensored and fast (a direct-response listener
+  // holds nothing in flight past the sequencer stop).
+  ASSERT_EQ(1, outcome.boundary_timings.size());
+  EXPECT_FALSE(outcome.boundary_timings[0].drain_censored);
+  EXPECT_LT(outcome.boundary_timings[0].drain_duration_ns,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count());
+
+  ASSERT_EQ(2, outcome.phase_gate_exceeded.size());
+  EXPECT_EQ(0, outcome.phase_gate_exceeded[0]);
+  EXPECT_EQ(0, outcome.phase_gate_exceeded[1]);
+
+  // Phase-0 lasted its declared duration: its start event to the next
+  // phase's start event is ~4 s, not the censoring-cap shape.
+  ASSERT_GE(outcome.events.size(), 4u);
+  const int64_t phase0_declared_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(4s).count();
+  const int64_t phase0_wall_ns =
+      outcome.events[2].wall_time_unix_ns - outcome.events[0].wall_time_unix_ns;
+  EXPECT_NEAR(phase0_wall_ns, phase0_declared_ns, phase0_declared_ns / 8)
+      << "phase0 did not last its declared duration (wall ns: " << phase0_wall_ns << ")";
+
+  // Per-second SUT-side initiation buckets per phase, relative to each
+  // phase's start event. Full buckets only: the final (partial) bucket of
+  // each phase window is dropped.
+  const std::vector<std::array<int64_t, 3>> phase_windows{
+      {outcome.events[0].wall_time_unix_ns, outcome.events[2].wall_time_unix_ns, 50},
+      {outcome.events[2].wall_time_unix_ns, std::numeric_limits<int64_t>::max(), 100}};
+  const std::vector<RequestSpan> spans = listener().requestSpans();
+  std::string histogram;
+  for (const std::array<int64_t, 3>& window : phase_windows) {
+    const int64_t window_start_ns = window[0];
+    const int64_t window_end_ns = window[1];
+    const int64_t rps = window[2];
+    histogram.clear();
+    std::vector<int64_t> buckets;
+    for (const RequestSpan& span : spans) {
+      if (span.start_ns < window_start_ns || span.start_ns >= window_end_ns) {
+        continue;
+      }
+      const int64_t sec = (span.start_ns - window_start_ns) / 1000000000;
+      if (static_cast<size_t>(sec) >= buckets.size()) {
+        buckets.resize(sec + 1, 0);
+      }
+      buckets[sec]++;
+    }
+    if (!buckets.empty()) {
+      buckets.pop_back();
+    }
+    EXPECT_GE(buckets.size(), 3u)
+        << "phase produced fewer than 3 full seconds of load; declared rps " << rps;
+    for (size_t sec = 0; sec < buckets.size(); ++sec) {
+      absl::StrAppend(&histogram,
+                      fmt::format("  second {} (declared {}): {}\n", sec, rps, buckets[sec]));
+    }
+    for (size_t sec = 0; sec < buckets.size(); ++sec) {
+      EXPECT_NEAR(buckets[sec], rps, rps / 2) << "bucket burst/undershoot; histogram:\n"
+                                              << histogram;
+    }
+  }
+}
+
+// The T8 close-blocker shape at test scale: a worker-count change across the
+// boundary, a 4x rps delta, and --timeout BELOW the phase durations. The
+// declared rps is the phase's GLOBAL rate (divided across the active
+// workers), the phase runs its declared duration before the boundary, and
+// the boundary drain is uncensored.
+TEST_F(PhaseRunTest, PhaseBoundaryWaitsForSequencerStop) {
+  RunOutcome outcome = runPhases(makePhaseOptions(listener().uri(), 2, {{3, 100, 2}, {3, 400, 4}}));
+  ASSERT_TRUE(outcome.success);
+
+  ASSERT_EQ(1, outcome.boundary_timings.size());
+  EXPECT_FALSE(outcome.boundary_timings[0].drain_censored)
+      << "boundary drain censored at the timeout cap: the drain budget was "
+         "applied from the phase begin instead of the sequencer stop";
+  EXPECT_LT(outcome.boundary_timings[0].drain_duration_ns,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count());
+
+  ASSERT_EQ(2, outcome.phase_gate_exceeded.size());
+  EXPECT_EQ(0, outcome.phase_gate_exceeded[0]);
+  EXPECT_EQ(0, outcome.phase_gate_exceeded[1]);
+
+  // Phase-0 ran its declared 3 s, not the timeout cap.
+  ASSERT_GE(outcome.events.size(), 4u);
+  const int64_t phase0_declared_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(3s).count();
+  const int64_t phase0_wall_ns =
+      outcome.events[2].wall_time_unix_ns - outcome.events[0].wall_time_unix_ns;
+  EXPECT_NEAR(phase0_wall_ns, phase0_declared_ns, phase0_declared_ns / 8)
+      << "phase0 did not last its declared duration (wall ns: " << phase0_wall_ns << ")";
+
+  // Global pacing per phase: declared rps is the phase total across the
+  // active workers (100, then 400). A predecessor sequencer that keeps
+  // running into the successor's window shows up here as overshoot.
+  const std::vector<std::array<int64_t, 3>> phase_windows{
+      {outcome.events[0].wall_time_unix_ns, outcome.events[2].wall_time_unix_ns, 100},
+      {outcome.events[2].wall_time_unix_ns, std::numeric_limits<int64_t>::max(), 400}};
+  const std::vector<RequestSpan> spans = listener().requestSpans();
+  std::string histogram;
+  for (const std::array<int64_t, 3>& window : phase_windows) {
+    const int64_t window_start_ns = window[0];
+    const int64_t window_end_ns = window[1];
+    const int64_t rps = window[2];
+    histogram.clear();
+    std::vector<int64_t> buckets;
+    for (const RequestSpan& span : spans) {
+      if (span.start_ns < window_start_ns || span.start_ns >= window_end_ns) {
+        continue;
+      }
+      const int64_t sec = (span.start_ns - window_start_ns) / 1000000000;
+      if (static_cast<size_t>(sec) >= buckets.size()) {
+        buckets.resize(sec + 1, 0);
+      }
+      buckets[sec]++;
+    }
+    if (!buckets.empty()) {
+      buckets.pop_back();
+    }
+    EXPECT_GE(buckets.size(), 2u)
+        << "phase produced fewer than 2 full seconds of load; declared rps " << rps;
+    for (size_t sec = 0; sec < buckets.size(); ++sec) {
+      absl::StrAppend(&histogram,
+                      fmt::format("  second {} (declared {}): {}\n", sec, rps, buckets[sec]));
+    }
+    for (size_t sec = 0; sec < buckets.size(); ++sec) {
+      EXPECT_NEAR(buckets[sec], rps, rps / 2) << "bucket burst/overshoot; histogram:\n"
+                                              << histogram;
+    }
+  }
+}
+
 // The worker dispatcher survives the boundary: live snapshots (produced by a
 // worker timer task on its dispatcher) keep flowing after the boundary, and
 // carry the real phase ids of the phase they were taken in.
@@ -681,9 +853,12 @@ TEST_F(PhaseRunTest, SubsetPhasesRunCorrectWorkers) {
   }
   EXPECT_EQ(4, worker_groups);
 
-  // Per-phase request traffic (per-worker rps 50, 2s per phase): phase 1
-  // runs twice the workers of phases 0 and 2, so it serves roughly twice the
-  // completions.
+  // Per-phase request traffic: the declared rps (50) is the phase's GLOBAL
+  // rate (divided across the phase's active workers), so every phase serves
+  // ~rps x duration completions regardless of its worker count (M2
+  // burstfix: without the division each worker paced the full declared rps
+  // and phase traffic scaled with the worker count). The subset itself is
+  // proven by the per-worker counters below.
   const int64_t p0_from = outcome.events[0].wall_time_unix_ns;
   const int64_t p0_to = outcome.events[1].wall_time_unix_ns;
   const int64_t p1_from = outcome.events[2].wall_time_unix_ns;
@@ -694,13 +869,19 @@ TEST_F(PhaseRunTest, SubsetPhasesRunCorrectWorkers) {
   const int p0_completions = completionsInWindow(spans, p0_from, p0_to);
   const int p1_completions = completionsInWindow(spans, p1_from, p1_to);
   const int p2_completions = completionsInWindow(spans, p2_from, p2_to);
+  // 50 rps x 2 s = ~100 per phase, on every subset size.
   EXPECT_GT(p0_completions, 50);
   EXPECT_GT(p1_completions, 50);
   EXPECT_GT(p2_completions, 50);
-  EXPECT_GT(p1_completions * 2, p0_completions * 3)
-      << "phase 1 did not serve ~2x the traffic of phase 0 (subset not applied)";
-  EXPECT_LT(p2_completions * 3, p1_completions * 2)
-      << "phase 2 did not shrink back to the [2]-worker subset";
+  EXPECT_LT(p0_completions, 160);
+  EXPECT_LT(p1_completions, 160);
+  EXPECT_LT(p2_completions, 160);
+  EXPECT_LT(p1_completions * 3, p0_completions * 5)
+      << "phase 1 traffic scaled with its worker count (declared rps is the "
+         "phase's global rate, not a per-worker rate)";
+  EXPECT_LT(p2_completions * 3, p1_completions * 5)
+      << "phase 2 traffic scaled with its worker count (declared rps is the "
+         "phase's global rate, not a per-worker rate)";
 
   // The workers beyond phase 2's subset sat it out: worker_0 ran all three
   // phases, worker_2 only the first two, on identical per-phase load.
@@ -723,13 +904,15 @@ TEST_F(PhaseRunTest, RemovedWorkerFoldsIntoLastPhase) {
   ASSERT_TRUE(outcome.success);
   ASSERT_EQ(4u, outcome.events.size());
 
-  // Phase 0 ran two workers at rps 50 for 2s (~200 completions); phase 1 ran
-  // the single remaining worker (~100). The removed worker's slab lands in
-  // phase 0's group only.
+  // Both phases declare rps 50 for 2s -- the phase's GLOBAL rate (M2
+  // burstfix: divided across the phase's active workers) -- so each phase's
+  // slab holds ~100 completions: phase 0 from its two workers, phase 1 from
+  // the single remaining worker. The removed worker's slab lands in phase
+  // 0's group only.
   const uint64_t p0 = sequencerCallbackCount(outcome.output, "phase_0_phase0");
   const uint64_t p1 = sequencerCallbackCount(outcome.output, "phase_1_phase1");
-  EXPECT_GT(p0, 150u) << "phase 0 group missing the removed worker's slab";
-  EXPECT_LT(p0, 300u);
+  EXPECT_GT(p0, 50u) << "phase 0 group missing the removed worker's slab";
+  EXPECT_LT(p0, 160u);
   EXPECT_GT(p1, 40u) << "phase 1 group missing entirely";
   EXPECT_LT(p1, 160u) << "phase 1 group holds more than the single active worker's slab";
 

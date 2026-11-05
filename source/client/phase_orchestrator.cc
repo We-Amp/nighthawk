@@ -99,10 +99,11 @@ BoundaryState PhaseOrchestrator::markSequencerStopped(uint32_t /*phase_index*/) 
 
 bool PhaseOrchestrator::collectDrainAcks(std::vector<std::future<PhaseDrainAck>>& acks,
                                          std::chrono::milliseconds budget,
-                                         uint32_t phase_index) {
+                                         uint32_t phase_index,
+                                         std::chrono::milliseconds stop_grace) {
   ASSERT(phase_index < phases_.size(), "phase index out of range");
   state_ = BoundaryState::kDraining;
-  const auto deadline = std::chrono::steady_clock::now() + budget;
+  const auto deadline = std::chrono::steady_clock::now() + budget + stop_grace;
   bool all_acked = true;
   int64_t earliest_stop_ns = std::numeric_limits<int64_t>::max();
   int64_t latest_drain_complete_ns = std::numeric_limits<int64_t>::min();
