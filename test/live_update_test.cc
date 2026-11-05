@@ -1663,12 +1663,11 @@ TEST_F(LiveCapabilityFanOutTest, BendDeltaRemainderGoesToLowestWorkerIndexes) {
     ASSERT_TRUE(workers_[i]->applies[1].delta.ramp->target_rps.has_value());
     EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->target_rps, expected_targets[i]);
     // The ramp time passes through undivided (identical on every worker --
-    // the shape is global; only the target rps divides). NOTE: the absolute
-    // value is NormalizeDelta's nanoseconds-of-proto-seconds conversion, a
-    // pre-existing quirk parked out of this task's scope.
+    // the shape is global; only the target rps divides), and its ABSOLUTE
+    // value survives the wire-path conversion: the proto's 5 seconds arrive
+    // as 5 seconds, not as nanoseconds-of-seconds.
     ASSERT_TRUE(workers_[i]->applies[1].delta.ramp->ramp_time.has_value());
-    EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->ramp_time,
-              *workers_[0]->applies[1].delta.ramp->ramp_time);
+    EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->ramp_time, std::chrono::seconds(5));
   }
 }
 

@@ -146,9 +146,17 @@ void LiveUpdateOrchestrator::HandleUpdate(const nighthawk::client::UpdateRequest
     } else {
       update_in_flight_ = true;
       const uint64_t candidate_epoch = applied_epoch_count_ + 1;
-      ack_threads_.push_back(std::thread(&LiveUpdateOrchestrator::AckThreadMain, this, request,
-                                         candidate_epoch, absl::StrCat("epoch-", candidate_epoch),
-                                         bend_instant, absl::Now() + ack_wait_bound_));
+      try {
+        ack_threads_.push_back(std::thread(&LiveUpdateOrchestrator::AckThreadMain, this, request,
+                                           candidate_epoch, absl::StrCat("epoch-", candidate_epoch),
+                                           bend_instant, absl::Now() + ack_wait_bound_));
+      } catch (...) {
+        // A failed spawn (e.g. thread resource exhaustion) must not leave
+        // the one-in-flight guard set forever: every future live update
+        // would be rejected. Release and rethrow.
+        update_in_flight_ = false;
+        throw;
+      }
     }
   }
   if (reject_in_flight) {

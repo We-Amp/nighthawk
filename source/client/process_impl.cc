@@ -1004,7 +1004,10 @@ LiveKnobDelta LiveCapabilityFanOutApplier::NormalizeDelta(
     } else if (knob.has_ramp()) {
       RampShapeChange change;
       if (knob.ramp().has_ramp_time()) {
-        change.ramp_time = std::chrono::nanoseconds(knob.ramp().ramp_time().seconds()) +
+        // The proto duration's seconds ARE seconds (the same conversion the
+        // plugin config path uses): casting them as nanoseconds turned every
+        // wire-sent ramp bend into a ~instantaneous ramp.
+        change.ramp_time = std::chrono::seconds(knob.ramp().ramp_time().seconds()) +
                            std::chrono::nanoseconds(knob.ramp().ramp_time().nanos());
       }
       if (knob.ramp().has_target_rps()) {
