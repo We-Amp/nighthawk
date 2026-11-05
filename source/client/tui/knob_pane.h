@@ -125,6 +125,14 @@ private:
 // total disclosure. Pure.
 ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height);
 
+// Whether an rps turn on this run is a ramp bend (C1): the engine treats a
+// live rps delta as ramp re-parameterization ONLY on a run configured with
+// the linear-ramping rate limiter plugin — the exact name the engine's
+// whitelist validator and fan-out admit on ("nighthawk.linear-ramping-
+// rate-limiter-plugin"). Any other named limiter plugin does NOT bend
+// (the session record must not claim a bend that never happened). Pure.
+bool RpsTurnBendsRamp(const nighthawk::client::CommandLineOptions& options);
+
 // ---------------------------------------------------------------------------
 // M2: the staged next-phase preview (spec §4 knob state machine). While a
 // run is active, edits to phase-gated knobs stage into a preview of the NEXT

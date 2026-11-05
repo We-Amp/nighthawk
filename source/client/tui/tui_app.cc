@@ -1620,11 +1620,13 @@ void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) 
       anchor_.wall_time_unix_ns = snapshot.wall_time_unix_ns();
       anchor_.monotonic_ns = snapshot.monotonic_ns();
     }
-    // M3 epoch-change marks (spec 8.5): one mark per epoch id change — the
-    // LiveSnapshot.epoch_changed marker's own split discipline (an applied
-    // advance OR a rollback demotion). These are the WINDOW-SPLIT inputs;
-    // the timeline marks come only from the acks (onUpdateResult).
-    if (!snapshot.epoch_id().empty() && snapshot.epoch_id() != last_seen_epoch_id_) {
+    // M3 epoch-change marks (spec 8.5): the explicit LiveSnapshot
+    // epoch_changed marker (field 7) is the split discipline — one mark per
+    // marker-bearing snapshot (an applied advance OR a rollback demotion),
+    // deduped by epoch id for belt-and-braces. These are the WINDOW-SPLIT
+    // inputs; the timeline marks come only from the acks (onUpdateResult).
+    if (snapshot.epoch_changed() && !snapshot.epoch_id().empty() &&
+        snapshot.epoch_id() != last_seen_epoch_id_) {
       last_seen_epoch_id_ = snapshot.epoch_id();
       epoch_marks_.push_back(EpochMark{snapshot.epoch_id(), snapshot.wall_time_unix_ns(),
                                        snapshot.monotonic_ns()});
@@ -1715,13 +1717,11 @@ absl::Status RunController::TurnRps(uint32_t new_rps) {
           "a knob turn is already pending: wait for its ack or rejection");
     }
     // Send-time context for the session record: the attempted phase-total
-    // rps, the phase it was sent from, and whether the run's ramp plugin
-    // makes the rps delta a ramp bend (C1: on the plugin path an rps delta
-    // IS ramp re-parameterization).
+    // rps, the phase it was sent from, and whether the rps delta is a ramp
+    // bend (C1 — the ENGINE's exact plugin rule, not any named plugin).
     pending_new_rps_ = new_rps;
     pending_phase_id_ = model_.last_snapshot.phase_id();
-    pending_ramp_bent_ = knob_options_.has_rate_limiter_plugin_config() &&
-                         !knob_options_.rate_limiter_plugin_config().name().empty();
+    pending_ramp_bent_ = RpsTurnBendsRamp(knob_options_);
     rps_tracker_.BeginRpsTurn(new_rps);
   }
   const absl::Status sent = feed_.SendUpdate(request);

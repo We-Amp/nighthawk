@@ -426,6 +426,32 @@ TEST(EpochStampsFlowTest, AckFlowsToKnobEpochRecord) {
 }
 
 // ---------------------------------------------------------------------------
+// The ramp_bent pin (C1, the ENGINE's exact rule): only the linear-ramping
+// rate limiter's runs bend — a different named limiter plugin must NOT
+// claim a bend in the session record.
+// ---------------------------------------------------------------------------
+
+TEST(RampBentRuleTest, OnlyTheLinearRampingPluginBends) {
+  nighthawk::client::CommandLineOptions options;
+  EXPECT_FALSE(RpsTurnBendsRamp(options)) << "no plugin configured: no bend";
+
+  options.mutable_rate_limiter_plugin_config()->set_name(
+      "nighthawk.linear-ramping-rate-limiter-plugin");
+  EXPECT_TRUE(RpsTurnBendsRamp(options));
+
+  // A DIFFERENT named limiter plugin: the engine would not treat the rps
+  // delta as a bend — the record must not either.
+  nighthawk::client::CommandLineOptions other;
+  other.mutable_rate_limiter_plugin_config()->set_name("nighthawk.some-other-limiter-plugin");
+  EXPECT_FALSE(RpsTurnBendsRamp(other));
+
+  // A present-but-empty name is unconfigured (the pane's own reading).
+  nighthawk::client::CommandLineOptions empty_name;
+  empty_name.mutable_rate_limiter_plugin_config()->set_name("");
+  EXPECT_FALSE(RpsTurnBendsRamp(empty_name));
+}
+
+// ---------------------------------------------------------------------------
 // The M3 pane header: the display-only banner is GONE; the phase-total
 // semantics render on the pane.
 // ---------------------------------------------------------------------------

@@ -202,6 +202,16 @@ void KnobTurnTracker::DismissOutcome() {
   }
 }
 
+bool RpsTurnBendsRamp(const nighthawk::client::CommandLineOptions& options) {
+  // The engine's C1 rule verbatim (live_update_validator / process_impl):
+  // only the linear-ramping rate limiter's runs bend, and on them an rps
+  // delta IS the ramp re-parameterization.
+  static constexpr absl::string_view kRampingPluginName =
+      "nighthawk.linear-ramping-rate-limiter-plugin";
+  return options.has_rate_limiter_plugin_config() &&
+         options.rate_limiter_plugin_config().name() == kRampingPluginName;
+}
+
 ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height) {
   if (width <= 0 || height <= 0) {
     return ftxui::emptyElement();
