@@ -1334,7 +1334,7 @@ TEST_P(ServiceTest, FanOutAppliesSingleEpochAtAgreedInstant) {
 // path, see the helper comment). The body below is the shape the fix will be
 // pinned against: anchor on the first phase-1-tagged snapshot, wait out one
 // full drain budget, update once, expect exactly one applied ack (epoch-1).
-TEST_P(ServiceTest, DISABLED_FanOutTargetsActiveWorkersInOrder) {
+TEST_P(ServiceTest, FanOutTargetsActiveWorkersInOrder) {
   TestHttpListener listener;
   request_ = makePhasedLiveRequest(listener.uri(), 1);
   auto r = stub_->ExecutionStream(&context_);
