@@ -140,10 +140,17 @@ public:
    * censored (recorded, never hidden) and the orchestrator moves on, so the
    * wait can always time out and the run always completes.
    *
+   * @param budget bounds the drain itself (measured from the deadline below).
+   * @param stop_grace additional wait covering the predecessor's sequencer
+   * still running when the collection begins: a drain ack resolves only
+   * after the sequencer stopped (at the phase's declared duration), so the
+   * deadline is now + budget + stop_grace. A censored boundary still
+   * records `budget` as its drain duration (never zero-silent).
    * @return true iff every future was ready before the deadline.
    */
   bool collectDrainAcks(std::vector<std::future<PhaseDrainAck>>& acks,
-                        std::chrono::milliseconds budget, uint32_t phase_index);
+                        std::chrono::milliseconds budget, uint32_t phase_index,
+                        std::chrono::milliseconds stop_grace = std::chrono::milliseconds::zero());
 
   // Marks the next phase's first scheduled work: records the idle gap against
   // the previous boundary's last drain completion and emits the phase-start
