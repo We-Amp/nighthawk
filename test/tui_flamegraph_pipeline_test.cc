@@ -145,6 +145,7 @@ public:
     assert(::listen(listen_fd_, 16) == 0);
     socklen_t len = sizeof(addr);
     assert(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+    static_cast<void>(len);
     port_ = ntohs(addr.sin_port);
     thread_ = std::thread([this]() { AcceptLoop(); });
   }
@@ -230,6 +231,7 @@ public:
     assert(::listen(listen_fd_, 16) == 0);
     socklen_t len = sizeof(addr);
     assert(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+    static_cast<void>(len);
     port_ = ntohs(addr.sin_port);
     thread_ = std::thread([this]() {
       while (true) {
