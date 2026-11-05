@@ -181,10 +181,16 @@ private:
   // (fresh termination predicate and rate limiter per phase) and starts it;
   // the sequencer's stop hook chains into the boundary drain watch, which
   // completes the drain promise once the benchmark client's in-flight count
-  // reaches zero. The dispatcher never blocks on the orchestrator.
+  // reaches zero. The boundary's drain promise arrives as the begin-phase's
+  // own capture (handed through the beginPhaseAsync post, never parked in a
+  // member -- a censored boundary leaves no happens-before to a straggler
+  // whose sequencer stops later, so a member read there races the
+  // orchestrator's next write and can latch the successor's promise). The
+  // dispatcher never blocks on the orchestrator.
   void beginPhase(uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec,
-                  bool final_phase);
-  void startDrainWatch(int64_t stop_monotonic_ns);
+                  bool final_phase, std::shared_ptr<std::promise<PhaseDrainAck>> drain_promise);
+  void startDrainWatch(int64_t stop_monotonic_ns,
+                       std::shared_ptr<std::promise<PhaseDrainAck>> drain_promise);
   // FORK-ONLY (We-Amp): M2 Task 6 worker subsets. Runs on this worker's own
   // dispatcher (posted via goIdleAsync): cancels the boundary drain watch of
   // the last phase, emits the fold's final live partial, stops the live
@@ -245,10 +251,6 @@ private:
   std::function<void()> sequencer_stop_observer_;
   std::promise<void> ready_promise_;
   std::shared_future<void> ready_future_;
-  // Created on the orchestrator thread in beginPhaseAsync (before the post,
-  // so the worker's later read is synchronized through the post queue) and
-  // handed to the BoundaryDrainWatch by value on the worker dispatcher.
-  std::shared_ptr<std::promise<PhaseDrainAck>> drain_promise_;
   std::unique_ptr<BoundaryDrainWatch> drain_watch_;
   // Keeps the blocking dispatcher run alive while no phase work is scheduled
   // yet (a libevent loop with no registered events returns immediately).

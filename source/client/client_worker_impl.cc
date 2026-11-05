@@ -267,10 +267,19 @@ const Phase& ClientWorkerImpl::phase() const {
 
 std::future<PhaseDrainAck> ClientWorkerImpl::beginPhaseAsync(
     uint32_t phase_index, const nighthawk::client::PhaseSpec& phase_spec, bool final_phase) {
-  drain_promise_ = std::make_shared<std::promise<PhaseDrainAck>>();
-  std::future<PhaseDrainAck> future = drain_promise_->get_future();
-  dispatcher_->post([this, phase_index, phase_spec, final_phase]() {
-    beginPhase(phase_index, phase_spec, final_phase);
+  // The boundary's promise is created here (on the orchestrator thread) and
+  // handed to the posted begin-phase BY VALUE, never parked in a member: on
+  // a censored boundary collectDrainAcks returns on a pure wait_for timeout,
+  // with no synchronization to a straggler whose sequencer stops only later.
+  // A member would leave that straggler's late stop hook reading whatever
+  // the successor phase just wrote there (a genuine data race, and the
+  // straggler's hung drain resolving the successor's ack). Carried through
+  // the post, the promise is owned end-to-end by this boundary's chain, and
+  // a stale stop hook can only ever complete its own boundary's ack.
+  auto drain_promise = std::make_shared<std::promise<PhaseDrainAck>>();
+  std::future<PhaseDrainAck> future = drain_promise->get_future();
+  dispatcher_->post([this, phase_index, phase_spec, final_phase, drain_promise]() {
+    beginPhase(phase_index, phase_spec, final_phase, drain_promise);
   });
   return future;
 }
@@ -305,7 +314,8 @@ void ClientWorkerImpl::goIdle(bool exit_dispatcher) {
 
 void ClientWorkerImpl::beginPhase(uint32_t phase_index,
                                   const nighthawk::client::PhaseSpec& phase_spec,
-                                  bool final_phase) {
+                                  bool final_phase,
+                                  std::shared_ptr<std::promise<PhaseDrainAck>> drain_promise) {
   // Phase-start ruling (M2 Task 6): phase begins are SAME-INSTANT across the
   // active subset, including workers joining at this phase. The legacy run
   // staggers the per-worker sequencer start anchors at BOOTSTRAP
@@ -405,7 +415,8 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
   const size_t duration_slot = phase_execution_durations_.size();
   phase_execution_durations_.push_back(0);
   sequencer_impl->setExitDispatcherOnStop(final_phase);
-  sequencer_impl->setStopHook([this, final_phase, duration_slot](bool /*timed_out*/) {
+  sequencer_impl->setStopHook([this, final_phase, duration_slot,
+                               drain_promise](bool /*timed_out*/) {
     // On this dispatcher, inside the sequencer's stop.
     dispatcher_->updateApproximateMonotonicTime();
     phase_execution_durations_[duration_slot] =
@@ -423,7 +434,7 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
     if (sequencer_stop_observer_ != nullptr) {
       sequencer_stop_observer_();
     }
-    startDrainWatch(time_source_->monotonicTime().time_since_epoch().count());
+    startDrainWatch(time_source_->monotonicTime().time_since_epoch().count(), drain_promise);
   });
   ENVOY_LOG(debug, "worker {}: begin phase {} ('{}'), final: {}", worker_number_, phase_index,
             phase_spec.name(), final_phase);
@@ -437,15 +448,17 @@ void ClientWorkerImpl::beginPhase(uint32_t phase_index,
 
 }
 
-void ClientWorkerImpl::startDrainWatch(const int64_t stop_monotonic_ns) {
+void ClientWorkerImpl::startDrainWatch(
+    const int64_t stop_monotonic_ns,
+    std::shared_ptr<std::promise<PhaseDrainAck>> drain_promise) {
   // The drain observable is the benchmark client's own in-flight tracking
-  // (the same accounting the client-side gates consult). The promise is
-  // copied into the watch here, ON the worker dispatcher, so the watch owns
-  // this boundary's ack no matter when it fires (reading the member from a
-  // re-armed timer would race with the orchestrator thread swapping it for
-  // the next boundary's promise).
+  // (the same accounting the client-side gates consult). The promise arrives
+  // as the begin-phase's own capture, so the watch owns THIS boundary's ack
+  // no matter when its stop hook fires: a straggler whose sequencer stops
+  // after the successor phase began can only ever complete its own
+  // boundary's future, never the successor's (there is no member to read).
   drain_watch_ = std::make_unique<BoundaryDrainWatch>(
-      *dispatcher_, [this]() { return benchmark_client_->inFlightRequests(); }, drain_promise_,
+      *dispatcher_, [this]() { return benchmark_client_->inFlightRequests(); }, drain_promise,
       stop_monotonic_ns);
   drain_watch_->start();
 }
