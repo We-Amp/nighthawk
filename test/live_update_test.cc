@@ -1006,6 +1006,25 @@ public:
     return n;
   }
 
+  // The plugin-path twin of makeSequencer: a ramping inner limiter captured
+  // BEFORE the ScheduledStartingRateLimiter wrap, exactly the way the factory
+  // wires it.
+  std::unique_ptr<SequencerImpl> makeRampSequencer(uint32_t rps, std::chrono::nanoseconds ramp) {
+    auto inner = std::make_unique<LinearRampingRateLimiterImpl>(timeSource(), ramp, Frequency(rps));
+    LiveTunableRateLimiter* handle = inner.get();
+    RateLimiterPtr decorated =
+        std::make_unique<ScheduledStartingRateLimiter>(std::move(inner), timeSource().monotonicTime());
+    return std::make_unique<SequencerImpl>(
+        platform_util_, *dispatcher_, timeSource(), std::move(decorated),
+        SequencerTarget([](const CompletionCallback& f) -> bool {
+          f(true, true);
+          return true;
+        }),
+        std::make_unique<StreamingStatistic>(), std::make_unique<StreamingStatistic>(),
+        nighthawk::client::SequencerIdleStrategy::POLL,
+        std::make_unique<NiceMock<MockTerminationPredicate>>(), stats_scope_, handle);
+  }
+
   // Drives real time forward in `tick` steps, greedily acquiring through the
   // sequencer's limiter; returns the acquisitions granted within the window.
   static uint64_t drive(SequencerImpl& sequencer, std::chrono::milliseconds window,
@@ -1039,6 +1058,62 @@ public:
   Envoy::Api::ApiPtr api_;
   Envoy::Event::DispatcherPtr dispatcher_;
 };
+
+// Review Focus 2, completed (C1): the SAME sequencer apply surface serves
+// both paths -- a plain rps delta on a non-plugin run (the linear degenerate
+// re-solve) and an rps delta on a ramp-plugin run (the ramp re-anchor), each
+// followed by the observed cadence of its new rate.
+TEST_F(SequencerLiveUpdateTest, RpsUpdateServesPluginAndNonPluginPaths) {
+  auto linear_seq = makeSequencer(10, /*with_handle=*/true);
+  auto ramp_seq = makeRampSequencer(100, 200ms);
+
+  // Half a second on both: linear 10 Hz (~5), ramp 100 Hz ramping 200ms to
+  // full (f*T/2 = 10 ramp counts + 30 at the target = 40).
+  uint64_t linear_total = drive(*linear_seq, 500ms, 1ms);
+  uint64_t ramp_total = drive(*ramp_seq, 500ms, 1ms);
+  ASSERT_GE(linear_total, 4u);
+  ASSERT_GE(ramp_total, 35u);
+
+  // The same update surface, both knobs at 5 Hz.
+  absl::Status linear_status = absl::InternalError("callback not run");
+  absl::Status ramp_status = absl::InternalError("callback not run");
+  std::atomic<bool> linear_done{false};
+  std::atomic<bool> ramp_done{false};
+  linear_seq->applyLiveUpdate(timeSource().monotonicTime(),
+                              LiveKnobDelta{std::uint32_t{5}, std::nullopt},
+                              [&](absl::Status s) {
+                                linear_status = s;
+                                linear_done = true;
+                              });
+  ramp_seq->applyLiveUpdate(timeSource().monotonicTime(),
+                            LiveKnobDelta{std::uint32_t{5}, std::nullopt},
+                            [&](absl::Status s) {
+                              ramp_status = s;
+                              ramp_done = true;
+                            });
+  pumpUntil([&linear_done, &ramp_done]() {
+    return linear_done.load() && ramp_done.load();
+  });
+  ASSERT_TRUE(linear_done.load());
+  ASSERT_TRUE(ramp_done.load());
+  EXPECT_TRUE(linear_status.ok()) << linear_status.message();
+  EXPECT_TRUE(ramp_status.ok()) << ramp_status.message();
+
+  // Half a second at 5 Hz through both surfaces, driven INTERLEAVED so each
+  // limiter's accrual window is the same 500ms (a sequential drive would let
+  // the second limiter accrue through the first's window): ~3 grants each,
+  // each far below its own pre-bend rate.
+  uint64_t linear_post = 0;
+  uint64_t ramp_post = 0;
+  const auto post_deadline = std::chrono::steady_clock::now() + 500ms;
+  while (std::chrono::steady_clock::now() < post_deadline) {
+    linear_post += acquireAll(const_cast<RateLimiter&>(linear_seq->rate_limiter()));
+    ramp_post += acquireAll(const_cast<RateLimiter&>(ramp_seq->rate_limiter()));
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_NEAR(linear_post, 3, 1);
+  EXPECT_NEAR(ramp_post, 3, 1);
+}
 
 TEST_F(SequencerLiveUpdateTest, ApplyLiveUpdatePostsToOwnDispatcherAndApplies) {
   auto sequencer = makeSequencer(10, /*with_handle=*/true);
