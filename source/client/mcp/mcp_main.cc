@@ -1,6 +1,8 @@
 // FORK-ONLY (We-Amp): see mcp_main.h.
 #include "source/client/mcp/mcp_main.h"
 
+#include <unistd.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <istream>
@@ -8,11 +10,11 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "grpc++/grpc++.h"
 #include "tclap/CmdLine.h"
 
 #include "source/client/mcp/mcp_server.h"
@@ -22,24 +24,99 @@ namespace Nighthawk {
 namespace Client {
 namespace {
 
-// SIGTERM graceful stop. Nothing is in flight yet in this milestone step
-// (the steering tools own run-cancel + session-seal, Task 2), so the
-// graceful stop is exit 0 on the signal boundary; write(2) keeps the
-// handler async-signal-safe.
+// --- SIGTERM graceful stop --------------------------------------------------
+//
+// A signal handler may only write(2). The handler drops one byte on a
+// self-pipe; the watcher thread (blocked in read(2) on it) performs the
+// actual stop — cancel any in-flight run, seal the open session, exit 0.
+// 's' = stop the process; 'w' = the main loop ended normally, just wake and
+// join. Both shutdown paths (SIGTERM, stdin EOF) run the same
+// GracefulStop.
+int g_sigterm_pipe_w = -1;
+
 void HandleSigterm(int) {
-  const char message[] = "nighthawk_mcp: SIGTERM received, shutting down\n";
+  const char message[] = "nighthawk_mcp: SIGTERM received; cancelling any run and sealing the "
+                         "session\n";
   ssize_t unused = write(2, message, sizeof(message) - 1);
   (void)unused;
-  _exit(0);
+  if (g_sigterm_pipe_w >= 0) {
+    const char stop = 's';
+    ssize_t unused_pipe = write(g_sigterm_pipe_w, &stop, 1);
+    (void)unused_pipe;
+  }
 }
 
 } // namespace
 
+WaiterPool::WaiterPool(int thread_count) {
+  threads_.reserve(thread_count);
+  for (int i = 0; i < thread_count; i++) {
+    threads_.emplace_back([this]() { WorkerLoop(); });
+  }
+}
+
+WaiterPool::~WaiterPool() { Drain(); }
+
+void WaiterPool::Drain() {
+  std::vector<std::thread> to_join;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (drained_) {
+      return;
+    }
+    drained_ = true;
+    stopping_ = true;
+    to_join = std::move(threads_);
+    threads_.clear();
+  }
+  cv_.notify_all();
+  for (std::thread& thread : to_join) {
+    thread.join();
+  }
+}
+
+void WaiterPool::Enqueue(std::function<void()> task) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tasks_.push_back(std::move(task));
+  }
+  cv_.notify_one();
+}
+
+void WaiterPool::WorkerLoop() {
+  while (true) {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this]() { return stopping_ || !tasks_.empty(); });
+      if (tasks_.empty()) {
+        return; // stopping_ and drained
+      }
+      task = std::move(tasks_.front());
+      tasks_.pop_front();
+    }
+    task();
+  }
+}
+
 int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& out,
                  std::ostream& err) {
+  const auto channel = grpc::CreateChannel(flags.service_address, grpc::InsecureChannelCredentials());
+  SteeringToolOptions steering;
+  steering.max_rps = flags.max_rps;
+  steering.timeout_s = flags.timeout_s;
+  steering.allow_target_cidrs = flags.allow_target_cidrs;
+  steering.session_prefix = "nighthawk-session";
+  SteeringController controller(channel, steering);
+
   ToolRegistry tools;
   ResourceRegistry resources;
   RegisterEchoTool(tools);
+  RegisterSteeringTools(tools, controller);
+
+  // The waiter pool: the bounded tool waits (steer 4s, cancel_run 35s) run
+  // here, OFF the dispatch loop, so ping answers during a wait.
+  WaiterPool pool(2);
 
   McpServer server(
       tools, resources,
@@ -53,17 +130,77 @@ int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& ou
       [&](absl::string_view line) {
         err << line << "\n";
         err.flush();
-      });
+      },
+      // Deferred tool handlers off the dispatch loop.
+      [&pool](std::function<void()> task) { pool.Enqueue(std::move(task)); });
 
-  err << absl::StrCat("nighthawk_mcp: starting (transport=stdio, address=", flags.address.empty() ? "(none)" : flags.address,
-                      ", allow_target_cidrs=[", absl::StrJoin(flags.allow_target_cidrs, ","), "]",
-                      ", max_rps=", flags.max_rps, ", timeout_s=", flags.timeout_s, ")\n");
+  err << absl::StrCat("nighthawk_mcp: starting (transport=stdio, address=",
+                      flags.address.empty() ? "(none)" : flags.address,
+                      ", service_address=", flags.service_address,
+                      ", allow_target_cidrs=[", absl::StrJoin(flags.allow_target_cidrs, ","),
+                      "]", ", max_rps=", flags.max_rps, ", timeout_s=", flags.timeout_s, ")\n");
+
+  // The graceful-stop self-pipe and its watcher thread (see mcp_main.h).
+  int pipe_fds[2];
+  if (::pipe(pipe_fds) != 0) {
+    err << "nighthawk_mcp: pipe() failed; SIGTERM will not be graceful\n";
+    pipe_fds[0] = pipe_fds[1] = -1;
+  } else {
+    g_sigterm_pipe_w = pipe_fds[1];
+    std::signal(SIGTERM, HandleSigterm);
+    // A SIGTERM landing after the watcher exited must not kill the process
+    // via SIGPIPE on the closed pipe; the EPIPE write failure is the signal.
+    std::signal(SIGPIPE, SIG_IGN);
+  }
+
+  auto graceful_stop = [&controller, &err]() {
+    controller.GracefulStop();
+    err << "nighthawk_mcp: graceful stop complete (run cancelled, session sealed)\n";
+  };
+
+  std::thread watcher;
+  if (pipe_fds[0] >= 0) {
+    watcher = std::thread([pipe_r = pipe_fds[0], graceful_stop]() {
+      char command = 0;
+      while (::read(pipe_r, &command, 1) == 1) {
+        if (command == 's') {
+          graceful_stop();
+          // The session is sealed and the run cancelled; exit 0 per the
+          // graceful-stop contract (the stdio loop dies with the process).
+          ::_exit(0);
+        }
+        if (command == 'w') {
+          return; // the main loop ended normally; nothing to stop
+        }
+      }
+    });
+  }
 
   std::string line;
   while (std::getline(in, line)) {
     server.HandleLine(line);
   }
-  err << "nighthawk_mcp: stdin closed, shutting down\n";
+
+  err << "nighthawk_mcp: stdin closed; cancelling any run and sealing the session\n";
+  graceful_stop();
+  if (pipe_fds[1] >= 0) {
+    // Wake the watcher (join path) before closing the pipe.
+    const char wake = 'w';
+    ssize_t unused = write(pipe_fds[1], &wake, 1);
+    (void)unused;
+  }
+  if (watcher.joinable()) {
+    watcher.join();
+  }
+  if (g_sigterm_pipe_w >= 0) {
+    g_sigterm_pipe_w = -1;
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+  }
+  // The deferred handlers join HERE, while the server and the steering
+  // controller are still alive — their completion must never land in a
+  // torn-down server.
+  pool.Drain();
   return 0;
 }
 
@@ -77,6 +214,10 @@ int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out
                                          "Reserved: listen address for a future non-stdio "
                                          "transport. The current transport is stdio.",
                                          false, "", "string", cmd);
+    TCLAP::ValueArg<std::string> service_address("", "service-address",
+                                                 "The Nighthawk service gRPC endpoint the "
+                                                 "steering tools drive, e.g. 127.0.0.1:8443.",
+                                                 false, "127.0.0.1:8443", "string", cmd);
     TCLAP::MultiArg<std::string> allow_target_cidr(
         "", "allow-target-cidr",
         "Repeatable CIDR allowlist widening the default loopback-only target "
@@ -87,18 +228,26 @@ int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out
                                   "start_run/steer; exceeding it is a tool error naming the cap.",
                                   false, 100000, "rps", cmd);
     TCLAP::ValueArg<long> timeout("", "timeout",
-                                  "Bound (seconds) for cancel_run and final-output waits; "
-                                  "expiry surfaces as a timed-out tool error.",
+                                  "Bound (seconds) for cancel_run's final-output wait (+5s "
+                                  "grace); expiry surfaces as a timed-out tool error.",
                                   false, 30, "seconds", cmd);
     cmd.parse(argc, argv);
 
     McpServerFlags flags;
     flags.address = address.getValue();
+    flags.service_address = service_address.getValue();
     flags.allow_target_cidrs = allow_target_cidr.getValue();
     flags.max_rps = max_rps.getValue();
     flags.timeout_s = timeout.getValue();
 
-    std::signal(SIGTERM, HandleSigterm);
+    // Malformed --allow-target-cidr values are a startup failure, before
+    // any protocol line is spoken.
+    const absl::Status cidrs = ValidateCidrs(flags.allow_target_cidrs);
+    if (!cidrs.ok()) {
+      err << absl::StrCat("nighthawk_mcp: ", cidrs.message(), "\n");
+      return 1;
+    }
+
     return RunMcpServer(flags, in, out, err);
   } catch (TCLAP::ArgException& e) {
     err << absl::StrCat("nighthawk_mcp: flag error: ", e.error(), " '", e.argId(), "'\n");

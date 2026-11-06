@@ -24,6 +24,8 @@ void StartRunDialogModel::set_rps(uint32_t rps) { rps_ = rps; }
 
 void StartRunDialogModel::set_duration_seconds(uint32_t seconds) { duration_seconds_ = seconds; }
 
+void StartRunDialogModel::set_connections(uint32_t connections) { connections_ = connections; }
+
 void StartRunDialogModel::set_phases(std::vector<nighthawk::client::PhaseSpec> phases) {
   phases_ = std::move(phases);
 }
@@ -124,6 +126,11 @@ nighthawk::client::StartRequest StartRunDialogModel::build_request() const {
     // duration (Task 2's rules, enforced here by construction — the
     // duration field is never written alongside a vector).
     *options->mutable_phases() = {phases.begin(), phases.end()};
+  }
+  // The steering surface's connection count lands directly on the options
+  // (the dialog has no field for it); 0 stays unset — the engine default.
+  if (connections_ > 0) {
+    options->mutable_connections()->set_value(connections_);
   }
   // Presence of live_streaming is the opt-in marker; stats_flush_interval
   // defaults to 1s (the proto bounds it to [1s, 300s]).

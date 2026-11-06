@@ -8,6 +8,60 @@ licenses(["notice"])  # Apache 2
 
 envoy_package()
 
+# FORK-ONLY (We-Amp): the FTXUI-free TUI sub-libraries (MCP plan Task 2's
+# quarantine need: the nighthawk_mcp graph must carry RunFeed, the
+# StartRunDialogModel, the session conversions and the knob rules WITHOUT
+# FTXUI, which tui_lib links). Each is plain proto/grpc/absl only; tui_lib
+# consumes them unchanged and the standing cquery guard (README.md) proves
+# the mcp graph clean.
+envoy_cc_library(
+    name = "run_feed_lib",
+    srcs = ["run_feed.cc"],
+    hdrs = ["run_feed.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:grpc_service_lib",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "session_conversion_lib",
+    srcs = ["session_conversion.cc"],
+    hdrs = ["session_conversion.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "knob_rules_lib",
+    srcs = ["knob_rules.cc"],
+    hdrs = ["knob_rules.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "start_run_dialog_lib",
+    srcs = ["start_run_dialog.cc"],
+    hdrs = ["start_run_dialog.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        # The pure phase-vector validation the dialog reuses (proto+absl deps
+        # only — quarantine-clean; the cquery guard proves it).
+        "//source/client:options_validation_phases_lib",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 # FORK-ONLY (We-Amp): TUI library skeleton. Quarantined dependency surface:
 # only FTXUI, TCLAP, the generated nighthawk client protos, and their
 # transitive proto/grpc deps — no @envoy//source C++ targets. The standing
@@ -26,9 +80,6 @@ envoy_cc_library(
         "profile_session_conversion.cc",
         "profile_symbolizer.cc",
         "profile_windows.cc",
-        "run_feed.cc",
-        "session_conversion.cc",
-        "start_run_dialog.cc",
         "status_bar.cc",
         "sut_stats.cc",
         "tui_app.cc",
@@ -46,9 +97,6 @@ envoy_cc_library(
         "profile_session_conversion.h",
         "profile_symbolizer.h",
         "profile_windows.h",
-        "run_feed.h",
-        "session_conversion.h",
-        "start_run_dialog.h",
         "status_bar.h",
         "sut_stats.h",
         "tui_app.h",
@@ -66,6 +114,12 @@ envoy_cc_library(
         # The pure phase-vector validation the dialog reuses (proto+absl deps
         # only — quarantine-clean; the cquery guard proves it).
         "//source/client:options_validation_phases_lib",
+        # The FTXUI-free sub-libraries above (moved out of this target so the
+        # nighthawk_mcp graph can consume them without FTXUI).
+        ":knob_rules_lib",
+        ":run_feed_lib",
+        ":session_conversion_lib",
+        ":start_run_dialog_lib",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",

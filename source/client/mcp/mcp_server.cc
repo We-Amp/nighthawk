@@ -3,8 +3,10 @@
 
 #include <cmath>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -76,8 +78,10 @@ bool TypeMatches(const std::string& expected, const Value& value) {
 
 } // namespace
 
-McpServer::McpServer(ToolRegistry& tools, ResourceRegistry& resources, LineSink sink, LogSink log)
-    : tools_(tools), resources_(resources), sink_(std::move(sink)), log_(std::move(log)) {}
+McpServer::McpServer(ToolRegistry& tools, ResourceRegistry& resources, LineSink sink, LogSink log,
+                     TaskDispatcher dispatch)
+    : tools_(tools), resources_(resources), sink_(std::move(sink)), log_(std::move(log)),
+      dispatch_(std::move(dispatch)) {}
 
 std::optional<std::string> McpServer::HandleLine(absl::string_view line) {
   // Trim the transport framing; an empty line is noise, not a fault.
@@ -94,7 +98,7 @@ std::optional<std::string> McpServer::HandleLine(absl::string_view line) {
     log_(absl::StrCat("malformed line dropped (not parseable JSON): ", trimmed));
     // The request id is unknowable: null.
     RespondError(Value(), kCodeParseError, "Parse error");
-    return last_response_;
+    return LastResponse();
   }
 
   const Struct& request = request_value.struct_value();
@@ -117,45 +121,50 @@ std::optional<std::string> McpServer::HandleLine(absl::string_view line) {
 
   if (!initialized_ && method != "initialize") {
     RespondError(id, kCodeServerNotInitialized, "Server not initialized");
-    return last_response_;
+    return LastResponse();
   }
 
   if (method == "initialize") {
     initialized_ = true;
     Respond(id, HandleInitialize());
-    return last_response_;
+    return LastResponse();
   }
   if (method == "ping") {
     Respond(id, Struct());
-    return last_response_;
+    return LastResponse();
   }
   if (method == "tools/list") {
     Respond(id, HandleToolsList());
-    return last_response_;
+    return LastResponse();
   }
   if (method == "tools/call") {
     const auto& params = Field(request, "params");
     if (!IsObject(params)) {
       RespondError(id, kCodeInvalidParams, "Invalid params: 'params' must be an object");
-      return last_response_;
+      return LastResponse();
     }
-    auto call = HandleToolsCall(params.struct_value());
+    bool deferred = false;
+    auto call = HandleToolsCall(params.struct_value(), id, &deferred);
     if (!call.ok()) {
       RespondError(id, kCodeInvalidParams, call.status().message());
-    } else {
+    } else if (!deferred) {
       Respond(id, *call);
+    } else {
+      // A deferred handler is in flight on the dispatcher; its envelope
+      // lands through the sink when it completes. No response line now.
+      return std::nullopt;
     }
-    return last_response_;
+    return LastResponse();
   }
   if (method == "resources/list") {
     Respond(id, HandleResourcesList());
-    return last_response_;
+    return LastResponse();
   }
   if (method == "resources/read") {
     const Value& params = Field(request, "params");
     if (!IsObject(params)) {
       RespondError(id, kCodeInvalidParams, "Invalid params: 'params' must be an object");
-      return last_response_;
+      return LastResponse();
     }
     auto read = HandleResourcesRead(params.struct_value());
     if (!read.ok()) {
@@ -163,11 +172,11 @@ std::optional<std::string> McpServer::HandleLine(absl::string_view line) {
     } else {
       Respond(id, *read);
     }
-    return last_response_;
+    return LastResponse();
   }
 
   RespondError(id, kCodeMethodNotFound, absl::StrCat("Method not found: ", method));
-  return last_response_;
+  return LastResponse();
 }
 
 void McpServer::Respond(const Value& id, const Struct& result) {
@@ -175,8 +184,10 @@ void McpServer::Respond(const Value& id, const Struct& result) {
   (*response.mutable_fields())["jsonrpc"].set_string_value("2.0");
   (*response.mutable_fields())["id"] = id;
   (*response.mutable_fields())["result"] = ToValue(result);
-  last_response_ = EmitCanonicalStruct(response);
-  sink_(last_response_);
+  const std::string line = EmitCanonicalStruct(response);
+  std::lock_guard<std::mutex> lock(response_mutex_);
+  last_response_ = line;
+  sink_(line);
 }
 
 void McpServer::RespondError(const Value& id, int code, absl::string_view message) {
@@ -187,8 +198,15 @@ void McpServer::RespondError(const Value& id, int code, absl::string_view messag
   (*response.mutable_fields())["jsonrpc"].set_string_value("2.0");
   (*response.mutable_fields())["id"] = id;
   (*response.mutable_fields())["error"] = ToValue(error);
-  last_response_ = EmitCanonicalStruct(response);
-  sink_(last_response_);
+  const std::string line = EmitCanonicalStruct(response);
+  std::lock_guard<std::mutex> lock(response_mutex_);
+  last_response_ = line;
+  sink_(line);
+}
+
+std::string McpServer::LastResponse() const {
+  std::lock_guard<std::mutex> lock(response_mutex_);
+  return last_response_;
 }
 
 Struct McpServer::HandleInitialize() {
@@ -220,7 +238,8 @@ Struct McpServer::HandleToolsList() {
   return result;
 }
 
-absl::StatusOr<Struct> McpServer::HandleToolsCall(const Struct& params) {
+absl::StatusOr<Struct> McpServer::HandleToolsCall(const Struct& params, const Value& id,
+                                                  bool* deferred) {
   const Value& name_value = Field(params, "name");
   if (name_value.kind_case() != Value::kStringValue) {
     return absl::InvalidArgumentError("Invalid params: 'name' (string) is required");
@@ -240,9 +259,27 @@ absl::StatusOr<Struct> McpServer::HandleToolsCall(const Struct& params) {
     arguments = arguments_value.struct_value();
   }
 
+  // The dispatcher-side validation runs inline ALWAYS (a deferred tool's
+  // malformed arguments are a -32602 now, not an error envelope later).
   absl::Status valid = ValidateArguments(tool->input_schema, arguments);
   if (!valid.ok()) {
     return valid;
+  }
+
+  if (tool->deferred && dispatch_ != nullptr) {
+    // The bounded wait runs OFF the dispatch loop; the id and arguments are
+    // captured by value (the request may be a temporary).
+    *deferred = true;
+    ToolHandler handler = tool->handler;
+    dispatch_([this, id, handler, arguments]() {
+      auto handler_result = handler(arguments);
+      if (!handler_result.ok()) {
+        Respond(id, CallToolError(handler_result.status().message()));
+      } else {
+        Respond(id, CallToolResult(*handler_result));
+      }
+    });
+    return Struct();
   }
 
   auto handler_result = tool->handler(arguments);

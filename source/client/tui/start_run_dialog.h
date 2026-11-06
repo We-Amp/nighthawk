@@ -24,6 +24,15 @@ public:
   void set_rps(uint32_t rps);
   void set_duration_seconds(uint32_t seconds);
 
+  // MCP-plan Task 2: the connection-count field, set DIRECTLY on the built
+  // CommandLineOptions (the interactive dialog has no field for it; the
+  // steering surface does). 0 (the default) leaves the options' connections
+  // unset — the engine's default applies. The proto pins the valid range
+  // (gte 1, lte 1000000); no dialog-side validation is added here (pure
+  // passthrough, tested).
+  void set_connections(uint32_t connections);
+  uint32_t connections() const { return connections_; }
+
   // M2: the phase-vector entry. A non-empty vector turns the request into a
   // phase run: build_request() writes the vector and clears the
   // mutually-exclusive top-level duration (Task 2's rules, enforced here by
@@ -81,6 +90,7 @@ private:
   std::string uri_;
   uint32_t rps_ = 0;
   uint32_t duration_seconds_ = 0;
+  uint32_t connections_ = 0;
   std::vector<nighthawk::client::PhaseSpec> phases_;
   std::string phases_field_;
 };

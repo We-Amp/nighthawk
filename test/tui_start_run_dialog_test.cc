@@ -62,6 +62,21 @@ TEST(StartRunDialogTest, DialogRejectsInvalid) {
   EXPECT_FALSE(StartRunDialogModel{}.valid());
 }
 
+// MCP-plan Task 2: the steering surface's connections field round-trips
+// directly onto the built options (the dialog itself has no field for it);
+// unset (0) stays unset — the engine default applies.
+TEST(StartRunDialogTest, ConnectionsFieldRoundTrips) {
+  StartRunDialogModel dialog = validDialog();
+  EXPECT_FALSE(dialog.build_request().options().has_connections());
+
+  dialog.set_connections(64);
+  EXPECT_EQ(dialog.connections(), 64);
+  ASSERT_TRUE(dialog.valid());
+  const nighthawk::client::StartRequest request = dialog.build_request();
+  ASSERT_TRUE(request.options().has_connections());
+  EXPECT_EQ(request.options().connections().value(), 64);
+}
+
 // Routed from the Task 5 review: a whitespace-only uri must not pass — set_uri
 // trims, so blank input lands on the invalid empty-uri path, and a
 // fat-fingered submit with surrounding whitespace still works.
