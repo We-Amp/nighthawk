@@ -1033,6 +1033,15 @@ TEST_F(SequencerCapabilityTest, BurstAndJitterDecoratorsUnaffected) {
 // real event loop), so this fixture runs on REAL time: simulated time does
 // not drive a real dispatcher's HRTimers, and the bend-window assertions
 // carry scheduler-jitter slack.
+// A test seam for the protected stop surface: the stop/restart pins below
+// stop a genuinely started sequencer (stop asserts running_) without waiting
+// on a termination predicate.
+class StopExposedSequencerImpl : public SequencerImpl {
+public:
+  using SequencerImpl::SequencerImpl;
+  void stopEarly() { stop(/*failed=*/false, /*exit_dispatcher=*/false); }
+};
+
 class SequencerLiveUpdateTest : public testing::Test {
 public:
   SequencerLiveUpdateTest()
@@ -1048,9 +1057,16 @@ public:
   // factory's own comment); the tests call the fork-only live-update surface
   // on it directly.
   std::unique_ptr<SequencerImpl> makeSequencer(uint32_t rps, bool with_handle) {
+    return makeSequencerOfType<SequencerImpl>(rps, with_handle);
+  }
+
+  // The subclass twin of makeSequencer, for tests that need the protected
+  // stop surface (StopExposedSequencerImpl): identical wiring.
+  template <class SequencerT>
+  std::unique_ptr<SequencerT> makeSequencerOfType(uint32_t rps, bool with_handle) {
     auto linear = std::make_unique<LinearRateLimiter>(timeSource(), Frequency(rps));
     LiveTunableRateLimiter* handle = with_handle ? linear.get() : nullptr;
-    return std::make_unique<SequencerImpl>(
+    return std::make_unique<SequencerT>(
         platform_util_, *dispatcher_, timeSource(), std::move(linear),
         SequencerTarget([](const CompletionCallback& f) -> bool {
           f(true, true);
@@ -1411,6 +1427,51 @@ TEST_F(SequencerLiveUpdateTest, CancelledStagedBendNeverApplies) {
   ASSERT_TRUE(applied.load());
   EXPECT_EQ(apply_status.code(), absl::StatusCode::kCancelled);
   EXPECT_THAT(apply_status.message(), HasSubstr("cancelled"));
+}
+
+// The stop/restart race, sequencer-side: a bend staged just before the
+// sequencer stops (a failing termination predicate, a cancellation, a phase
+// boundary -- anything that ends the sequencer before t_bend) must never
+// apply into the stopped sequencer. stop() drains the pending bend the way
+// cancelPendingLiveUpdate() does: the timer is disarmed, the pending state
+// cleared, and the apply callback resolved CancelledError -- so the fan-out
+// can never commit an apply that never happened (and never stamp the knob
+// epoch after the phase's operating point is retired), and the armed bend
+// timer can never fire into a stopped sequencer.
+TEST_F(SequencerLiveUpdateTest, StopDrainsPendingStagedBend) {
+  auto sequencer = makeSequencerOfType<StopExposedSequencerImpl>(10, /*with_handle=*/true);
+  // An operating point to conserve: half a second at 10 Hz.
+  const uint64_t pre = drive(*sequencer, 500ms, 10ms);
+  ASSERT_NEAR(pre, 5, 1);
+
+  sequencer->start();
+
+  std::atomic<bool> staged{false};
+  absl::Status apply_status = absl::InternalError("apply callback not run");
+  std::atomic<bool> applied{false};
+  LiveKnobDelta delta;
+  delta.new_rps = 20;
+  const Envoy::MonotonicTime t_bend = timeSource().monotonicTime() + 250ms;
+  sequencer->applyLiveUpdate(
+      t_bend, delta, [&](absl::Status s) { ASSERT_TRUE(s.ok()); staged = true; },
+      [&](absl::Status s) { apply_status = s; applied = true; });
+  pump(20);
+  ASSERT_TRUE(staged.load()) << "the staging confirm must fire at arming time";
+  ASSERT_FALSE(applied.load()) << "the apply must not fire before the bend instant";
+
+  // The phase ends (here: an early stop) while the bend is still pending.
+  sequencer->stopEarly();
+
+  // The stop drained the pending bend: the apply callback resolves cancelled
+  // -- it never ran against the limiter.
+  pumpUntil([&applied]() { return applied.load(); });
+  ASSERT_TRUE(applied.load());
+  EXPECT_EQ(apply_status.code(), absl::StatusCode::kCancelled) << apply_status.message();
+
+  // And the limiter keeps its pre-bend operating point: a second at the
+  // declared 10 Hz, never a step to the bend's 20 Hz.
+  const uint64_t post = drive(*sequencer, 1000ms, 10ms);
+  EXPECT_NEAR(post, 10, 3) << "the stopped sequencer applied a staged bend";
 }
 
 // --- The process-side fan-out (LiveCapabilityFanOutApplier) against an

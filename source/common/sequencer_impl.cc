@@ -66,6 +66,27 @@ void SequencerImpl::stop(bool failed, bool exit_dispatcher) {
   spin_timer_->disableTimer();
   periodic_timer_.reset();
   spin_timer_.reset();
+  // FORK-ONLY (We-Amp): drain a pending staged live-update bend exactly the
+  // way cancelPendingLiveUpdate() does. A bend staged just before the
+  // sequencer stops (an early termination predicate, a cancellation, a phase
+  // boundary) would otherwise keep its armed timer and fire into the stopped
+  // sequencer: applying into a limiter whose operating point is already
+  // retired, and resolving the fan-out's apply callback with success for an
+  // apply that lands after the phase ended. stop() runs on the dispatcher
+  // thread, so the drain is done inline rather than via dispatcher_.post.
+  if (bend_timer_pending_) {
+    bend_timer_pending_ = false;
+    if (live_update_timer_ != nullptr) {
+      live_update_timer_->disableTimer();
+    }
+    auto callback = std::move(pending_bend_callback_);
+    pending_bend_callback_ = nullptr;
+    pending_bend_delta_ = LiveKnobDelta{};
+    if (callback != nullptr) {
+      callback(absl::CancelledError("the staged live-update bend was cancelled by "
+                                    "sequencer stop; nothing was applied"));
+    }
+  }
   if (exit_dispatcher) {
     dispatcher_.exit();
   }
