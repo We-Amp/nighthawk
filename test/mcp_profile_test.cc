@@ -86,7 +86,12 @@ std::string ErrorText(const Struct& result) {
 
 class FakeNighthawkService final : public nighthawk::client::NighthawkService::Service {
 public:
-  FakeNighthawkService() = default;
+  // counter_ns_per_unit_ scales the completed-work counter's slope: the
+  // default mirrors the real engine's roughly-per-millisecond growth; a
+  // large value models a TRIVIALLY loaded SUT whose counter barely moves
+  // (the near-zero-sample differential case).
+  explicit FakeNighthawkService(uint64_t counter_ns_per_unit = 1'000'000)
+      : counter_ns_per_unit_(counter_ns_per_unit) {}
 
   ~FakeNighthawkService() override {
     StopTicker();
@@ -203,7 +208,7 @@ private:
       seen_epoch_ = run_epoch_;
     }
     (*snapshot->mutable_counters())["benchmark.http_2xx"] =
-        static_cast<uint64_t>((wall - kMonoOffsetNs) / 1000000);
+        static_cast<uint64_t>((wall - kMonoOffsetNs) / counter_ns_per_unit_);
     return response;
   }
 
@@ -263,6 +268,8 @@ private:
   int seen_epoch_ = 0;
   // The fake engine's fixed wall->monotonic offset (the anchor pair).
   static constexpr int64_t kMonoOffsetNs = 1'000'000'000;
+  // The completed-work counter's granularity in ns per unit (see the ctor).
+  uint64_t counter_ns_per_unit_;
 };
 
 // --- the stub admin (POST-only /cpuprofiler mutators) -----------------------
@@ -426,9 +433,10 @@ struct Harness {
 };
 
 std::unique_ptr<Harness> MakeHarness(bool configure_profiling = false,
-                                     bool fail_enable = false) {
+                                     bool fail_enable = false,
+                                     uint64_t counter_ns_per_unit = 1'000'000) {
   auto harness = std::make_unique<Harness>();
-  harness->service = std::make_unique<FakeNighthawkService>();
+  harness->service = std::make_unique<FakeNighthawkService>(counter_ns_per_unit);
   grpc::ServerBuilder builder;
   builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
                            &harness->grpc_port);
@@ -734,6 +742,10 @@ TEST(McpProfileTest, DiffAcrossEpochLabeled) {
     EXPECT_FALSE(Text(Field(StructOf(entry), "function")).empty());
   }
   EXPECT_GT(best_ratio, 0.0) << "the heavier current side must show a positive delta";
+  // The filled case carries NO guidance note: the differential is readable,
+  // and the note is reserved for the (near-)zero-sample windows.
+  EXPECT_FALSE(structured.fields().contains("note"))
+      << "a well-loaded differential must not carry the guidance note";
 }
 
 // DiffSameStateRefusedNoiseFloor: two same-epoch windows are REFUSED with
@@ -765,6 +777,54 @@ TEST(McpProfileTest, DiffSameStateRefusedNoiseFloor) {
   const std::string reason = ErrorText(diff);
   EXPECT_NE(reason.find("NOISE FLOOR"), std::string::npos) << reason;
   EXPECT_NE(reason.find("same knob epoch"), std::string::npos) << reason;
+}
+
+// DiffNearZeroSamplesCarriesGuidanceNote: at trivial SUT load the
+// differential is honest but opaque — tiny denominators, zeros everywhere,
+// often an empty diffs array. The result stays truthful (no invented
+// signal) and gains a guidance note naming the sample count and the fix
+// (fill the SUT); a well-loaded pair (DiffAcrossEpochLabeled) carries none.
+TEST(McpProfileTest, DiffNearZeroSamplesCarriesGuidanceNote) {
+  // The completed-work counter grows 2 units per second, so a 1s window
+  // carries ~2 samples — per-unit-of-work arithmetic on a near-zero
+  // denominator.
+  auto harness = MakeHarness(/*configure_profiling=*/true, /*fail_enable=*/false,
+                             /*counter_ns_per_unit=*/500'000'000);
+  StartRunAndWaitForSnapshot(*harness);
+
+  StageCannedProfile(*harness, /*sample_multiplier=*/1);
+  Struct first = CallToolOrDie(*harness, "pull_profile_window",
+                               R"json({"duration_s": 1})json", absl::Seconds(30));
+  ASSERT_FALSE(IsIsError(first)) << ErrorText(first);
+  const int64_t base_id = static_cast<int64_t>(Field(Structured(first), "window_id").number_value());
+  WaitForWindow(*harness, base_id, absl::Seconds(30),
+                [](const std::string& status) { return status == "ready"; });
+
+  Struct steer = CallToolOrDie(*harness, "steer", R"json({"rps": 20})json");
+  ASSERT_FALSE(IsIsError(steer)) << ErrorText(steer);
+  EXPECT_EQ(Text(Field(Structured(steer), "epoch_id")), "epoch-1");
+
+  StageCannedProfile(*harness, /*sample_multiplier=*/3);
+  Struct second = CallToolOrDie(*harness, "pull_profile_window",
+                                R"json({"duration_s": 1})json", absl::Seconds(30));
+  ASSERT_FALSE(IsIsError(second)) << ErrorText(second);
+  const int64_t cur_id =
+      static_cast<int64_t>(Field(Structured(second), "window_id").number_value());
+  WaitForWindow(*harness, cur_id, absl::Seconds(30),
+                [](const std::string& status) { return status == "ready"; });
+
+  Struct diff = CallToolOrDie(*harness, "diff_windows",
+                              absl::StrCat(R"json({"a": )json", base_id,
+                                           R"json(, "b": )json", cur_id, R"json(})json"));
+  ASSERT_FALSE(IsIsError(diff)) << ErrorText(diff);
+  const Struct& structured = Structured(diff);
+  ASSERT_TRUE(structured.fields().contains("note"))
+      << "the near-zero-sample pair must carry the guidance note";
+  const std::string note = Text(Field(structured, "note"));
+  EXPECT_NE(note.find("samples"), std::string::npos) << note;
+  EXPECT_NE(note.find("fill the SUT"), std::string::npos) << note;
+  // The named count is the honest near-zero one (both windows together).
+  EXPECT_NE(note.find("~"), std::string::npos) << note;
 }
 
 } // namespace

@@ -1339,7 +1339,17 @@ constexpr char kDiffDescription[] =
     "effect: <a> -> <b>'; a same-state pair is REFUSED with isError:true — "
     "its differential is the noise floor, not an effect. A worker-count "
     "change computes with comparable:false and the reason; impure or "
-    "mixed-type (cpu vs alloc) pairs are refused with the reason verbatim.";
+    "mixed-type (cpu vs alloc) pairs are refused with the reason verbatim. "
+    "A pair whose windows together carry fewer than 10 completed requests "
+    "gains a 'note' naming the sample count — the differential is correct "
+    "but near-meaningless; fill the SUT (higher rate or cheaper responses) "
+    "before reading it.";
+
+// The near-zero-sample floor for diff_windows' guidance note: below this
+// many completed requests across BOTH windows the per-unit-of-work
+// differential is arithmetic on (near-)zero denominators — correct, but a
+// differential no agent should read as signal.
+constexpr uint64_t kNearZeroSamplesNoteFloor = 10;
 
 // The common id validation: server-assigned ints only (positive; the
 // tracker's monotonic ids start at 1).
@@ -1693,6 +1703,18 @@ ProfileController::DiffWindows(const google::protobuf::Struct& arguments) {
   }
   SetDouble(out, "base_total_per_work", diff->base_total_per_work);
   SetDouble(out, "cur_total_per_work", diff->cur_total_per_work);
+  // The empty-diff experience (the dogfooding follow-up): at trivial SUT
+  // load the per-unit-of-work differential is CORRECT but opaque — tiny
+  // denominators, zeros everywhere, often an empty diffs array. The honest
+  // guidance: name the sample count and point at the fix. Never invented
+  // signal — no value in the payload changes with it.
+  const uint64_t window_samples = base->work_units + current->work_units;
+  if (window_samples < kNearZeroSamplesNoteFloor) {
+    SetString(out, "note",
+              absl::StrCat("windows carry ~", window_samples,
+                           " samples; fill the SUT (higher rate or cheaper "
+                           "responses) before reading the differential"));
+  }
   Value& diffs = (*out.mutable_fields())["diffs"];
   diffs.mutable_list_value();
   for (const Tui::DifferentialNodeDiff& node : diff->diffs) {
