@@ -179,9 +179,11 @@ absl::StatusOr<std::string> CheckTarget(absl::string_view uri,
                                         HostResolver resolver);
 
 // The shared load-ceiling check behind start_run (the declared total AND
-// each phase's rps) and steer: `declared` above `max_rps` refuses with the
-// cap-naming error. `subject` names the refused figure ("declared total
-// rps", or "phase 'warm' total rps").
+// each phase's rps) and steer: a non-positive `declared` refuses with the
+// field-naming positive-integer error (BEFORE every caller's uint32 cast —
+// a negative would wrap past any ceiling), and `declared` above `max_rps`
+// refuses with the cap-naming error. `subject` names the refused figure
+// ("declared total rps", or "phase 'warm' total rps").
 absl::Status CheckRpsCeiling(long long declared, long long max_rps,
                              absl::string_view subject = "declared total rps");
 
@@ -353,6 +355,13 @@ private:
   uint32_t pending_rps_ = 0;
   std::string pending_phase_id_;
   bool pending_ramp_bent_ = false;
+  // True while the most recent outstanding steer arm TIMED OUT mid-run and
+  // no newer arm has been sent: its fate is genuinely unknown (the proto's
+  // late-rejection drop window may still resolve it). Resolved — back to
+  // false — by the verdict (OnUpdateResult), the run's terminal
+  // (OnFinished), or the next send; get_status surfaces it as
+  // pending.state "unresolved".
+  bool pending_unknown_ = false;
   // The accepted run's request (its stats flush interval bounds steer's
   // wait) and its rewritten target.
   nighthawk::client::StartRequest start_request_;

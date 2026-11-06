@@ -45,6 +45,7 @@
 
 #include "source/client/mcp/json_util.h"
 #include "source/client/mcp/mcp_main.h"
+#include "source/client/mcp/mcp_resources.h"
 #include "source/client/mcp/mcp_server.h"
 #include "source/client/mcp/mcp_tools.h"
 
@@ -83,8 +84,14 @@ std::string ErrorText(const Struct& result) {
 // same shape the real ServiceImpl's ack threads produce.
 class FakeNighthawkService final : public nighthawk::client::NighthawkService::Service {
 public:
-  FakeNighthawkService(absl::Duration ack_delay, bool stall_after_cancel)
-      : ack_delay_(ack_delay), stall_after_cancel_(stall_after_cancel) {}
+  // `end_after_snapshots` > 0 makes the service end the run ON ITS OWN after
+  // that many streamed snapshots (final output, then the stream closes) —
+  // the duration-expired natural end the MCP server must seal on.
+  FakeNighthawkService(absl::Duration ack_delay, bool stall_after_cancel,
+                       int end_after_snapshots = 0)
+      : ack_delay_(ack_delay),
+        stall_after_cancel_(stall_after_cancel),
+        end_after_snapshots_(end_after_snapshots) {}
 
   ~FakeNighthawkService() override {
     StopTicker();
@@ -98,10 +105,10 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       context_ = context;
-      stream_ = stream;
       run_epoch_ = 0;
       update_in_flight_ = false;
       done_ = false;
+      snapshot_count_ = 0;
     }
     nighthawk::client::ExecutionRequest request;
     while (stream->Read(&request)) {
@@ -110,8 +117,8 @@ public:
           std::lock_guard<std::mutex> lock(mutex_);
           start_requests_.push_back(request.start_request());
         }
-        WriteLocked(SnapshotResponse());
-        StartTicker();
+        WriteLocked(stream, SnapshotResponse());
+        StartTicker(stream);
       } else if (request.has_update_request()) {
         bool reject = false;
         int candidate = 0;
@@ -131,9 +138,12 @@ public:
           result->set_applied(false);
           result->set_rejection_reason(
               "another live update is still in flight; bends are not queued");
-          WriteLocked(response);
+          WriteLocked(stream, response);
         } else {
-          std::thread ack([this, candidate]() { AckAfterDelay(candidate); });
+          // The ack thread captures ITS stream: a second run's handler must
+          // never see a first run's late ack (a shared stream_ member would
+          // hand the late write a freed stream once this handler returned).
+          std::thread ack([this, stream, candidate]() { AckAfterDelay(stream, candidate); });
           std::lock_guard<std::mutex> lock(mutex_);
           ack_threads_.push_back(std::move(ack));
         }
@@ -154,7 +164,7 @@ public:
           std::lock_guard<std::mutex> lock(mutex_);
           done_ = true;
         }
-        WriteLocked(OutputResponse());
+        WriteLocked(stream, OutputResponse());
         JoinAcks();
         return grpc::Status::OK;
       }
@@ -180,6 +190,7 @@ private:
     snapshot->set_wall_time_unix_ns(absl::ToUnixNanos(absl::Now()));
     snapshot->set_monotonic_ns(++monotonic_ns_);
     snapshot->set_phase_id("main");
+    ++snapshot_count_;
     if (run_epoch_ > 0) {
       snapshot->set_epoch_id(absl::StrCat("epoch-", run_epoch_));
     }
@@ -194,14 +205,19 @@ private:
     return response;
   }
 
-  void WriteLocked(const nighthawk::client::ExecutionResponse& response) {
+  void WriteLocked(
+      grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse, nighthawk::client::ExecutionRequest>*
+          stream,
+      const nighthawk::client::ExecutionResponse& response) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stream_ != nullptr) {
-      stream_->Write(response);
+    if (stream != nullptr) {
+      stream->Write(response);
     }
   }
 
-  void StartTicker() {
+  void StartTicker(
+      grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse, nighthawk::client::ExecutionRequest>*
+          stream) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (ticking_) {
@@ -209,7 +225,7 @@ private:
       }
       ticking_ = true;
     }
-    ticker_ = std::thread([this]() {
+    ticker_ = std::thread([this, stream]() {
       while (true) {
         absl::SleepFor(absl::Milliseconds(100));
         // Build the snapshot under the lock, write OUTSIDE it (WriteLocked
@@ -222,7 +238,21 @@ private:
           }
           response = SnapshotResponse();
         }
-        WriteLocked(response);
+        WriteLocked(stream, response);
+        // The natural end: the service's own terminal output, then the RPC
+        // closes (the server-side cancel ends the handler's Read loop, and
+        // with it the stream — the duration-expired engine shape).
+        if (end_after_snapshots_ > 0 && snapshot_count_ >= end_after_snapshots_) {
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+          }
+          WriteLocked(stream, OutputResponse());
+          if (context_ != nullptr) {
+            context_->TryCancel();
+          }
+          return;
+        }
       }
     });
   }
@@ -240,7 +270,10 @@ private:
     }
   }
 
-  void AckAfterDelay(int candidate) {
+  void AckAfterDelay(
+      grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse, nighthawk::client::ExecutionRequest>*
+          stream,
+      int candidate) {
     // The applier analog: it honors its deadline, so a delay past the
     // steer bound is exactly the "hogging applier" case — the ack resolves
     // only after the tool could ever wait for it.
@@ -254,7 +287,7 @@ private:
       result->set_monotonic_ns(++monotonic_ns_);
       result->set_wall_time_unix_ns(absl::ToUnixNanos(absl::Now()));
     }
-    WriteLocked(response);
+    WriteLocked(stream, response);
     std::lock_guard<std::mutex> lock(mutex_);
     update_in_flight_ = false;
   }
@@ -273,10 +306,9 @@ private:
 
   std::mutex mutex_;
   grpc::ServerContext* context_ = nullptr;
-  grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
-                           nighthawk::client::ExecutionRequest>* stream_ = nullptr;
   const absl::Duration ack_delay_;
   const bool stall_after_cancel_;
+  const int end_after_snapshots_;
   std::vector<nighthawk::client::StartRequest> start_requests_;
   std::vector<std::thread> ack_threads_;
   std::thread ticker_;
@@ -285,6 +317,7 @@ private:
   bool update_in_flight_ = false;
   int run_epoch_ = 0;
   int64_t monotonic_ns_ = 0;
+  int snapshot_count_ = 0;
 };
 
 // One wired steering server: fake service + gRPC server + channel +
@@ -314,10 +347,12 @@ struct Harness {
 std::unique_ptr<Harness> MakeHarness(absl::Duration ack_delay = absl::ZeroDuration(),
                                      bool stall_after_cancel = false,
                                      SteeringToolOptions options = {},
-                                     HostResolver resolver = nullptr) {
+                                     HostResolver resolver = nullptr,
+                                     int end_after_snapshots = 0) {
   auto harness = std::make_unique<Harness>();
   harness->options = options;
-  harness->service = std::make_unique<FakeNighthawkService>(ack_delay, stall_after_cancel);
+  harness->service = std::make_unique<FakeNighthawkService>(ack_delay, stall_after_cancel,
+                                                            end_after_snapshots);
   grpc::ServerBuilder builder;
   builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
                            &harness->grpc_port);
@@ -329,6 +364,9 @@ std::unique_ptr<Harness> MakeHarness(absl::Duration ack_delay = absl::ZeroDurati
       std::make_unique<SteeringController>(harness->channel, harness->options, resolver);
   RegisterEchoTool(harness->tools);
   RegisterSteeringTools(harness->tools, *harness->controller);
+  // The telemetry resources (the session seal pins read nighthawk://session
+  // through the server like an agent does).
+  RegisterTelemetryResources(harness->resources, *harness->controller);
   harness->server = std::make_unique<McpServer>(
       harness->tools, harness->resources,
       [raw = harness.get()](absl::string_view line) {
@@ -431,6 +469,31 @@ void WaitForStartRequest(Harness& harness, absl::Duration budget = absl::Seconds
     absl::SleepFor(absl::Milliseconds(20));
   }
   ADD_FAILURE() << "the service never processed the start request within " << budget;
+}
+
+// One resources/read round trip: contents[0].text parsed back (the same
+// parse-then-compare discipline as mcp_loop_test's ReadPayload).
+absl::StatusOr<Struct> ReadPayload(Harness& harness, const std::string& uri) {
+  const int id = ++harness.next_id;
+  Struct request;
+  (*request.mutable_fields())["jsonrpc"].set_string_value("2.0");
+  (*request.mutable_fields())["id"].set_number_value(id);
+  (*request.mutable_fields())["method"].set_string_value("resources/read");
+  Struct params;
+  (*params.mutable_fields())["uri"].set_string_value(uri);
+  (*request.mutable_fields())["params"] = ToValue(params);
+  const std::string line =
+      harness.server->HandleLine(EmitCanonicalStruct(request)).value_or("");
+  auto parsed = ParseJsonObject(line);
+  if (!parsed.ok()) {
+    return absl::InternalError(absl::StrCat("unparseable response: ", line));
+  }
+  if (parsed->fields().contains("error")) {
+    return absl::InvalidArgumentError(Text(Field(StructOf(Field(*parsed, "error")), "message")));
+  }
+  const Struct& result = StructOf(Field(*parsed, "result"));
+  const Value& contents = Field(result, "contents");
+  return ParseJsonObject(Text(StructOf(contents.list_value().values(0)).fields().at("text")));
 }
 
 // MCP-plan Task 2 pin: every shipped tool's schema states
@@ -761,6 +824,132 @@ TEST(McpToolsTest, GetStatusCarriesPhaseAndEpoch) {
   });
   status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
   EXPECT_EQ(Text(Field(StructOf(Field(status, "current")), "epoch_id")), "epoch-1");
+}
+
+// --- M4 close-fix pins (panel round) ----------------------------------------
+
+// NaturalRunEndSealsSessionAndAllowsNextRun (panel major #1): a NATURAL run
+// end (the engine's own terminal output; no cancel_run, no graceful stop)
+// seals the session — the file carries its run_end(completed=true) record
+// with a flushed tail, and a second start_run succeeds instead of being
+// latched out by the still-open recorder ("a session is already open").
+TEST(McpToolsTest, NaturalRunEndSealsSessionAndAllowsNextRun) {
+  // The fake ends the run on its own after 8 snapshots (~0.8s of ticks).
+  auto harness = MakeHarness(absl::ZeroDuration(), /*stall_after_cancel=*/false,
+                             /*options=*/{}, /*resolver=*/nullptr,
+                             /*end_after_snapshots=*/8);
+  Struct started = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 60})json"));
+  ASSERT_FALSE(IsIsError(started)) << ErrorText(started);
+  const std::string session_path = Text(Field(Structured(started), "session"));
+
+  // The run ends on its own (no cancel_run was ever sent).
+  WaitForStatus(*harness, absl::Seconds(10), [](const Struct& status) {
+    return !Field(StructOf(Field(status, "run")), "in_flight").bool_value();
+  });
+  Struct status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
+  EXPECT_FALSE(Field(StructOf(Field(status, "run")), "in_flight").bool_value());
+  EXPECT_TRUE(Field(StructOf(Field(status, "run")), "completed").bool_value());
+
+  // The session file is SEALED: the tail is not torn (the writer flushed)
+  // and run_end(completed=true) is the last record.
+  auto session = ReadPayload(*harness, "nighthawk://session");
+  ASSERT_TRUE(session.ok()) << session.status();
+  EXPECT_FALSE(Field(*session, "tail_skipped").bool_value())
+      << "the natural end must flush and seal the file";
+  const Value& records = Field(*session, "records");
+  ASSERT_GE(records.list_value().values_size(), 1);
+  const Value& last = records.list_value().values(records.list_value().values_size() - 1);
+  EXPECT_EQ(Text(Field(StructOf(last), "type")), "run_end");
+  EXPECT_TRUE(Field(StructOf(last), "completed").bool_value());
+
+  // The latch is gone: a second start_run succeeds with a fresh session.
+  Struct second = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 60})json"));
+  ASSERT_FALSE(IsIsError(second)) << ErrorText(second);
+  EXPECT_TRUE(Field(Structured(second), "run_started").bool_value());
+  EXPECT_NE(Text(Field(Structured(second), "session")), session_path);
+}
+
+// TimedOutSteerPendingIsUnresolvedThenResolved (panel major #3a): after a
+// steer times out mid-run the pending state stays (the arm's fate is
+// genuinely unknown mid-run — the proto's late-rejection drop window may
+// still resolve it) but is TRUTHFUL: pending.state reads "unresolved"
+// instead of an indistinguishable "awaiting_ack", until the late verdict
+// resolves it back to "none".
+TEST(McpToolsTest, TimedOutSteerPendingIsUnresolvedThenResolved) {
+  auto harness = MakeHarness(absl::Seconds(6) /* the applier resolves past the bound */);
+  CallToolOrDie(*harness, "start_run",
+                absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                              R"json(/", "rps": 10, "duration_s": 60})json"));
+  WaitForStatus(*harness, absl::Seconds(5), [](const Struct& status) {
+    return !Text(Field(StructOf(Field(status, "current")), "phase_id")).empty();
+  });
+
+  Struct steer = CallToolOrDie(*harness, "steer", R"json({"rps": 20})json");
+  ASSERT_TRUE(IsIsError(steer));
+  EXPECT_TRUE(absl::StartsWith(ErrorText(steer), "timed out after 4s: ")) << ErrorText(steer);
+
+  // Mid-run, post-timeout: pending truthfully reads unresolved.
+  Struct status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
+  const Struct& pending = StructOf(Field(status, "pending"));
+  EXPECT_TRUE(Field(pending, "update").bool_value());
+  EXPECT_EQ(Text(Field(pending, "state")), "unresolved");
+
+  // The late ack lands at ~6s: the verdict resolves the arm, and the status
+  // says so.
+  WaitForStatus(*harness, absl::Seconds(10), [](const Struct& s) {
+    return Text(Field(StructOf(Field(s, "pending")), "state")) == "none";
+  });
+}
+
+// RunTerminalResolvesPendingAndNextRunStartsClean (panel major #3b): the
+// run's terminal response resolves every outstanding arm (the proto's
+// consumer rule) — after a steer whose verdict never arrives, the ended run
+// reports no pending work, and the next run starts clean (no stale pending
+// from the previous run).
+TEST(McpToolsTest, RunTerminalResolvesPendingAndNextRunStartsClean) {
+  // The applier resolves at 10s (never within the run); the run ends on its
+  // own at ~6s (60 ticks) — the arm's verdict is still outstanding at the
+  // terminal.
+  auto harness = MakeHarness(absl::Seconds(10), /*stall_after_cancel=*/false,
+                             /*options=*/{}, /*resolver=*/nullptr,
+                             /*end_after_snapshots=*/60);
+  CallToolOrDie(*harness, "start_run",
+                absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                              R"json(/", "rps": 10, "duration_s": 60})json"));
+  WaitForStatus(*harness, absl::Seconds(5), [](const Struct& status) {
+    return !Text(Field(StructOf(Field(status, "current")), "phase_id")).empty();
+  });
+
+  Struct steer = CallToolOrDie(*harness, "steer", R"json({"rps": 20})json");
+  ASSERT_TRUE(IsIsError(steer));
+  EXPECT_TRUE(absl::StartsWith(ErrorText(steer), "timed out after 4s: ")) << ErrorText(steer);
+  Struct status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
+  EXPECT_EQ(Text(Field(StructOf(Field(status, "pending")), "state")), "unresolved");
+
+  // The run ends; the terminal response resolves the outstanding arm.
+  WaitForStatus(*harness, absl::Seconds(15), [](const Struct& s) {
+    return !Field(StructOf(Field(s, "run")), "in_flight").bool_value();
+  });
+  status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
+  EXPECT_FALSE(Field(StructOf(Field(status, "pending")), "update").bool_value())
+      << "the terminal response must resolve the outstanding arm";
+  EXPECT_EQ(Text(Field(StructOf(Field(status, "pending")), "state")), "none");
+
+  // The next run starts clean: no phantom pending from the previous run.
+  Struct second = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 60})json"));
+  ASSERT_FALSE(IsIsError(second)) << ErrorText(second);
+  status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
+  EXPECT_FALSE(Field(StructOf(Field(status, "pending")), "update").bool_value());
+  EXPECT_EQ(Text(Field(StructOf(Field(status, "pending")), "state")), "none");
 }
 
 } // namespace

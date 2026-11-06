@@ -492,6 +492,87 @@ TEST(McpSecurityTest, CeilingAppliesToPhaseTotals) {
       << "the phased refusal happens before anything reaches the engine";
 }
 
+// --- M4 close-fix pin: the ceiling's positive-integer floor -----------------
+
+// CheckRpsCeilingPositiveIntegerFloor: the shared check refuses a
+// non-positive declared total naming the subject field, BEFORE the callers'
+// uint32 casts could wrap it (a >-only ceiling let rps=-1 pass and wrap to
+// 4294967295, past any --max-rps). The upper boundary stays: declared ==
+// cap passes.
+TEST(McpSecurityTest, CheckRpsCeilingPositiveIntegerFloor) {
+  auto refused_negative = CheckRpsCeiling(-1, 100);
+  ASSERT_FALSE(refused_negative.ok()) << "a negative declared total must refuse";
+  EXPECT_NE(refused_negative.message().find("declared total rps must be a positive integer"),
+            std::string::npos)
+      << refused_negative.message();
+  EXPECT_NE(refused_negative.message().find("(got -1)"), std::string::npos)
+      << refused_negative.message();
+  auto refused_zero = CheckRpsCeiling(0, 100);
+  ASSERT_FALSE(refused_zero.ok()) << "a zero declared total must refuse";
+  auto refused_phase = CheckRpsCeiling(-5, 100, "phase 'warm' total rps");
+  ASSERT_FALSE(refused_phase.ok());
+  EXPECT_NE(refused_phase.message().find("phase 'warm' total rps must be a positive integer"),
+            std::string::npos)
+      << refused_phase.message();
+  EXPECT_TRUE(CheckRpsCeiling(100, 100).ok()) << "a total AT the cap is not a violation";
+}
+
+// NegativeLoadValuesRefusedBeforeAnyCast: steer{"rps": -1} and steer's
+// negative ramp_time_s, plus start_run's negative rps / connections /
+// duration_s, are each refused naming the field, before any uint32 cast and
+// before anything reaches the engine (the pinned security floor: the load
+// ceiling is not bypassable by a negative integer).
+TEST(McpSecurityTest, NegativeLoadValuesRefusedBeforeAnyCast) {
+  SteeringToolOptions options;
+  options.max_rps = 100;
+  // steer{"rps": -1} mid-run: refused by the shared ceiling check's
+  // positive-integer floor; nothing reaches the engine.
+  {
+    auto harness = MakeHarness(options);
+    Struct started = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                      R"json(/", "rps": 10, "duration_s": 60})json"));
+    ASSERT_FALSE(IsIsError(started)) << ErrorText(started);
+    Struct steer = CallToolOrDie(*harness, "steer", R"json({"rps": -1})json");
+    ASSERT_TRUE(IsIsError(steer));
+    EXPECT_NE(ErrorText(steer).find("declared total rps must be a positive integer (got -1)"),
+              std::string::npos)
+        << ErrorText(steer);
+    EXPECT_EQ(harness->service->accepted_updates(), 0)
+        << "the refusal happened before SendUpdate";
+  }
+  // steer{"ramp_time_s": -1}: refused naming the field at the argument
+  // boundary (before the arm is built or sent — no run needed).
+  {
+    auto harness = MakeHarness(options);
+    Struct steer = CallToolOrDie(*harness, "steer", R"json({"ramp_time_s": -1})json");
+    ASSERT_TRUE(IsIsError(steer));
+    EXPECT_NE(ErrorText(steer).find("ramp_time_s must be a positive integer (got -1)"),
+              std::string::npos)
+        << ErrorText(steer);
+    EXPECT_EQ(harness->service->accepted_updates(), 0);
+  }
+  // start_run's negative fields: each refused naming the field, before any
+  // uint32 cast; nothing reaches the engine and no session opens.
+  const std::vector<std::pair<std::string, std::string>> refusals = {
+      {"rps", R"json({"uri": "http://127.0.0.1:80/", "rps": -30001})json"},
+      {"duration_s",
+       R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": -30001})json"},
+      {"connections",
+       R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5, "connections": -30001})json"},
+  };
+  for (const auto& [field, args_json] : refusals) {
+    auto harness = MakeHarness(options);
+    Struct result = CallToolOrDie(*harness, "start_run", args_json);
+    ASSERT_TRUE(IsIsError(result)) << field << " must refuse";
+    EXPECT_NE(ErrorText(result).find(field + " must be a positive integer (got -30001)"),
+              std::string::npos)
+        << field << ": " << ErrorText(result);
+    EXPECT_EQ(harness->service->accepted_updates(), 0) << field;
+  }
+}
+
 // --- Task 5 pin 4: the boundary validator covers resources too --------------
 
 // BoundaryValidatorCoversResourcesToo: resources/read params go through the

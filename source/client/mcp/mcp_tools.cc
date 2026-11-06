@@ -323,14 +323,16 @@ constexpr char kStartRunDescription[] =
     "optional; the DECLARED GLOBAL total per second), phases (string, "
     "optional; 'name:rps:duration[:concurrency[:connections]]' entries "
     "replacing duration_s), connections (integer, optional), duration_s "
-    "(integer, optional). The target host is resolved and EVERY resolved "
-    "address is checked against loopback and --allow-target-cidr BEFORE any "
-    "engine connection: an off-box target is refused with the scoping "
-    "message, and an allowed target is rewritten to the resolved IP so the "
-    "engine cannot re-resolve elsewhere. Redirects are refused for "
-    "non-allowlisted targets. A declared total above the --max-rps ceiling "
-    "is refused naming the cap. Errors arrive as isError:true with the "
-    "reason verbatim (scoping message, ceiling, validator text, engine "
+    "(integer, optional). Non-positive rps, connections, or duration_s is "
+    "refused naming the field ('must be a positive integer'). The target "
+    "host is resolved and EVERY resolved address is checked against "
+    "loopback and --allow-target-cidr BEFORE any engine connection: an "
+    "off-box target is refused with the scoping message, and an allowed "
+    "target is rewritten to the resolved IP so the engine cannot "
+    "re-resolve elsewhere. Redirects are refused for non-allowlisted "
+    "targets. A declared total above the --max-rps ceiling is refused "
+    "naming the cap. Errors arrive as isError:true with the reason "
+    "verbatim (scoping message, ceiling, validator text, engine "
     "rejection). Returns {run_started, session, resolved_target}.";
 
 constexpr char kSteerSchema[] = R"json(
@@ -345,15 +347,18 @@ constexpr char kSteerSchema[] = R"json(
 constexpr char kSteerDescription[] =
     "Steers the in-flight run. Args: rps (integer, optional; the new GLOBAL "
     "total per second), ramp_time_s (integer, optional; ramp-plugin runs). "
-    "At least one is required. The declared total is checked against the "
-    "--max-rps ceiling first. One steer in flight at a time: a second steer "
-    "while one is pending reaches the engine and is rejected by its "
-    "one-in-flight guard (surfaced verbatim, never queued). Waits up to "
-    "2x the stats flush interval + 2s (default 4s) for the engine's apply "
-    "ack; the ack is the result ({applied, epoch_id, wall_time_unix_ns, "
-    "monotonic_ns}); a rejection or the timeout arrives as isError:true with "
-    "the reason verbatim ('timed out after <X>s: <what>'). Results match "
-    "sends in order.";
+    "At least one is required; a non-positive value is refused naming the "
+    "field. The declared total is checked against the --max-rps ceiling "
+    "first. One steer in flight at a time: a second steer while one is "
+    "pending reaches the engine and is rejected by its one-in-flight guard "
+    "(surfaced verbatim, never queued). Waits up to 2x the stats flush "
+    "interval + 2s (default 4s) for the engine's apply ack; the ack is the "
+    "result ({applied, epoch_id, wall_time_unix_ns, monotonic_ns}); a "
+    "rejection or the timeout arrives as isError:true with the reason "
+    "verbatim ('timed out after <X>s: <what>'). A timed-out arm's fate "
+    "stays unknown until its verdict or the run's end resolves it — "
+    "get_status's pending.state reads 'unresolved' meanwhile. Results "
+    "match sends in order.";
 
 constexpr char kCancelRunSchema[] = R"json(
     {"type": "object",
@@ -377,7 +382,9 @@ constexpr char kGetStatusSchema[] = R"json(
 constexpr char kGetStatusDescription[] =
     "Reads the run's structured status strip: run state (in_flight, "
     "completed, session path, resolved_target), the current phase id and "
-    "knob epoch, the pending steering state, the phase boundaries (drain, "
+    "knob epoch, the pending steering state (update plus its fate: "
+    "state is 'none', 'awaiting_ack', or 'unresolved' after a timed-out "
+    "steer whose verdict has not landed), the phase boundaries (drain, "
     "idle gap, censoring), and the latest counters. The same object the "
     "nighthawk://status resource renders. No args.";
 
@@ -536,6 +543,15 @@ absl::StatusOr<std::string> CheckTarget(absl::string_view uri,
 }
 
 absl::Status CheckRpsCeiling(long long declared, long long max_rps, absl::string_view subject) {
+  if (declared <= 0) {
+    // The positive-integer floor, BEFORE every caller's uint32 cast: a
+    // >-only ceiling check lets a negative declared total through, and the
+    // cast below wraps it (rps -1 -> 4294967295), driving ~4.29e9 rps past
+    // any --max-rps. The engine's own validator refuses rps < 1 too;
+    // refusing here names the field at the tool boundary.
+    return absl::InvalidArgumentError(
+        absl::StrCat(subject, " must be a positive integer (got ", declared, ")"));
+  }
   if (declared > max_rps) {
     return absl::InvalidArgumentError(absl::StrCat(
         subject, " ", declared, " exceeds the load ceiling of ", max_rps, " rps (--max-rps)"));
@@ -642,7 +658,6 @@ void SteeringController::OnCompleted(const nighthawk::client::Output& output) {
 void SteeringController::OnUpdateResult(const nighthawk::client::UpdateResult& result) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    update_results_.push_back(QueuedResult{++next_seq_, result});
     // The session's knob-epoch record: engine verdicts only — the
     // feed-generated pending surfacing ("run-feed: " prefix) is not one
     // (the TUI pattern). Built once and kept for the timeline resource
@@ -656,13 +671,24 @@ void SteeringController::OnUpdateResult(const nighthawk::client::UpdateResult& r
         recorder_.AppendSnapshot(std::move(record));
       }
     }
+    update_results_.push_back(QueuedResult{++next_seq_, result});
+    // A verdict landing after its waiter timed out is permanently
+    // unclaimable (a later steer's send POSTdates this arrival, so the
+    // send-sequence rule can never hand it over): drop it at arrival, or it
+    // would sit at the queue front lying about pending work forever — the
+    // same orphan the send-time purge guards against (T2-M1).
+    PurgeUnclaimableResults();
     pending_rps_ = 0;
     pending_phase_id_.clear();
+    // The verdict resolves the arm: any earlier timed-out arm's unresolved
+    // state ends here (this result IS the resolution — applied or rejected).
+    pending_unknown_ = false;
   }
   cv_.notify_all();
 }
 
 void SteeringController::OnFinished(const absl::Status& /*status*/) {
+  bool completed = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     finished_ = true;
@@ -670,7 +696,28 @@ void SteeringController::OnFinished(const absl::Status& /*status*/) {
     // a finished run; the TUI RunController's counterpart).
     run_end_unix_ns_ = absl::ToUnixNanos(absl::Now());
     ++finished_count_;
+    // The proto's consumer rule (service.proto): the run's terminal response
+    // resolves every outstanding update arm rather than waiting for an ack
+    // that may never come. Clear the pending steering state and drop queued
+    // results no remaining waiter can claim, so get_status stops reporting
+    // pending work the instant the run is over — and no stale front carries
+    // into the next run.
+    pending_rps_ = 0;
+    pending_phase_id_.clear();
+    pending_ramp_bent_ = false;
+    pending_unknown_ = false;
+    PurgeUnclaimableResults();
+    completed = completed_;
   }
+  // Seal the session on NATURAL end, strictly after the feed's terminal
+  // event (the TUI's finishSession ordering). Without this a
+  // duration-expired run latches the server to one run per process — the
+  // recorder stays open, so the next start_run is refused with the
+  // recorder's "a session is already open" — and leaves the file unsealed
+  // (no run_end record, buffered tail unflushed). CancelRun's and
+  // GracefulStop's later seals become the recorder's no-op second close:
+  // exactly one run end record per session either way.
+  SealSession(/*completed=*/completed);
   cv_.notify_all();
 }
 
@@ -715,16 +762,30 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
   Tui::StartRunDialogModel dialog;
   dialog.set_uri(uri->string_value());
   if (rps != nullptr) {
+    // The ceiling's positive-integer floor already refused <= 0 above, so
+    // this cast cannot wrap a negative.
     dialog.set_rps(static_cast<uint32_t>(IntegerOf(*rps)));
   }
   if (phases != nullptr) {
     dialog.set_phases_field(phases->string_value());
   }
   if (const Value* connections = FindField(arguments, "connections"); connections != nullptr) {
-    dialog.set_connections(static_cast<uint32_t>(IntegerOf(*connections)));
+    const int64_t value = IntegerOf(*connections);
+    if (value <= 0) {
+      // Before the uint32 cast: a negative would wrap to a huge count.
+      return absl::InvalidArgumentError(
+          absl::StrCat("connections must be a positive integer (got ", value, ")"));
+    }
+    dialog.set_connections(static_cast<uint32_t>(value));
   }
   if (const Value* duration = FindField(arguments, "duration_s"); duration != nullptr) {
-    dialog.set_duration_seconds(static_cast<uint32_t>(IntegerOf(*duration)));
+    const int64_t value = IntegerOf(*duration);
+    if (value <= 0) {
+      // Before the uint32 cast: a negative would wrap to a huge duration.
+      return absl::InvalidArgumentError(
+          absl::StrCat("duration_s must be a positive integer (got ", value, ")"));
+    }
+    dialog.set_duration_seconds(static_cast<uint32_t>(value));
   }
   for (int field : {Tui::StartRunDialogModel::kUri, Tui::StartRunDialogModel::kRps,
                     Tui::StartRunDialogModel::kDuration, Tui::StartRunDialogModel::kPhases}) {
@@ -765,6 +826,14 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
     series_records_.clear();
     knob_epochs_.clear();
     update_results_.clear();
+    // The steering-pending state resets with the run (the previous run's
+    // arms were resolved by its terminal response): a fresh run's first
+    // get_status reports no pending work, never a phantom from before.
+    steer_waiters_.clear();
+    pending_rps_ = 0;
+    pending_phase_id_.clear();
+    pending_ramp_bent_ = false;
+    pending_unknown_ = false;
     final_output_ = {};
     start_request_ = request;
     resolved_target_ = *rewritten;
@@ -802,10 +871,19 @@ SteeringController::Steer(const google::protobuf::Struct& arguments) {
   }
   if (rps != nullptr) {
     // The ceiling is the shared start_run/steer check: a steer's declared
-    // total is refused exactly like a start_run's (Task 5 pin).
+    // total is refused exactly like a start_run's (Task 5 pin). Its
+    // positive-integer floor refuses <= 0 before the uint32 cast below.
     const absl::Status ceiling = CheckRpsCeiling(IntegerOf(*rps), options_.max_rps);
     if (!ceiling.ok()) {
       return ceiling;
+    }
+  }
+  if (ramp_time_s != nullptr) {
+    const int64_t value = IntegerOf(*ramp_time_s);
+    if (value <= 0) {
+      // At the argument boundary, before the arm is built or sent.
+      return absl::InvalidArgumentError(
+          absl::StrCat("ramp_time_s must be a positive integer (got ", value, ")"));
     }
   }
 
@@ -831,6 +909,9 @@ SteeringController::Steer(const google::protobuf::Struct& arguments) {
     pending_rps_ = rps != nullptr ? static_cast<uint32_t>(IntegerOf(*rps)) : 0;
     pending_phase_id_ = last_snapshot_.phase_id();
     pending_ramp_bent_ = Tui::RpsTurnBendsRamp(start_request_.options());
+    // A fresh send is a genuine await-ack, whatever an earlier timed-out arm
+    // left unresolved.
+    pending_unknown_ = false;
     const int64_t flush_s = start_request_.options().has_stats_flush_interval()
                                 ? start_request_.options().stats_flush_interval().value()
                                 : 1;
@@ -906,6 +987,16 @@ SteeringController::Steer(const google::protobuf::Struct& arguments) {
     cv_.notify_all();
   }
   if (timed_out) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // NOT clearing pending_* here: the arm's fate is genuinely unknown
+      // mid-run (the proto's late-rejection drop window may still resolve
+      // it, or the ack may still land). Mark the pending state unresolved
+      // so get_status is truthful about the distinction; the verdict
+      // (OnUpdateResult), the run's terminal (OnFinished), or the next
+      // send resolves or clears it.
+      pending_unknown_ = true;
+    }
     return absl::InvalidArgumentError(
         absl::StrCat("timed out after ", bound_s, "s: the run's update ack"));
   }
@@ -1009,8 +1100,15 @@ google::protobuf::Struct SteeringController::BuildStatus() {
     (*status.mutable_fields())["current"] = ToValue(current);
 
     Struct pending;
-    SetBool(pending, "update",
-            !update_results_.empty() || !steer_waiters_.empty() || pending_rps_ > 0);
+    const bool update_pending =
+        !update_results_.empty() || !steer_waiters_.empty() || pending_rps_ > 0;
+    SetBool(pending, "update", update_pending);
+    // The honest fate: "none" | "awaiting_ack" | "unresolved". A steer that
+    // timed out mid-run leaves the arm's fate genuinely unknown (the proto's
+    // late-rejection drop window may still resolve it); the run's terminal
+    // response resolves every outstanding arm.
+    SetString(pending, "state",
+              !update_pending ? "none" : (pending_unknown_ ? "unresolved" : "awaiting_ack"));
     (*status.mutable_fields())["pending"] = ToValue(pending);
 
     boundaries = boundary_events_;
