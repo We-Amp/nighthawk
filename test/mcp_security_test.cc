@@ -455,6 +455,43 @@ TEST(McpSecurityTest, CeilingAppliesToSteerTotal) {
   EXPECT_EQ(harness->service->accepted_updates(), 0);
 }
 
+// The T5-review routed item: a DIRECT pin for the per-phase ceiling variant
+// of the shared CheckRpsCeiling — the function is the per-phase check behind
+// start_run's phases loop (subject "phase '<name>' total rps"), so its
+// refusal text and its boundary behavior are pinned at the function level,
+// and the tool's phased refusal is proven byte-identical to it.
+TEST(McpSecurityTest, CeilingAppliesToPhaseTotals) {
+  // The function-level pin: the per-phase subject rides the message, the
+  // cap-naming substring agents match on is identical to the total's, and
+  // the boundary (declared == cap) passes.
+  auto refused = CheckRpsCeiling(150, 100, "phase 'warm' total rps");
+  ASSERT_FALSE(refused.ok()) << "a phase total above the cap must refuse";
+  EXPECT_NE(refused.message().find("phase 'warm' total rps 150"), std::string::npos)
+      << refused.message();
+  EXPECT_NE(refused.message().find("exceeds the load ceiling of 100 rps (--max-rps)"),
+            std::string::npos)
+      << refused.message();
+  EXPECT_TRUE(CheckRpsCeiling(100, 100, "phase 'warm' total rps").ok())
+      << "a phase total AT the cap is not a violation";
+
+  // Parity: the start_run tool's phased refusal is the SAME bytes as the
+  // shared check's (the tool has no ceiling message of its own).
+  SteeringToolOptions options;
+  options.max_rps = 100;
+  const auto loopback_resolver =
+      [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+        return std::vector<std::string>{"127.0.0.1"};
+      };
+  auto harness = MakeHarness(options, loopback_resolver);
+  Struct tool_result = CallToolOrDie(
+      *harness, "start_run",
+      R"json({"uri": "http://127.0.0.1:80/", "phases": "warm:150:5:2"})json");
+  ASSERT_TRUE(IsIsError(tool_result));
+  EXPECT_EQ(ErrorText(tool_result), refused.message());
+  EXPECT_EQ(harness->service->accepted_updates(), 0)
+      << "the phased refusal happens before anything reaches the engine";
+}
+
 // --- Task 5 pin 4: the boundary validator covers resources too --------------
 
 // BoundaryValidatorCoversResourcesToo: resources/read params go through the
