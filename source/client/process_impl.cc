@@ -1246,6 +1246,17 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
       absl::MutexLock lock(&mutex_);
       if (delta.new_rps.has_value()) {
         tracked_schedule_.new_rps = delta.new_rps;
+        // FORK-ONLY (We-Amp): on the ramp-plugin path (C1) an rps commit IS
+        // ramp re-parameterization -- the tracker's ramp arm models the same
+        // physical rate and must move with the commit. Leaving the ramp arm
+        // at its pre-commit value made a later residual rollback post the
+        // committed rps followed by the STALE ramp target, and the ramp
+        // applied last won: a silent N-fold down-shift delivered as
+        // "rolled back to the prior schedule". The tracker carries a ramp
+        // arm only on plugin runs, so its presence is the plugin signal.
+        if (tracked_schedule_.ramp.has_value()) {
+          tracked_schedule_.ramp->target_rps = delta.new_rps;
+        }
       }
       if (delta.ramp.has_value()) {
         RampShapeChange& tracked =

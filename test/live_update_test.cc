@@ -2087,6 +2087,51 @@ TEST_F(LiveCapabilityFanOutTest, LegacyPartialRollbackRestoresTheTruePriorPerWor
       << "the failed worker never mutated; no rollback post";
 }
 
+// C1 ruling: on the ramp-plugin path an rps commit IS ramp
+// re-parameterization -- the tracker's two arms model the same physical
+// rate. After an rps-only commit the ramp arm's target must move with it,
+// or a later residual rollback posts rps-then-ramp and the STALE ramp
+// target applied last wins: a silent N-fold down-shift acked as "rolled
+// back to the prior schedule".
+TEST_F(LiveCapabilityFanOutTest, PluginRpsOnlyCommitKeepsRollbackArmsUnified) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  // The tracker seeds from production currentPhaseScheduleDelta on a plugin
+  // legacy run: flag 100 x 2 workers = 200 global on the ramp arm.
+  OptionsImpl options(MakePluginCommandLine(100));
+  declared_schedule_ = ComputeCurrentScheduleDelta(options, 2, 0, true);
+
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  // First bend: rps-only commit to 400 global (200 per worker).
+  const UpdateResult first =
+      applier.ApplyDeltas(RpsRequest(400), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(first.applied()) << first.rejection_reason();
+
+  // Second bend fails post-bend on worker 1; worker 0 gets the rollback.
+  // The prior must be the COMMITTED 400 in BOTH arms: rps 200/worker AND
+  // ramp target 200/worker -- the stale declared 100 must never ride along
+  // and win.
+  workers_[1]->apply_ok = false;
+  workers_[1]->apply_status = absl::InternalError("boom");
+  const EngineInstant second_instant{2000, fake_now_.time_since_epoch().count() + 1000000000};
+  const UpdateResult second =
+      applier.ApplyDeltas(RpsRequest(400), "epoch-2", second_instant, Deadline());
+  ASSERT_FALSE(second.applied());
+  ASSERT_EQ(workers_[0]->applies.size(), 3u);
+  const FakeFanOutWorker::ApplyRecord& rollback = workers_[0]->applies[2];
+  ASSERT_TRUE(rollback.delta.new_rps.has_value());
+  EXPECT_EQ(*rollback.delta.new_rps, 200u);
+  ASSERT_TRUE(rollback.delta.ramp.has_value());
+  ASSERT_TRUE(rollback.delta.ramp->target_rps.has_value());
+  EXPECT_EQ(*rollback.delta.ramp->target_rps, 200u)
+      << "the ramp arm must carry the committed 400 global (200/worker), not the stale declared 100";
+  ASSERT_TRUE(rollback.delta.ramp->ramp_time.has_value());
+  EXPECT_EQ(*rollback.delta.ramp->ramp_time, std::chrono::seconds(1))
+      << "ramp time passes through undivided";
+}
+
 // --- The plugin branch of SequencerFactoryImpl::create vs the per-phase rps
 // override. The phase path's override is the worker's divided share of the
 // phase's declared GLOBAL rate (the burstfix division), and the plugin branch
