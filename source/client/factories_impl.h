@@ -59,11 +59,16 @@ private:
    * @param config Plugin name and typed configuration.
    * @param api Envoy API context.
    * @param time_source Time source used by the rate limiter.
+   * @param options The options the plugin factory reads its rate and bound
+   * checks through. A per-phase run passes a cloned Options whose
+   * requests_per_second carries the worker's divided share (the plugin
+   * factory has no override seam of its own).
    * @return Initialized plugin or error status.
    */
   absl::StatusOr<RateLimiterPtr>
   LoadRateLimiterPlugin(const envoy::config::core::v3::TypedExtensionConfig& config,
-                        Envoy::Api::Api& api, Envoy::TimeSource& time_source) const;
+                        Envoy::Api::Api& api, Envoy::TimeSource& time_source,
+                        const Options& options) const;
 };
 
 class StatisticFactoryImpl : public OptionBasedFactoryImpl, public StatisticFactory {

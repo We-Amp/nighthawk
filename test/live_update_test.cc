@@ -23,6 +23,7 @@
 
 #include "source/client/factories_impl.h"
 #include "source/client/live_update_orchestrator.h"
+#include "source/client/options_impl.h"
 #include "source/client/live_update_validator.h"
 #include "source/client/process_impl.h"
 #include "source/common/ramp_reanchor.h"
@@ -1998,6 +1999,258 @@ TEST_F(LiveCapabilityFanOutTest, FanOutRefusedWhenUpdatesDisabled) {
   EXPECT_THAT(result.rejection_reason(), HasSubstr("shutting down"));
   EXPECT_TRUE(post_order_.empty());
   EXPECT_EQ(in_flight_fan_outs_, 0) << "the fence registration must always pair";
+}
+
+// --- The rollback/no-op baseline (production currentPhaseScheduleDelta,
+// factored into ComputeCurrentScheduleDelta) pinned against the REAL
+// construction semantics of each run shape: legacy and plugin runs build
+// each worker's limiter at the top-level flag -- PER WORKER -- while a phase
+// run divides the phase's declared rps at phase begin (the burstfix). The
+// tracker's global baseline must reproduce that construction exactly:
+// PerWorkerDelta(baseline) == what every worker was built at. ---
+
+// Real OptionsImpl instances (the proto path the service materializes); no
+// argv, no mocks.
+nighthawk::client::CommandLineOptions MakeLegacyCommandLine(uint32_t rps) {
+  nighthawk::client::CommandLineOptions command_line;
+  command_line.mutable_requests_per_second()->set_value(rps);
+  command_line.mutable_duration()->set_seconds(2);
+  command_line.mutable_uri()->set_value("http://127.0.0.1:1/");
+  return command_line;
+}
+
+nighthawk::client::CommandLineOptions MakePluginCommandLine(uint32_t rps) {
+  nighthawk::client::CommandLineOptions command_line = MakeLegacyCommandLine(rps);
+  auto* plugin_config = command_line.mutable_rate_limiter_plugin_config();
+  plugin_config->set_name("nighthawk.linear-ramping-rate-limiter-plugin");
+  nighthawk::rate_limiter::LinearRampingRateLimiterConfig plugin_proto;
+  plugin_proto.mutable_ramp_time()->set_seconds(1);
+  std::ignore = plugin_config->mutable_typed_config()->PackFrom(plugin_proto);
+  return command_line;
+}
+
+nighthawk::client::CommandLineOptions
+MakePhaseCommandLine(const std::vector<std::pair<uint32_t, uint32_t>>& phase_rps_seconds,
+                     bool with_plugin) {
+  nighthawk::client::CommandLineOptions command_line =
+      with_plugin ? MakePluginCommandLine(/*rps=*/5) : MakeLegacyCommandLine(/*rps=*/5);
+  // A phase vector and the top-level duration are mutually exclusive; the
+  // per-phase durations own the run's shape.
+  command_line.clear_duration();
+  int index = 0;
+  for (const auto& [rps, seconds] : phase_rps_seconds) {
+    nighthawk::client::PhaseSpec* phase = command_line.add_phases();
+    phase->set_name(absl::StrCat("phase-", ++index));
+    phase->set_requests_per_second(rps);
+    phase->mutable_duration()->set_seconds(seconds);
+  }
+  return command_line;
+}
+
+TEST(ComputeCurrentScheduleDeltaTest, LegacyRunBaselineIsFlagTimesActiveWorkers) {
+  OptionsImpl options(MakeLegacyCommandLine(100));
+  const LiveKnobDelta baseline =
+      ComputeCurrentScheduleDelta(options, /*active_workers=*/4, /*current_phase_index=*/0,
+                                  /*ramp_plugin_configured=*/false);
+  ASSERT_TRUE(baseline.new_rps.has_value());
+  EXPECT_EQ(*baseline.new_rps, 400u)
+      << "legacy construction paces the flag PER WORKER; the global baseline is flag x workers";
+  EXPECT_FALSE(baseline.ramp.has_value());
+}
+
+TEST(ComputeCurrentScheduleDeltaTest, LegacyRunSingleWorkerBaselineIsTheFlag) {
+  OptionsImpl options(MakeLegacyCommandLine(100));
+  const LiveKnobDelta baseline = ComputeCurrentScheduleDelta(options, 1, 0, false);
+  ASSERT_TRUE(baseline.new_rps.has_value());
+  EXPECT_EQ(*baseline.new_rps, 100u);
+}
+
+TEST(ComputeCurrentScheduleDeltaTest, PluginRunBaselineIsFlagTimesActiveWorkersOnTheRampArm) {
+  OptionsImpl options(MakePluginCommandLine(100));
+  const LiveKnobDelta baseline = ComputeCurrentScheduleDelta(options, 4, 0, true);
+  ASSERT_TRUE(baseline.ramp.has_value());
+  ASSERT_TRUE(baseline.ramp->target_rps.has_value());
+  EXPECT_EQ(*baseline.ramp->target_rps, 400u)
+      << "plugin construction also paces the flag per worker (rate_limiter_impl reads the Options seam)";
+  ASSERT_TRUE(baseline.ramp->ramp_time.has_value());
+  EXPECT_EQ(*baseline.ramp->ramp_time, std::chrono::seconds(1));
+  EXPECT_FALSE(baseline.new_rps.has_value());
+}
+
+TEST(ComputeCurrentScheduleDeltaTest, PhaseRunBaselineIsTheCurrentPhaseDeclaredRps) {
+  OptionsImpl options(MakePhaseCommandLine({{8, 2}, {12, 2}}, /*with_plugin=*/false));
+  const LiveKnobDelta baseline = ComputeCurrentScheduleDelta(options, 4, /*current_phase_index=*/1, false);
+  ASSERT_TRUE(baseline.new_rps.has_value());
+  EXPECT_EQ(*baseline.new_rps, 12u)
+      << "phase begin divides the phase's declared rps across the workers; the declared value is global";
+}
+
+TEST(ComputeCurrentScheduleDeltaTest, PhaseRunWithPluginBaselineIsDeclaredRpsOnTheRampArm) {
+  OptionsImpl options(MakePhaseCommandLine({{8, 2}, {12, 2}}, /*with_plugin=*/true));
+  const LiveKnobDelta baseline = ComputeCurrentScheduleDelta(options, 4, 1, true);
+  ASSERT_TRUE(baseline.ramp.has_value());
+  ASSERT_TRUE(baseline.ramp->target_rps.has_value());
+  EXPECT_EQ(*baseline.ramp->target_rps, 12u)
+      << "with the override consumed (factory fix), the plugin phase limiter paces at the phase's share; the declared value is global here too";
+}
+
+// Task-8a's global-knob contract on a LEGACY run: a no-op bend AT the true
+// total (flag x active workers) must leave every worker's limiter at its
+// constructed share -- previously the tracker treated the bare flag as the
+// global baseline and the same bend re-paced every worker at flag/N (an
+// N-fold load cut acked as applied).
+TEST_F(LiveCapabilityFanOutTest, LegacyNoOpBendAtTrueTotalLeavesWorkerSharesUnchanged) {
+  for (int i = 0; i < 4; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  OptionsImpl options(MakeLegacyCommandLine(100));
+  declared_schedule_ = ComputeCurrentScheduleDelta(options, /*active_workers=*/4, 0, false);
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result =
+      applier.ApplyDeltas(RpsRequest(400), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(result.applied()) << result.rejection_reason();
+  for (size_t i = 0; i < workers_.size(); i++) {
+    ASSERT_EQ(workers_[i]->applies.size(), 1u);
+    ASSERT_TRUE(workers_[i]->applies[0].delta.new_rps.has_value());
+    EXPECT_EQ(*workers_[i]->applies[0].delta.new_rps, 100u)
+        << "worker " << i << " must keep its constructed per-worker share (the flag)";
+  }
+}
+
+// The first partial-fan-out rollback on a legacy run must restore each
+// worker's TRUE prior rate (the flag) -- previously the rollback re-applied
+// flag/active_workers, leaving a heterogeneous fleet under a "rolled back"
+// ack.
+TEST_F(LiveCapabilityFanOutTest, LegacyPartialRollbackRestoresTheTruePriorPerWorkerRate) {
+  for (int i = 0; i < 4; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  OptionsImpl options(MakeLegacyCommandLine(100));
+  declared_schedule_ = ComputeCurrentScheduleDelta(options, 4, 0, false);
+  workers_[3]->apply_ok = false;
+  workers_[3]->apply_status = absl::InternalError("limiter cannot honor the delta");
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result =
+      applier.ApplyDeltas(RpsRequest(400), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("rolled back"));
+  for (int w : {0, 1, 2}) {
+    ASSERT_EQ(workers_[w]->applies.size(), 2u);
+    const FakeFanOutWorker::ApplyRecord& rollback = workers_[w]->applies[1];
+    ASSERT_TRUE(rollback.delta.new_rps.has_value());
+    EXPECT_EQ(*rollback.delta.new_rps, 100u)
+        << "the rollback must restore worker " << w
+        << "'s true constructed rate (the flag), never flag/active_workers";
+  }
+  EXPECT_EQ(workers_[3]->applies.size(), 1u)
+      << "the failed worker never mutated; no rollback post";
+}
+
+// C1 ruling: on the ramp-plugin path an rps commit IS ramp
+// re-parameterization -- the tracker's two arms model the same physical
+// rate. After an rps-only commit the ramp arm's target must move with it,
+// or a later residual rollback posts rps-then-ramp and the STALE ramp
+// target applied last wins: a silent N-fold down-shift acked as "rolled
+// back to the prior schedule".
+TEST_F(LiveCapabilityFanOutTest, PluginRpsOnlyCommitKeepsRollbackArmsUnified) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  // The tracker seeds from production currentPhaseScheduleDelta on a plugin
+  // legacy run: flag 100 x 2 workers = 200 global on the ramp arm.
+  OptionsImpl options(MakePluginCommandLine(100));
+  declared_schedule_ = ComputeCurrentScheduleDelta(options, 2, 0, true);
+
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  // First bend: rps-only commit to 400 global (200 per worker).
+  const UpdateResult first =
+      applier.ApplyDeltas(RpsRequest(400), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(first.applied()) << first.rejection_reason();
+
+  // Second bend fails post-bend on worker 1; worker 0 gets the rollback.
+  // The prior must be the COMMITTED 400 in BOTH arms: rps 200/worker AND
+  // ramp target 200/worker -- the stale declared 100 must never ride along
+  // and win.
+  workers_[1]->apply_ok = false;
+  workers_[1]->apply_status = absl::InternalError("boom");
+  const EngineInstant second_instant{2000, fake_now_.time_since_epoch().count() + 1000000000};
+  const UpdateResult second =
+      applier.ApplyDeltas(RpsRequest(400), "epoch-2", second_instant, Deadline());
+  ASSERT_FALSE(second.applied());
+  ASSERT_EQ(workers_[0]->applies.size(), 3u);
+  const FakeFanOutWorker::ApplyRecord& rollback = workers_[0]->applies[2];
+  ASSERT_TRUE(rollback.delta.new_rps.has_value());
+  EXPECT_EQ(*rollback.delta.new_rps, 200u);
+  ASSERT_TRUE(rollback.delta.ramp.has_value());
+  ASSERT_TRUE(rollback.delta.ramp->target_rps.has_value());
+  EXPECT_EQ(*rollback.delta.ramp->target_rps, 200u)
+      << "the ramp arm must carry the committed 400 global (200/worker), not the stale declared 100";
+  ASSERT_TRUE(rollback.delta.ramp->ramp_time.has_value());
+  EXPECT_EQ(*rollback.delta.ramp->ramp_time, std::chrono::seconds(1))
+      << "ramp time passes through undivided";
+}
+
+// --- The plugin branch of SequencerFactoryImpl::create vs the per-phase rps
+// override. The phase path's override is the worker's divided share of the
+// phase's declared GLOBAL rate (the burstfix division), and the plugin branch
+// must pace the per-phase limiter at it -- exactly like the linear branch
+// does. The regression: the plugin branch silently discarded the override and
+// built every per-phase limiter at the top-level flag (offered load =
+// active_workers x flag on every phase of a plugin run). ---
+
+TEST(SequencerFactoryPluginOverrideTest, PluginLimiterPacesAtPerPhaseRpsOverride) {
+  Envoy::Stats::IsolatedStoreImpl stats_store;
+  Envoy::Api::ApiPtr api = Envoy::Api::createApiForTest(stats_store);
+  Envoy::Event::DispatcherPtr dispatcher = api->allocateDispatcher("factory_plugin_override_test");
+
+  // A real OptionsImpl (the proto path the service materializes), top-level
+  // flag 100: an override-consuming plugin branch must never pace at it.
+  nighthawk::client::CommandLineOptions command_line;
+  command_line.mutable_requests_per_second()->set_value(100);
+  command_line.mutable_duration()->set_seconds(10);
+  command_line.mutable_uri()->set_value("http://127.0.0.1:1/");
+  auto* plugin_config = command_line.mutable_rate_limiter_plugin_config();
+  plugin_config->set_name("nighthawk.linear-ramping-rate-limiter-plugin");
+  nighthawk::rate_limiter::LinearRampingRateLimiterConfig plugin_proto;
+  plugin_proto.mutable_ramp_time()->set_seconds(1);
+  std::ignore = plugin_config->mutable_typed_config()->PackFrom(plugin_proto);
+  OptionsImpl options(command_line);
+
+  SequencerFactoryImpl factory(options);
+  LiveTunableRateLimiter* captured = nullptr;
+  const SequencerTarget dummy_target = [](const CompletionCallback& f) -> bool {
+    f(true, true);
+    return true;
+  };
+  auto sequencer =
+      factory.create(api->timeSource(), *dispatcher, dummy_target,
+                     std::make_unique<NiceMock<MockTerminationPredicate>>(),
+                     *stats_store.rootScope(), api->timeSource().monotonicTime() + 10ms, *api,
+                     /*requests_per_second_override=*/10, &captured);
+  ASSERT_NE(sequencer.get(), nullptr);
+  ASSERT_NE(captured, nullptr);
+  // The captured handle is the INNER plugin limiter (captured before the
+  // ScheduledStartingRateLimiter wrap): the physical pacer of this phase.
+  auto* limiter = dynamic_cast<RateLimiter*>(captured);
+  ASSERT_NE(limiter, nullptr);
+
+  // Drive the captured limiter in real time, starting at its first attempt:
+  // the 1s ramp completes, then it paces at its schedule rate. It must pace
+  // at the override (10/s), never at the top-level flag (100/s).
+  int acquired = 0;
+  const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (limiter->tryAcquireOne()) {
+      ++acquired;
+    }
+  }
+  // ~2.5s from the first attempt: ~5 releases (the ramp's integral) plus ~15
+  // at the 10/s target. The flag-paced limiter would hand out ~250.
+  EXPECT_LT(acquired, 60)
+      << "the plugin limiter must pace at the per-phase rps override, not the top-level flag";
 }
 
 } // namespace
