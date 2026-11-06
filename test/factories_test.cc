@@ -264,7 +264,10 @@ TEST_P(SequencerFactoryTest, ValidRateLimiterPluginCreatesWorkingSequencer) {
   EXPECT_CALL(dispatcher_, createTimer_(_)).Times(2);
 
   // LinearRampingRateLimiter specific. Adjust if test fails because of any
-  // changes made to the LinearRampingRateLimiterImplFactory.
+  // changes made to the LinearRampingRateLimiterImplFactory. The factory
+  // now also consults the phase vector first: a phase run bounds ramp_time
+  // by the phases' total duration instead of the top-level --duration.
+  EXPECT_CALL(options_, hasPhaseVector()).WillOnce(Return(false));
   EXPECT_CALL(options_, requestsPerSecond()).WillOnce(Return(100));
   EXPECT_CALL(options_, noDuration()).WillOnce(Return(false));
   EXPECT_CALL(options_, duration()).WillOnce(Return(std::chrono::seconds(10)));

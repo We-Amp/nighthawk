@@ -244,6 +244,22 @@ private:
   bool in_progress_{false};
 };
 
+// FORK-ONLY (We-Amp): the schedule the live-knob fan-out seeds its rollback
+// prior-state tracker with for the CURRENT operating point -- the declared
+// GLOBAL rps of the run shape (the value whose per-worker division through
+// PerWorkerDelta reproduces what every worker's limiter was actually built
+// at). Factored out of ProcessImpl::currentPhaseScheduleDelta() so tests can
+// pin it against the REAL construction semantics of each run shape: on a
+// phase run the phase-begin loop divides the phase's declared rps (the
+// burstfix), so the declared value is global; on a legacy or plugin run each
+// worker's limiter is constructed at the top-level flag -- PER WORKER -- so
+// the global baseline is flag x active_workers. Free function over the
+// Options interface plus the live run-shape facts; ProcessImpl binds its own
+// state around it.
+LiveKnobDelta ComputeCurrentScheduleDelta(const Client::Options& options,
+                                          uint32_t active_workers, uint32_t current_phase_index,
+                                          bool ramp_plugin_configured);
+
 class ProcessImpl : public Process, public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
   /**

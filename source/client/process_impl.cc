@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -1458,36 +1459,62 @@ uint32_t ProcessImpl::activeWorkerCountForUpdate() const {
   return active_worker_count_;
 }
 
-LiveKnobDelta ProcessImpl::currentPhaseScheduleDelta() const {
+LiveKnobDelta ComputeCurrentScheduleDelta(const Client::Options& options,
+                                          const uint32_t active_workers,
+                                          const uint32_t current_phase_index,
+                                          const bool ramp_plugin_configured) {
+  // The declared GLOBAL rps of the current operating point: the value whose
+  // per-worker division through PerWorkerDelta reproduces what every
+  // worker's limiter was actually built at. On a phase run the phase-begin
+  // loop divides the phase's declared rps (the burstfix), so the declared
+  // value is already global. On a LEGACY or plugin run each worker's limiter
+  // is constructed at the top-level flag -- PER WORKER (factories_impl
+  // builds every LinearRateLimiter at the flag; the plugin factory reads the
+  // same flag through its Options seam) -- so the global baseline is flag x
+  // active_workers: seeding the rollback tracker with the bare flag there
+  // made a no-op bend at the displayed value an N-fold load cut and a
+  // partial-failure rollback re-apply flag/N per worker, all under a
+  // "rolled back to the prior schedule" ack.
+  uint32_t declared_global_rps = options.requestsPerSecond();
+  if (options.hasPhaseVector()) {
+    const auto& phases = options.phases();
+    if (current_phase_index < phases.size() &&
+        phases[current_phase_index].requests_per_second() > 0) {
+      declared_global_rps = phases[current_phase_index].requests_per_second();
+    }
+  } else {
+    const uint64_t global = static_cast<uint64_t>(options.requestsPerSecond()) *
+                            std::max<uint32_t>(active_workers, 1u);
+    declared_global_rps =
+        static_cast<uint32_t>(std::min<uint64_t>(global, std::numeric_limits<uint32_t>::max()));
+  }
+
   LiveKnobDelta schedule;
-  if (liveUpdateRunShape().ramp_plugin_configured) {
+  if (ramp_plugin_configured) {
     // The plugin path's schedule is the ramp: the declared ramp time (the
-    // plugin config is run-level) and the target frequency. The plugin
-    // factory ignores per-phase rps overrides, so the run-level option is
-    // the target on every phase.
+    // plugin config is run-level; a shape, never divided) and the declared
+    // global target. With the factory now consuming the per-phase override,
+    // a phase run's plugin limiter paces at the phase's divided share, so
+    // the declared phase rps is the honest global baseline there too.
     nighthawk::rate_limiter::LinearRampingRateLimiterConfig config;
-    const auto& plugin = options_.rateLimiterPluginConfig();
+    const auto& plugin = options.rateLimiterPluginConfig();
     if (plugin.has_value() && plugin->typed_config().UnpackTo(&config)) {
       RampShapeChange change;
       change.ramp_time = std::chrono::seconds(config.ramp_time().seconds()) +
                          std::chrono::nanoseconds(config.ramp_time().nanos());
-      change.target_rps = options_.requestsPerSecond();
+      change.target_rps = declared_global_rps;
       schedule.ramp = change;
     }
     return schedule;
   }
-  // Non-plugin path: the CURRENT phase's declared rps (the per-phase
-  // sequencer is built at that rate; unset inherits the run-level option).
-  const auto& phases = options_.phases();
-  uint32_t rps = options_.requestsPerSecond();
-  if (options_.hasPhaseVector()) {
-    std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
-    if (current_phase_index_ < phases.size() && phases[current_phase_index_].requests_per_second() > 0) {
-      rps = phases[current_phase_index_].requests_per_second();
-    }
-  }
-  schedule.new_rps = rps;
+  schedule.new_rps = declared_global_rps;
   return schedule;
+}
+
+LiveKnobDelta ProcessImpl::currentPhaseScheduleDelta() const {
+  return ComputeCurrentScheduleDelta(options_, activeWorkerCountForUpdate(),
+                                     currentPhaseIndexForUpdate(),
+                                     liveUpdateRunShape().ramp_plugin_configured);
 }
 
 bool ProcessImpl::fanOutBegin() {
