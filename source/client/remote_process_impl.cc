@@ -31,15 +31,18 @@ bool RemoteProcessImpl::run(OutputCollector& collector) {
   // choke point in NighthawkServiceClientImpl::PerformNighthawkBenchmark does
   // that for every legacy remote consumer, including this one.
 
-  // FORK-ONLY (We-Amp): arm the cancellation handle for the duration of the
-  // blocking execution (M3 Task 7, #380) so requestExecutionCancellation()
+  // FORK-ONLY (We-Amp): the cancellation handle exists for this object's
+  // whole lifetime (see the member note in the header) and is handed to the
+  // blocking execution unchanged (#380), so requestExecutionCancellation()
   // can write the CancellationRequest arm from another thread. The arm keeps
-  // the stream alive, so the run's final response still arrives below.
-  cancellation_handle_ = std::make_unique<NighthawkServiceCancellationHandle>();
+  // the stream alive, so the run's final response still arrives below. The
+  // handle's write closure is armed and disarmed INSIDE the benchmark, under
+  // the handle's own mutex, so nothing here touches the member at run
+  // boundaries: a cancellation request racing execution start or end always
+  // reads a valid, armed-or-disarmed handle -- never a freed one.
   const absl::StatusOr<const nighthawk::client::ExecutionResponse> result =
       service_client_->PerformNighthawkBenchmarkWithCancellation(&stub_, *options,
                                                                 cancellation_handle_.get());
-  cancellation_handle_.reset();
   if (result.ok()) {
     collector.setOutput(result.value().output());
     return true;

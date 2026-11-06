@@ -263,5 +263,106 @@ TEST_F(ClientTest, RemoteCancellationSendsArm) {
   EXPECT_GT(collector.toProto().results_size(), 0);
 }
 
+// The cancellation handle's lifetime is race-free: the handle exists for the
+// RemoteProcessImpl's whole lifetime and is never armed (assigned) or reset
+// from run(), so requestExecutionCancellation() -- called from the
+// signal-handler dispatch thread -- has no member mutation to race whatever
+// the run lifecycle is doing. The pin exercises the whole lifecycle in two
+// windows: BEFORE any run (the old pre-first-run window, where the handle
+// member used to be null and in-flight-free requests had nothing valid to
+// read) every request must answer an honest false; and during flight a
+// hammering thread (started only after live upstream traffic proves the run
+// is in flight -- a hammer that starts earlier can honestly land in the
+// child's bootstrap and end the run before it ever reaches the upstream,
+// which is correct cancellation semantics but not this pin's window) gets
+// its cancellation accepted, the run still completes with its final output,
+// and after the run a request answers false again. (Without sanitizers the
+// freed-handle windows usually pass silently on a plain build; under TSan a
+// hammer against the old arming/reset would be a definitive data-race
+// report; under ASan a hit in the window is a heap-use-after-free.)
+TEST_F(ClientTest, RemoteCancellationHandleIsRaceFreeAcrossRunLifecycle) {
+  TestHttpListener listener;
+  std::unique_ptr<ServiceImpl> service = std::make_unique<ServiceImpl>();
+  grpc::ServerBuilder builder;
+  int grpc_server_port = 0;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_server_port);
+  builder.RegisterService(service.get());
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  auto channel = grpc::CreateChannel(fmt::format("127.0.0.1:{}", grpc_server_port),
+                                     grpc::InsecureChannelCredentials());
+  auto stub = nighthawk::client::NighthawkService::NewStub(channel);
+  auto options = TestUtility::createOptionsImpl(fmt::format(
+      "foo --duration 10 --rps 10 --concurrency 1 --verbosity error --nighthawk-service "
+      "grpc://127.0.0.1:{} {}",
+      grpc_server_port, listener.uri()));
+
+  Envoy::Event::RealTimeSystem time_system; // NO_CHECK_FORMAT(real_time)
+  OutputCollectorImpl collector(time_system, *options);
+  RemoteProcessImpl process(*options, *stub);
+
+  // Window 1 -- before any run: the handle is alive but nothing is in
+  // flight, so every request answers an honest false. The old code's member
+  // was null here (and reset between runs), leaving these calls reading a
+  // freed/absent handle.
+  for (int i = 0; i < 200; ++i) {
+    EXPECT_FALSE(process.requestExecutionCancellation());
+  }
+
+  bool run_ok = false;
+  std::thread run_thread([&process, &collector, &run_ok]() {
+    run_ok = process.run(collector);
+  });
+  // Anchor on live upstream traffic so the hammer (started below) lands
+  // squarely in the in-flight window. No fatal assert inside the wait: the
+  // run and hammer threads must always be joined before this test body can
+  // return, or their joinable threads terminate the process.
+  const auto traffic_deadline = std::chrono::steady_clock::now() + 10s;
+  bool got_traffic = false;
+  while (std::chrono::steady_clock::now() < traffic_deadline) {
+    if (listener.connections() > 0) {
+      got_traffic = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+
+  // Window 2 -- during flight: the hammer retires at the first accepted
+  // request (exactly one cancellation per run is the sanctioned contract,
+  // client and service alike: the signal handler cancels once, and the
+  // service tears down the shared stream on a cancellation request that
+  // lands after the run began unwinding -- hammering past the acceptance
+  // would lose the run's final response through that pre-existing service
+  // path, which is not this pin's window). The calls racing the acceptance
+  // still exercise the arming instant against the always-valid handle; the
+  // teardown window is pinned by the post-run request below.
+  std::atomic<bool> hammer_stop{false};
+  std::atomic<int> cancellations_accepted{0};
+  std::thread hammer([&process, &hammer_stop, &cancellations_accepted]() {
+    while (!hammer_stop.load()) {
+      if (process.requestExecutionCancellation()) {
+        cancellations_accepted++;
+        hammer_stop.store(true);
+      }
+    }
+  });
+
+  run_thread.join();
+  hammer_stop.store(true);
+  hammer.join();
+
+  EXPECT_TRUE(got_traffic) << "the benchmark never reached the upstream listener";
+  EXPECT_TRUE(run_ok);
+  // The hammer landed during flight at least once: the arm was sent, and the
+  // run's final output still arrived (the single-response contract).
+  EXPECT_GT(cancellations_accepted.load(), 0) << "the cancellation never reached the run";
+  EXPECT_GT(collector.toProto().results_size(), 0);
+
+  // No run is in flight anymore: the still-alive handle is disarmed, and a
+  // post-run request reports exactly that (false), never a stale success.
+  EXPECT_FALSE(process.requestExecutionCancellation());
+}
+
 } // namespace Client
 } // namespace Nighthawk

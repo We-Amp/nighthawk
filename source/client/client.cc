@@ -91,8 +91,10 @@ bool Main::run() {
     // is the most likely to hang, and signals must keep being handled there. Requesting
     // execution cancellation on an already-finished run is safe: worker cancellation and
     // shutdown() serialize on the same lock inside ProcessImpl (encap subprocess
-    // termination is guarded by the runner's own mutex), and RemoteProcessImpl logs that
-    // cancellation is unsupported. The SignalHandler restores the previous (typically
+    // termination is guarded by the runner's own mutex), and on the remote path
+    // RemoteProcessImpl's cancellation handle outlives every run (armed/disarmed
+    // internally under its own mutex), so a request outside an in-flight run is a safe
+    // false. The SignalHandler restores the previous (typically
     // default) dispositions as soon as it consumes the first signal, so any further signal
     // terminates the process (escalation) even if the cancellation callback blocks on a
     // hung shutdown.
