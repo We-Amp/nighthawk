@@ -40,22 +40,36 @@ using nighthawk::client::ExecutionResponse;
 // A minimal HTTP/1.1 server that answers every request with an empty 200
 // response. It gives the benchmark client live upstream traffic so that tests
 // can observe 2xx counters in the output the service produces.
+// The listener binds the caller's IP version so an IpVersions-parametrized
+// test's IPv6 variant genuinely loads a v6 loopback upstream (and its IPv4
+// variant a v4 one) — the parametrization would otherwise be a misnomer with
+// every variant pinned to 127.0.0.1.
 class TestHttpListener {
 public:
-  TestHttpListener() {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  explicit TestHttpListener(Envoy::Network::Address::IpVersion version) : version_(version) {
+    const bool is_v6 = version_ == Envoy::Network::Address::IpVersion::v6;
+    listen_fd_ = ::socket(is_v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     EXPECT_NE(listen_fd_, -1);
     int one = 1;
     EXPECT_EQ(::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)), 0);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    EXPECT_EQ(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    sockaddr_in6 addr{};
+    socklen_t addr_len = 0;
+    if (is_v6) {
+      addr.sin6_family = AF_INET6;
+      addr.sin6_addr = in6addr_loopback;
+      addr.sin6_port = 0;
+      addr_len = sizeof(addr);
+    } else {
+      auto* addr4 = reinterpret_cast<sockaddr_in*>(&addr);
+      addr4->sin_family = AF_INET;
+      addr4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      addr4->sin_port = 0;
+      addr_len = sizeof(sockaddr_in);
+    }
+    EXPECT_EQ(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), addr_len), 0);
     EXPECT_EQ(::listen(listen_fd_, 16), 0);
-    socklen_t addr_len = sizeof(addr);
     EXPECT_EQ(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
-    port_ = ntohs(addr.sin_port);
+    port_ = ntohs(is_v6 ? addr.sin6_port : reinterpret_cast<sockaddr_in*>(&addr)->sin_port);
     thread_ = std::thread([this]() { acceptLoop(); });
   }
 
@@ -69,9 +83,16 @@ public:
   TestHttpListener(const TestHttpListener&) = delete;
   TestHttpListener& operator=(const TestHttpListener&) = delete;
 
-  std::string uri() const { return fmt::format("http://127.0.0.1:{}/", port_); }
+  std::string uri() const {
+    if (version_ == Envoy::Network::Address::IpVersion::v6) {
+      // Bracketed form: an IPv6 literal host needs brackets in a URI.
+      return fmt::format("http://[::1]:{}/", port_);
+    }
+    return fmt::format("http://127.0.0.1:{}/", port_);
+  }
 
 private:
+  Envoy::Network::Address::IpVersion version_;
   static constexpr int kNoSignalFlags =
 #ifdef MSG_NOSIGNAL
       MSG_NOSIGNAL;
@@ -405,7 +426,7 @@ TEST_P(ServiceTest, CancellationWithoutRunInFlightTearsDown) {
 // byte-identically to pre-M3: snapshots flow, the final output is the LAST
 // response on the stream, and the stream finishes OK.
 TEST_P(ServiceTest, NoArmsIsLegacyRun) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto r = startLiveRun(listener, 2, 10);
   bool saw_output = false;
   while (r->Read(&response_)) {
@@ -431,7 +452,7 @@ TEST_P(ServiceTest, NoArmsIsLegacyRun) {
 // rejection was a stale pin left behind when T6 landed the fan-out; this test
 // pins the applied path now, exactly as the T6 report describes.)
 TEST_P(ServiceTest, UpdateArmDoesNotTearDownStream) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto r = startLiveRun(listener, 4, 10);
   std::this_thread::sleep_for(1s);
   nighthawk::client::ExecutionRequest update_request;
@@ -462,7 +483,7 @@ TEST_P(ServiceTest, UpdateArmDoesNotTearDownStream) {
 // Targeting validation at the routing layer: a mismatched execution_id acks a
 // structured rejection and the stream (and run) survive.
 TEST_P(ServiceTest, ExecutionIdMismatchRejected) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto r = startLiveRun(listener, 3, 10);
   std::this_thread::sleep_for(300ms);
   nighthawk::client::ExecutionRequest update_request;
@@ -491,7 +512,7 @@ TEST_P(ServiceTest, ExecutionIdMismatchRejected) {
 
 // Same for a mismatched phase_id.
 TEST_P(ServiceTest, PhaseIdMismatchRejected) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto r = startLiveRun(listener, 3, 10);
   std::this_thread::sleep_for(300ms);
   nighthawk::client::ExecutionRequest update_request;
@@ -519,7 +540,7 @@ TEST_P(ServiceTest, PhaseIdMismatchRejected) {
 
 // An update with no deltas is rejected with a structured reason.
 TEST_P(ServiceTest, EmptyDeltasRejected) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto r = startLiveRun(listener, 3, 10);
   std::this_thread::sleep_for(300ms);
   nighthawk::client::ExecutionRequest update_request;
@@ -552,7 +573,7 @@ TEST_P(ServiceTest, EmptyDeltasRejected) {
 // the re-anchoring apply path, a fitting ramp delta applies honestly and
 // carries the first knob epoch). The stream and run survive every step.
 TEST_P(ServiceTest, RampDeltaValidatedAgainstRunShape) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   // A 3s ramp-plugin run (the plugin's own 2s ramp time fits the duration,
   // the factory's construction-time backstop).
   ExecutionRequest start_request;
@@ -617,7 +638,7 @@ TEST_P(ServiceTest, RampDeltaValidatedAgainstRunShape) {
 // knob arm) is rejected with a structured whitelist reason before any engine
 // contact, and the run completes normally afterwards.
 TEST_P(ServiceTest, RejectedUpdateMutatesNothing) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto r = startLiveRun(listener, 3, 10);
   std::this_thread::sleep_for(300ms);
   nighthawk::client::ExecutionRequest update_request;
@@ -651,7 +672,7 @@ TEST_P(ServiceTest, RejectedUpdateMutatesNothing) {
 // run is served normally, instead of being declined while the abandoned run
 // lingers for its full configured duration.
 TEST_P(ServiceTest, CancelViaContext) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   auto options = request_.mutable_start_request()->mutable_options();
   options->mutable_uri()->set_value(listener.uri());
   options->mutable_duration()->set_seconds(60);
@@ -721,7 +742,7 @@ TEST_P(ServiceTest, CancelViaContext) {
 // the stream after the cancellation was accepted, and the final output stays
 // the last response.
 TEST_P(ServiceTest, CancellationRequestNotStalledBehindAckWait) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   BlockingTestApplier* applier_ptr = nullptr;
   service_->SetUpdateApplierFactoryForTest(
       [&applier_ptr]() -> std::unique_ptr<LiveUpdateOrchestrator::Applier> {
@@ -775,7 +796,7 @@ TEST_P(ServiceTest, CancellationRequestNotStalledBehindAckWait) {
 // orchestrator dereference — instead of tearing the stream down with a
 // success-looking status.
 TEST_P(ServiceTest, ArmDispatchAfterRunFailureIsHonestRejection) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   service_->SetRunFailureInjectionForTest(
       []() { throw NighthawkException("injected run failure"); });
   auto r = startLiveRun(listener, 60, 10);
@@ -809,7 +830,7 @@ TEST_P(ServiceTest, ArmDispatchAfterRunFailureIsHonestRejection) {
 // behind the pending ack wait (the bounded join happens after the final
 // write).
 TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterRunEnd) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   BlockingTestApplier* applier_ptr = nullptr;
   service_->SetUpdateApplierFactoryForTest(
       [&applier_ptr]() -> std::unique_ptr<LiveUpdateOrchestrator::Applier> {
@@ -855,7 +876,7 @@ TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterRunEnd) {
 // M4 (Review Focus 6): after a cancellation is accepted, a pending update
 // resolves — even as applied=true — WITHOUT any further stream write.
 TEST_P(ServiceTest, PendingUpdateResolvesWithoutWriteAfterCancellationAccepted) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   BlockingTestApplier* applier_ptr = nullptr;
   service_->SetUpdateApplierFactoryForTest(
       [&applier_ptr]() -> std::unique_ptr<LiveUpdateOrchestrator::Applier> {
@@ -976,7 +997,7 @@ readRunFromStream(grpc::ClientReaderWriter<ExecutionRequest, ExecutionResponse>&
 // before: a single response carrying the run output, and no snapshot messages
 // at all. The fork's legacy consumers assert on this via RELEASE_ASSERT.
 TEST_P(ServiceTest, LiveStreamingDisabledBackCompat) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   ExecutionRequest request = makeLiveRequest(listener.uri(), 2, 10, 1, /*live_streaming=*/false);
   LiveStreamResult result = readLiveStream(stub_.get(), request);
   EXPECT_TRUE(result.got_final_response);
@@ -988,7 +1009,7 @@ TEST_P(ServiceTest, LiveStreamingDisabledBackCompat) {
 // the run is in flight: strictly increasing monotonic_ns, counters that only
 // grow, and at least one statistic sample with real content.
 TEST_P(ServiceTest, LiveStreamingSnapshots) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   ExecutionRequest request = makeLiveRequest(listener.uri(), 10, 10, 1, /*live_streaming=*/true);
   LiveStreamResult result = readLiveStream(stub_.get(), request);
   EXPECT_TRUE(result.got_final_response);
@@ -1029,7 +1050,7 @@ TEST_P(ServiceTest, LiveStreamingSnapshots) {
 // any snapshot writer or run state survived run 1, it would surface here as a
 // stray message or a carry-over of run 1's counters.
 TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   ExecutionRequest request = makeLiveRequest(listener.uri(), 2, 10, 1, /*live_streaming=*/true);
 
   auto stream = stub_->ExecutionStream(&context_);
@@ -1091,7 +1112,7 @@ TEST_P(ServiceTest, SnapshotsStopAtRunEnd) {
 // repointed — and then drives a second run over it, reading both streams to
 // completion.
 TEST_P(ServiceTest, TwoConcurrentStreamsStayIsolated) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
 
   // Run 1: long enough to comfortably overlap the second stream being opened.
   ExecutionRequest first_request = makeLiveRequest(listener.uri(), 10, 10, 1, true);
@@ -1175,7 +1196,7 @@ TEST_P(ServiceTest, TwoConcurrentStreamsStayIsolated) {
 // contributed at steady state, while counters keep growing and monotonic_ns
 // keeps increasing.
 TEST_P(ServiceTest, TwoWorkersMergeIntoLiveSnapshots) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   const uint32_t kConcurrency = 2;
   const uint32_t kDurationSeconds = 10;
   const uint32_t kRps = 10;
@@ -1261,7 +1282,7 @@ ExecutionRequest makePhasedLiveRequest(const std::string& uri, uint32_t flush_se
 // (pre-first-apply) epoch; snapshots produced from post-bend partials carry
 // epoch-1; the final output stays the last response on the stream.
 TEST_P(ServiceTest, FanOutAppliesSingleEpochAtAgreedInstant) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   request_ = makeLiveRequest(listener.uri(), 4, 10, 1, /*live_streaming=*/true,
                              /*concurrency=*/2);
   auto r = stub_->ExecutionStream(&context_);
@@ -1335,7 +1356,7 @@ TEST_P(ServiceTest, FanOutAppliesSingleEpochAtAgreedInstant) {
 // pinned against: anchor on the first phase-1-tagged snapshot, wait out one
 // full drain budget, update once, expect exactly one applied ack (epoch-1).
 TEST_P(ServiceTest, FanOutTargetsActiveWorkersInOrder) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   request_ = makePhasedLiveRequest(listener.uri(), 1);
   auto r = stub_->ExecutionStream(&context_);
   ASSERT_TRUE(r->Write(request_, {}));
@@ -1392,8 +1413,17 @@ TEST_P(ServiceTest, FanOutTargetsActiveWorkersInOrder) {
 // 0 still stamps phase 1's snapshots -- the bend survives the boundary in
 // the labels even though the limiter (and its schedule) is per-phase.
 TEST_P(ServiceTest, EpochSurvivesPhaseBoundary) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   request_ = makePhasedLiveRequest(listener.uri(), 1);
+  // This test pins the epoch stamp across the phase boundary, not connection
+  // health. The default failure predicates (threshold 0 on stream resets and
+  // pool connection failures) kill the run for a single loopback hiccup when
+  // the host is loaded — 150ms into phase 1, after the boundary handoff —
+  // which raced the first phase-1 live-snapshot flush and made the epoch
+  // assertion flaky. The run must complete its phases for this test, so the
+  // zero-tolerance default predicates are off for it.
+  request_.mutable_start_request()->mutable_options()->mutable_no_default_failure_predicates()->set_value(
+      true);
   auto r = stub_->ExecutionStream(&context_);
   ASSERT_TRUE(r->Write(request_, {}));
   // Land the update inside phase 0, with the bend still inside the phase.
@@ -1435,7 +1465,7 @@ TEST_P(ServiceTest, EpochSurvivesPhaseBoundary) {
 // one-stream proof; the arm's entire reason to exist alongside the
 // context-cancel watchdog).
 TEST_P(ServiceTest, CancellationRequestStopsRunKeepsStream) {
-  TestHttpListener listener;
+  TestHttpListener listener(GetParam());
   request_ = makeLiveRequest(listener.uri(), /*duration_seconds=*/10, /*rps=*/10,
                              /*flush_interval_seconds=*/1, /*live_streaming=*/true);
   auto r = stub_->ExecutionStream(&context_);
