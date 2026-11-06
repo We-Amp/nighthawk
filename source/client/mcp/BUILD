@@ -8,13 +8,14 @@ licenses(["notice"])  # Apache 2
 
 envoy_package()
 
-# FORK-ONLY (We-Amp): the MCP transport + dispatch skeleton (Task 1) plus the
-# steering tools and their driver (Task 2). Quarantined dependency surface:
-# the generated client protos, protobuf's JSON parser, absl, grpc++ (RunFeed's
-# transport), TCLAP for the flag surface, and the FTXUI-free client pieces
-# (client_headless; the run_feed / start_run_dialog / session_conversion /
-# knob_rules sub-libraries split out of tui_lib for exactly this) — NO FTXUI,
-# no tui_lib, no @envoy//source C++ targets (the standing cquery guard in
+# FORK-ONLY (We-Amp): the MCP transport + dispatch skeleton (Task 1), the
+# steering tools and their driver (Task 2), and the telemetry resources
+# (Task 3). Quarantined dependency surface: the generated client protos,
+# protobuf's JSON parser, absl, grpc++ (RunFeed's transport), TCLAP for the
+# flag surface, and the FTXUI-free client pieces (client_headless; the
+# run_feed / start_run_dialog / session_conversion / knob_rules
+# sub-libraries split out of tui_lib for exactly this) — NO FTXUI, no
+# tui_lib, no @envoy//source C++ targets (the standing cquery guard in
 # source/client/tui/README.md runs over the nighthawk_mcp binary built on
 # this library too).
 envoy_cc_library(
@@ -22,17 +23,20 @@ envoy_cc_library(
     srcs = [
         "json_util.cc",
         "mcp_main.cc",
+        "mcp_resources.cc",
         "mcp_server.cc",
         "mcp_tools.cc",
     ],
     hdrs = [
         "json_util.h",
         "mcp_main.h",
+        "mcp_resources.h",
         "mcp_server.h",
         "mcp_tools.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//api/client:base_cc_proto",
         "//source/client/headless:client_headless",
         "//source/client/tui:knob_rules_lib",
         "//source/client/tui:run_feed_lib",

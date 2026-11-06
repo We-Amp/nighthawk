@@ -17,6 +17,7 @@
 #include "grpc++/grpc++.h"
 #include "tclap/CmdLine.h"
 
+#include "source/client/mcp/mcp_resources.h"
 #include "source/client/mcp/mcp_server.h"
 #include "source/client/mcp/mcp_tools.h"
 
@@ -113,6 +114,7 @@ int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& ou
   ResourceRegistry resources;
   RegisterEchoTool(tools);
   RegisterSteeringTools(tools, controller);
+  RegisterTelemetryResources(resources, controller);
 
   // The waiter pool: the bounded tool waits (steer 4s, cancel_run 35s) run
   // here, OFF the dispatch loop, so ping answers during a wait.

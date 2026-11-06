@@ -82,6 +82,34 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): the MCP telemetry resources' contract pins (MCP plan
+# Task 3), driven over the same wire-faithful in-proc NighthawkService double
+# as mcp_tools_test, extended with a phased snapshot sequence (streamed
+# boundary events, censor-flagged) and a post-run Output with phase metadata
+# — the minimal wire shape the timeline resource consumes. Plain cc_test,
+# same quarantine reasoning.
+cc_test(
+    name = "mcp_resources_test",
+    srcs = ["mcp_resources_test.cc"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//api/client:grpc_service_lib",
+        "//source/client/headless:client_headless",
+        "//source/client/mcp:mcp_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@googletest//:gtest_main",
+        # mcp_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+        "@protobuf//:duration_cc_proto",
+    ],
+)
+
 # FORK-ONLY (We-Amp): session file format, writer/reader, and queue drop
 # contract tests. Plain cc_test for the same reason as tui_app_test: the TUI
 # quarantine keeps this off Envoy's C++ sources and test helpers.

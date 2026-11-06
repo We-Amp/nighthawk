@@ -10,7 +10,8 @@ envoy_package()
 
 # FORK-ONLY (We-Amp): the headless client pieces extracted from the TUI (MCP
 # plan Task 0) — the session file owner, the profile-window lifecycle state
-# machine, and the phase/epoch-stamped series view — plus the moved-as-is
+# machine, the phase/epoch-stamped series view, and the phase timeline
+# segment builders — plus the moved-as-is
 # session format pieces (session_writer/session_reader/session_framing) and
 # the run view model they read. Quarantined dependency surface: the generated
 # nighthawk client protos and absl ONLY — no FTXUI, no tui_lib, no
@@ -25,6 +26,7 @@ envoy_cc_library(
         "session_reader.cc",
         "session_recorder.cc",
         "session_writer.cc",
+        "timeline_segments.cc",
     ],
     hdrs = [
         "fold_tracker.h",
@@ -34,6 +36,7 @@ envoy_cc_library(
         "session_reader.h",
         "session_recorder.h",
         "session_writer.h",
+        "timeline_segments.h",
     ],
     visibility = ["//visibility:public"],
     deps = [

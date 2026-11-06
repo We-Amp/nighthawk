@@ -188,6 +188,19 @@ public:
   // renders this same object.
   google::protobuf::Struct BuildStatus();
 
+  // --- MCP plan Task 3: the telemetry resource payloads ---------------------
+  //
+  // Pure-store reads: nothing here blocks. series reads the live series the
+  // callbacks captured (exactly the records the session persists; fresher
+  // than nighthawk://session's sealed-prefix read, which sees only frames
+  // that reached the disk); timeline joins the boundary events and knob
+  // epochs with the TUI's segment builders; session reads the session file's
+  // sealed prefix with the torn-tail honesty. Payloads are rendered by
+  // mcp_resources' pure renderers (RenderSeriesPayload et al.).
+  google::protobuf::Struct BuildSeries();
+  google::protobuf::Struct BuildTimeline();
+  google::protobuf::Struct BuildSession();
+
   // The process-shutdown path (SIGTERM, stdin EOF): stops an in-flight run
   // (bounded wait for its terminal event), then seals the open session.
   // Idempotent; safe to call with nothing in flight.
@@ -229,6 +242,16 @@ private:
   nighthawk::client::LiveSnapshot last_snapshot_;
   bool has_snapshot_ = false;
   std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events_;
+  // The run's metric-series records (exactly what OnSnapshot persists to the
+  // session), for the nighthawk://series payload; kept in memory so the
+  // series resource is fresh — the session FILE's sealed prefix lags by the
+  // writer's buffered frames. Cleared at every start_run.
+  std::vector<nighthawk::client::MetricSeriesRecord> series_records_;
+  // The knob-epoch records built from the engine verdicts (applied AND
+  // rejected — WithEpochMarks/renderers keep the timeline truth: only an
+  // applied ack marks), for the nighthawk://timeline payload; the same
+  // filter as the session's knob_epoch records. Cleared at every start_run.
+  std::vector<nighthawk::client::KnobEpochRecord> knob_epochs_;
   // Update acks not yet consumed by a steer wait, with their arrival
   // sequence; correlation between results and waiters follows the engine's
   // delivery discipline (see Steer — the guard's rejections arrive in arm

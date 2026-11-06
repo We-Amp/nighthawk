@@ -23,6 +23,7 @@
 #include "source/client/headless/fold_tracker.h"
 #include "source/client/headless/session_recorder.h"
 #include "source/client/mcp/json_util.h"
+#include "source/client/mcp/mcp_resources.h"
 #include "source/client/tui/knob_rules.h"
 #include "source/client/tui/session_conversion.h"
 #include "source/client/tui/start_run_dialog.h"
@@ -568,9 +569,13 @@ void SteeringController::OnSnapshot(const nighthawk::client::LiveSnapshot& snaps
     std::lock_guard<std::mutex> lock(mutex_);
     last_snapshot_ = snapshot;
     has_snapshot_ = true;
+    // The series resource reads the records the session persists — built
+    // once here, kept fresh in memory (the file's sealed prefix lags by the
+    // writer's buffered frames) and persisted unchanged.
+    nighthawk::client::SessionRecord record;
+    *record.mutable_metric_series() = Tui::ToMetricSeries(snapshot);
+    series_records_.push_back(record.metric_series());
     if (recorder_.open()) {
-      nighthawk::client::SessionRecord record;
-      *record.mutable_metric_series() = Tui::ToMetricSeries(snapshot);
       recorder_.AppendSnapshot(std::move(record));
     }
   }
@@ -605,12 +610,14 @@ void SteeringController::OnUpdateResult(const nighthawk::client::UpdateResult& r
     update_results_.push_back(QueuedResult{++next_seq_, result});
     // The session's knob-epoch record: engine verdicts only — the
     // feed-generated pending surfacing ("run-feed: " prefix) is not one
-    // (the TUI pattern).
+    // (the TUI pattern). Built once and kept for the timeline resource
+    // (WithEpochMarks keeps the truth: only an applied ack marks).
     if (!absl::StartsWith(result.rejection_reason(), "run-feed: ")) {
+      nighthawk::client::SessionRecord record;
+      *record.mutable_knob_epoch() =
+          Tui::ToKnobEpochRecord(result, pending_phase_id_, pending_rps_, pending_ramp_bent_);
+      knob_epochs_.push_back(record.knob_epoch());
       if (recorder_.open()) {
-        nighthawk::client::SessionRecord record;
-        *record.mutable_knob_epoch() =
-            Tui::ToKnobEpochRecord(result, pending_phase_id_, pending_rps_, pending_ramp_bent_);
         recorder_.AppendSnapshot(std::move(record));
       }
     }
@@ -717,6 +724,8 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
     has_snapshot_ = false;
     last_snapshot_ = {};
     boundary_events_.clear();
+    series_records_.clear();
+    knob_epochs_.clear();
     update_results_.clear();
     final_output_ = {};
     start_request_ = request;
@@ -947,6 +956,60 @@ google::protobuf::Struct SteeringController::BuildStatus() {
     *phases.mutable_list_value()->add_values() = ToValue(phase);
   }
   return status;
+}
+
+google::protobuf::Struct SteeringController::BuildSeries() {
+  std::string session_path;
+  std::vector<nighthawk::client::MetricSeriesRecord> records;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    session_path = recorder_.path();
+    records = series_records_;
+  }
+  return RenderSeriesPayload(session_path, records);
+}
+
+google::protobuf::Struct SteeringController::BuildTimeline() {
+  nighthawk::client::CommandLineOptions options;
+  std::vector<nighthawk::client::PhaseBoundaryEvent> events;
+  std::vector<nighthawk::client::PhaseMetadata> metadata;
+  std::vector<nighthawk::client::KnobEpochRecord> epochs;
+  std::string current_phase;
+  std::string session_path;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    options = start_request_.options();
+    events = boundary_events_;
+    // The post-run source (the Output's phase metadata, complete cells);
+    // empty until the run finished, which selects the streamed-event path —
+    // BuildPhaseTimeline's source rule.
+    metadata.assign(final_output_.phase_metadata().begin(), final_output_.phase_metadata().end());
+    epochs = knob_epochs_;
+    current_phase = last_snapshot_.phase_id();
+    session_path = recorder_.path();
+  }
+  return RenderTimelinePayload(session_path, options, events, metadata, current_phase, epochs);
+}
+
+google::protobuf::Struct SteeringController::BuildSession() {
+  const std::string path = recorder_.path();
+  auto prefix = recorder_.ReadSealedPrefix();
+  if (!prefix.ok()) {
+    // No session yet (before the first start_run): an honest empty shape,
+    // not a protocol fault — a resource read is not a client error. The
+    // reader's reason travels as a note, not as a tail disclosure (nothing
+    // is torn; there is no file).
+    Struct out;
+    Struct provenance;
+    SetString(provenance, "session", path);
+    SetString(provenance, "source", "the session file's sealed prefix (flushed frames only)");
+    (*out.mutable_fields())["provenance"] = ToValue(provenance);
+    SetBool(out, "tail_skipped", false);
+    SetString(out, "note", prefix.status().message());
+    (*out.mutable_fields())["records"].mutable_list_value();
+    return out;
+  }
+  return RenderSessionPayload(path, *prefix);
 }
 
 void SteeringController::SealSession(bool completed) {
