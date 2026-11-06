@@ -98,13 +98,13 @@ TEST(KnobPaneTest, KnobPaneMarksLiveVsPhaseGated) {
   EXPECT_NE(lineContaining(lines, "connections").find("PHASE-GATED"), std::string::npos);
   EXPECT_NE(lineContaining(lines, "queue bounds").find("PHASE-GATED"), std::string::npos);
 
-  // The M3 header: live steering (the u key) and the phase-total semantics;
-  // the display-only banner is gone.
+  // The M3 header: live steering (the u key) and the total-across-workers
+  // semantics of every rps value; the display-only banner is gone.
   std::string text;
   for (const std::string& line : lines) {
     text += line + "\n";
   }
-  EXPECT_NE(text.find("phase total"), std::string::npos);
+  EXPECT_NE(text.find("total across the active workers"), std::string::npos);
   EXPECT_NE(text.find("press u"), std::string::npos);
   EXPECT_EQ(text.find("display-only"), std::string::npos);
 

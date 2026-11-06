@@ -358,9 +358,10 @@ ftxui::Element RenderKeyBar(InputMode mode, bool running, bool session_open, int
   } else if (mode == InputMode::kEditingSearch) {
     bar = "type to search | enter apply | esc cancel";
   } else if (mode == InputMode::kEditingKnob) {
-    // The M3 rps turn: the typed value is the PHASE TOTAL (the knob speaks
-    // global rps; the engine divides at fan-out).
-    bar = "digits: new rps (phase total) | enter: turn | esc: cancel";
+    // The M3 rps turn: the typed value is the GLOBAL total (the knob speaks
+    // global rps; the engine divides it across the active workers at
+    // fan-out).
+    bar = "digits: new rps (total across workers) | enter: turn | esc: cancel";
   } else if (active_tab == 1) {
     // The flame tab: the pane's own keys (the key map table's flame rows).
     bar = "Arrows nav | Enter zoom | Esc root | / find | p win | d diff | N noise";
@@ -416,7 +417,7 @@ const std::vector<KeyBinding>& KeyBindingTable() {
       {"d", "differential (default: last two pure)"},
       {"N", "noise-floor view (plain n stays dialog)"},
       {"e", "stage an edit for the next phase (knobs tab; esc discards)"},
-      {"u", "turn the rps knob (knobs tab, live run; the PHASE TOTAL)"},
+      {"u", "turn the rps knob (knobs tab, live run; the total across workers)"},
   };
   return *table;
 }
@@ -441,7 +442,7 @@ ftxui::Element RenderHelpOverlay() {
   lines.push_back(ftxui::text(borderedRow("  n               open the start-run dialog", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  d / N           differential | noise-floor view", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  s / q           stop the run | quit (run stops first)", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  u               turn the rps knob (PHASE TOTAL, live run)", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  u               turn the rps knob (the total, live run)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  Arrows          flame frame navigation (flame tab)", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  Enter           zoom to the selected frame", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  Esc/Backspace   unzoom to the tree root", inner_width)));
@@ -452,7 +453,7 @@ ftxui::Element RenderHelpOverlay() {
   lines.push_back(ftxui::text(borderedRow("  state/elapsed  idle|running|completed|stopped; 39s/60s", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  target         uri under load; (target pending) pre-ack", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  phase/epoch    live phase and knob epoch of the latest flush", inner_width)));
-  lines.push_back(ftxui::text(borderedRow("  rps semantics  rps values are PHASE TOTALS across workers", inner_width)));
+  lines.push_back(ftxui::text(borderedRow("  rps semantics  rps values are TOTALS across all workers", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  flush 1s       chart cadence: one column per flush", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  4xx/rst/t/o    per-flush client-side failure rates", inner_width)));
   lines.push_back(ftxui::text(borderedRow("  session        session recording path", inner_width)));

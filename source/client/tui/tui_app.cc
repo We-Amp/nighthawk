@@ -668,9 +668,10 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
   }
 
   // The live rps knob turn (M3, knobs tab + a live run): typed digits are
-  // the new PHASE TOTAL rps; enter sends the update (the pending state and
-  // the ack flow through the controller's knob tracker), esc cancels. The
-  // suspension rule is the M0b pattern: exactly one forced redraw on exit.
+  // the new total-across-workers rps; enter sends the update (the pending
+  // state and the ack flow through the controller's knob tracker), esc
+  // cancels. The suspension rule is the M0b pattern: exactly one forced
+  // redraw on exit.
   if (state.mode == InputMode::kEditingKnob) {
     if (event == Event::Escape) {
       state.knob_draft.clear();
@@ -682,7 +683,8 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
     if (event == Event::Return) {
       uint32_t value = 0;
       if (!absl::SimpleAtoi(state.knob_draft, &value) || value == 0) {
-        controller.NoteFlameStatus("rps turn: enter a positive integer (the phase total)");
+        controller.NoteFlameStatus(
+            "rps turn: enter a positive integer (the total across workers)");
         return true;
       }
       const absl::Status turned = controller.TurnRps(value);
@@ -1452,7 +1454,13 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
             ? parsed
             : 1;
     // M3 knob state: fresh per run; the starting acked value is the run's
-    // configured rps (the configured PHASE TOTAL).
+    // GLOBAL rps — the same construction semantics the engine's live
+    // baseline uses (ComputeCurrentScheduleDelta): on a legacy or plugin
+    // run the top-level flag is the PER-WORKER rate at construction, so the
+    // display seed is flag x workers; on a phase run the declared phase rps
+    // is already global. Seeding the bare flag displayed a per-worker
+    // number as the operating point: a no-op knob turn at the displayed
+    // value was an N-fold load cut on a legacy run.
     rps_tracker_ = KnobTurnTracker{};
     knob_epoch_marks_.clear();
     epoch_marks_.clear();
@@ -1460,8 +1468,9 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     pending_new_rps_ = 0;
     pending_phase_id_.clear();
     pending_ramp_bent_ = false;
-    if (request.options().has_requests_per_second()) {
-      rps_tracker_.SeedAckedValue(request.options().requests_per_second().value());
+    const uint32_t seed_rps = SeedGlobalRpsBaseline(request.options(), worker_count_);
+    if (seed_rps > 0) {
+      rps_tracker_.SeedAckedValue(seed_rps);
     }
   }
   store_.store(model_);
@@ -1737,7 +1746,7 @@ absl::Status RunController::TurnRps(uint32_t new_rps) {
       return absl::FailedPreconditionError(
           "a knob turn is already pending: wait for its ack or rejection");
     }
-    // Send-time context for the session record: the attempted phase-total
+    // Send-time context for the session record: the attempted global-total
     // rps, the phase it was sent from, and whether the rps delta is a ramp
     // bend (C1 — the ENGINE's exact plugin rule, not any named plugin).
     pending_new_rps_ = new_rps;

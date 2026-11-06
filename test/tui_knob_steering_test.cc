@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -218,9 +219,9 @@ TEST(KnobTurnRenderTest, KnobStatesRenderVisuallyDistinct) {
   EXPECT_NE(pending_text.find("-> 300"), std::string::npos) << pending_text;
   EXPECT_EQ(acked_text.find("300"), std::string::npos) << acked_text;
 
-  // Every rps surface carries the phase-total disclosure (the knob speaks
+  // Every rps surface carries the total disclosure (the knob speaks
   // GLOBAL rps).
-  EXPECT_NE(acked_text.find("phase total"), std::string::npos) << acked_text;
+  EXPECT_NE(acked_text.find("(total)"), std::string::npos) << acked_text;
 
   // The staged state (M2 preview) stays distinct from every live state.
   EXPECT_EQ(std::string(KnobTurnStateMarker(KnobTurnState::kStaged)), "STAGED");
@@ -456,6 +457,97 @@ TEST(RampBentRuleTest, OnlyTheLinearRampingPluginBends) {
 }
 
 // ---------------------------------------------------------------------------
+// The legacy-display honesty fix: the pane's STARTING acked rps is the
+// GLOBAL total the engine's live baseline is built from
+// (ComputeCurrentScheduleDelta's construction semantics). On a legacy or
+// plugin run every worker's limiter is constructed at the top-level flag
+// PER WORKER, so the display seed is flag x workers; on a phase run the
+// declared phase rps is already global. Seeding the bare flag made a no-op
+// knob turn at the displayed value an N-fold load cut on a legacy run.
+// ---------------------------------------------------------------------------
+
+TEST(SeedGlobalRpsTest, LegacyRunSeedsFlagTimesWorkers) {
+  nighthawk::client::CommandLineOptions options;
+  options.mutable_requests_per_second()->set_value(100);
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/1), 100);
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/4), 400);
+  // A zero worker count floors at one worker (the engine's rule).
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/0), 100);
+}
+
+TEST(SeedGlobalRpsTest, LegacyOverflowClampsAtUint32Max) {
+  nighthawk::client::CommandLineOptions options;
+  options.mutable_requests_per_second()->set_value(1000000);
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/100000),
+            std::numeric_limits<uint32_t>::max());
+}
+
+TEST(SeedGlobalRpsTest, PhaseRunSeedsTheDeclaredPhaseTotalNotTheFlag) {
+  nighthawk::client::CommandLineOptions options;
+  options.mutable_requests_per_second()->set_value(100);
+  auto* phase = options.add_phases();
+  phase->set_name("spike");
+  phase->set_requests_per_second(500);
+  auto* sustain = options.add_phases();
+  sustain->set_name("sustain");
+  sustain->set_requests_per_second(300);
+  // Phase 0 is the current phase at seed time; its declared rps is the
+  // global baseline (the flag is not).
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/8), 500);
+}
+
+TEST(SeedGlobalRpsTest, PhaseWithUnsetRpsFallsBackToTheFlag) {
+  nighthawk::client::CommandLineOptions options;
+  options.mutable_requests_per_second()->set_value(100);
+  auto* phase = options.add_phases();
+  phase->set_name("coast");
+  // The engine's fallback: a phase that leaves rps unset reads the flag.
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/4), 100);
+}
+
+TEST(SeedGlobalRpsTest, NoConfiguredRpsSeedsNothing) {
+  nighthawk::client::CommandLineOptions options;
+  EXPECT_EQ(SeedGlobalRpsBaseline(options, /*worker_count=*/4), 0);
+}
+
+// The flow pin: a legacy 4-worker run's pane displays the TOTAL (flag x
+// workers), never the bare flag; a phase run's display stays the declared
+// global. startRun seeds the tracker before the feed's start attempt, so
+// the acked state is checkable over an unroutable channel — the seed is
+// what the pane shows in the failed-start state too.
+TEST(SeedGlobalRpsTest, ControllerSeedsTheLegacyTotalAndThePhaseGlobal) {
+  auto channel = grpc::CreateChannel("127.0.0.1:1", grpc::InsecureChannelCredentials());
+  nighthawk::client::StartRequest request;
+  auto* options = request.mutable_options();
+  options->mutable_requests_per_second()->set_value(100);
+  options->mutable_concurrency()->set_value("4");
+  options->mutable_uri()->set_value("http://127.0.0.1:1/x");
+  {
+    RunController controller(channel, tempPath("seed-legacy"));
+    (void)controller.startRun(request);
+    EXPECT_EQ(controller.rpsTurnState().acked_value, "400");
+    const std::string text =
+        screenText(RenderLiveKnobTurns(controller.rpsTurnState(), 120, 5), 120, 5);
+    EXPECT_NE(text.find("400"), std::string::npos) << text;
+    EXPECT_NE(text.find("(total)"), std::string::npos) << text;
+    EXPECT_EQ(text.find("100 ("), std::string::npos)
+        << "the bare flag must not be the displayed operating point:\n"
+        << text;
+  }
+  // Phase run: the seed is the declared phase rps (the global total), not
+  // the flag — the display language is unchanged there.
+  auto* phase = options->add_phases();
+  phase->set_name("spike");
+  phase->set_requests_per_second(500);
+  options->clear_concurrency();
+  {
+    RunController controller(channel, tempPath("seed-phase"));
+    (void)controller.startRun(request);
+    EXPECT_EQ(controller.rpsTurnState().acked_value, "500");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fix round: the failed-pending surfacing must survive the run's END. The
 // shell's frame gate used to read runInProgress(); the feed fires its run-end
 // pending surfacing exactly when that flag is gone, so the failed frame never
@@ -638,17 +730,23 @@ TEST(KnobNoteRoutingTest, KnobsTabRendersTheStatusNote) {
 }
 
 // ---------------------------------------------------------------------------
-// The M3 pane header: the display-only banner is GONE; the phase-total
-// semantics render on the pane.
+// The M3 pane header: the display-only banner is GONE; the global-total
+// semantics render on the pane. The rps language is the total across the
+// active workers — true on every run shape now that the seed is the
+// construction-honest global (flag x workers on a legacy run, the declared
+// phase total on a phase run); the legacy "phase total" vocabulary is gone.
 // ---------------------------------------------------------------------------
 
-TEST(KnobPaneBannerTest, BannerGoneAndPhaseTotalStated) {
+TEST(KnobPaneBannerTest, BannerGoneAndTotalAcrossWorkersStated) {
   nighthawk::client::CommandLineOptions options;
   options.mutable_requests_per_second()->set_value(100);
   const std::string text = screenText(RenderKnobPane(KnobsFromOptions(options), 100, 10), 100, 10);
   EXPECT_EQ(text.find("display-only"), std::string::npos) << text;
   EXPECT_EQ(text.find("steering lands in M3"), std::string::npos) << text;
-  EXPECT_NE(text.find("phase total"), std::string::npos) << text;
+  EXPECT_NE(text.find("total across the active workers"), std::string::npos) << text;
+  EXPECT_EQ(text.find("phase total"), std::string::npos)
+      << "the rps language is the total across workers on every shape:\n"
+      << text;
   EXPECT_NE(text.find("LIVE"), std::string::npos) << text;
 }
 

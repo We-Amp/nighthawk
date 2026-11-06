@@ -22,10 +22,11 @@ constexpr const char* kLiveTag = "LIVE";
 constexpr const char* kPhaseGatedTag = "PHASE-GATED";
 constexpr const char* kStagedTag = "STAGED";
 constexpr const char* kInheritSuffix = " (inherit)";
-// The phase-total disclosure riding on every rps surface (the knob speaks
-// GLOBAL rps: the engine divides the value across the active workers at
-// fan-out — turning rps to X means X total, not X per worker).
-constexpr const char* kPhaseTotalSuffix = " (phase total)";
+// The total disclosure riding on every rps surface (the knob speaks GLOBAL
+// rps: the engine divides the value across the active workers at fan-out —
+// turning rps to X means X total, not X per worker; the seed is the
+// construction-honest total too, flag x workers on a legacy run).
+constexpr const char* kTotalSuffix = " (total)";
 // Column the value starts at (the name field's fixed width); the steering tag
 // trails the value after a second fixed-width column.
 constexpr int kNameColumn = 14;
@@ -126,10 +127,12 @@ ftxui::Element RenderKnobPane(const std::vector<KnobDisplay>& knobs, int width, 
   }
   std::vector<ftxui::Element> rows;
   // The M3 header: the pane is live — the banner names the live knob and the
-  // turn key, and states the phase-total semantics of every rps value (the
-  // global-rps copy discipline; the M0b display-only banner is gone).
-  rows.push_back(ftxui::text(
-      "knobs (live: rps - press u to turn; every rps value is the phase total)"));
+  // turn key, and states the global-total semantics of every rps value (the
+  // total across the active workers is true on every run shape: the declared
+  // phase rps on a phase run, flag x workers on a legacy run; the M0b
+  // display-only banner is long gone).
+  rows.push_back(ftxui::text("knobs (live: rps - press u to turn; every rps value is the "
+                             "total across the active workers)"));
   for (const KnobDisplay& knob : knobs) {
     rows.push_back(ftxui::text(knobLine(knob)));
   }
@@ -212,6 +215,32 @@ bool RpsTurnBendsRamp(const nighthawk::client::CommandLineOptions& options) {
          options.rate_limiter_plugin_config().name() == kRampingPluginName;
 }
 
+uint32_t SeedGlobalRpsBaseline(const nighthawk::client::CommandLineOptions& options,
+                               uint32_t worker_count) {
+  // The display-side twin of the engine's ComputeCurrentScheduleDelta
+  // baseline rule (process_impl): the declared GLOBAL rps of the run's
+  // starting operating point. The engine value itself is not reachable here
+  // (it lives behind ProcessImpl + Client::Options, past the proto seam the
+  // TUI sees), so the rule is mirrored, and pinned against the engine's in
+  // live_update_test. On a phase run the phase-begin loop divides the
+  // phase's declared rps, so it is already global; on a legacy or plugin
+  // run every worker's limiter is CONSTRUCTED at the top-level flag per
+  // worker, so the global total is flag x workers. Seeding the bare flag
+  // made the pane display a per-worker number as the operating point: a
+  // no-op knob turn at the displayed value was an N-fold load cut.
+  const uint32_t flag_rps =
+      options.has_requests_per_second() ? options.requests_per_second().value() : 0;
+  if (!options.phases().empty()) {
+    // Phase run: phase 0 is the current phase at seed time. A phase that
+    // leaves rps unset falls back to the flag, exactly as the engine reads
+    // it (the proto pins PhaseSpec rps >= 1, so this is the defensive path).
+    const uint32_t phase_rps = options.phases(0).requests_per_second();
+    return phase_rps > 0 ? phase_rps : flag_rps;
+  }
+  const uint64_t global = static_cast<uint64_t>(flag_rps) * std::max<uint32_t>(worker_count, 1u);
+  return static_cast<uint32_t>(std::min<uint64_t>(global, std::numeric_limits<uint32_t>::max()));
+}
+
 bool LiveKnobTurnSurfaceable(const LiveKnobTurn& turn) {
   // The pristine tracker (never seeded, nothing pending, no note) says
   // nothing; every other state does. A rejected/failed-pending outcome
@@ -226,10 +255,10 @@ ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int 
     return ftxui::emptyElement();
   }
   std::vector<ftxui::Element> rows;
-  // The acked value carries the phase-total disclosure; a pending/rejected/
+  // The acked value carries the total disclosure; a pending/rejected/
   // failed turn shows the attempted value in the transition.
   std::string value = rps_turn.acked_value.empty() ? std::string(kUnsetValue)
-                                                   : rps_turn.acked_value + kPhaseTotalSuffix;
+                                                   : rps_turn.acked_value + kTotalSuffix;
   std::string line = absl::StrCat("rps", ": ", value);
   switch (rps_turn.state) {
   case KnobTurnState::kCurrentAcked:

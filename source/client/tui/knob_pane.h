@@ -99,9 +99,9 @@ absl::string_view KnobTurnStateMarker(KnobTurnState state);
 // one-outstanding discipline; the controller refuses earlier still).
 class KnobTurnTracker {
 public:
-  // The run's configured rps (the starting acked value — the configured
-  // PHASE TOTAL); seeded by the controller at run start. No-op while a turn
-  // is pending.
+  // The run's starting GLOBAL rps (the starting acked value — see
+  // SeedGlobalRpsBaseline for the construction semantics); seeded by the
+  // controller at run start. No-op while a turn is pending.
   void SeedAckedValue(uint32_t rps);
   // Begins a turn of the rps knob to `new_rps` (the PHASE TOTAL). A stale
   // rejection/failed note is dismissed by the turn.
@@ -121,8 +121,8 @@ private:
 
 // The live knob-turn lines for the knobs tab: the rps turn rendered with its
 // state marker (acked/pending/rejected/failed) and, outside the acked state,
-// the inline reason or the pending transition; rps values carry the phase-
-// total disclosure. Pure.
+// the inline reason or the pending transition; rps values carry the total-
+// across-workers disclosure. Pure.
 ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height);
 
 // Whether the knobs tab must render the live-turn line: true whenever the
@@ -142,6 +142,19 @@ bool LiveKnobTurnSurfaceable(const LiveKnobTurn& turn);
 // rate-limiter-plugin"). Any other named limiter plugin does NOT bend
 // (the session record must not claim a bend that never happened). Pure.
 bool RpsTurnBendsRamp(const nighthawk::client::CommandLineOptions& options);
+
+// The run's starting GLOBAL rps — the display-side twin of the engine's live
+// baseline (ComputeCurrentScheduleDelta's construction semantics), used to
+// seed the knob pane's acked value. On a phase run the declared phase rps is
+// already global (phase begin divides it across the active workers), so the
+// first phase's declared rps IS the seed; on a legacy or plugin run every
+// worker's limiter is constructed at the top-level flag PER WORKER, so the
+// global total is flag x `worker_count` (clamped at the uint32 ceiling; a
+// zero worker count floors at one). A phase that leaves rps unset falls back
+// to the flag, exactly as the engine reads it. Returns 0 when no rps is
+// configured at all — the caller seeds nothing in that case. Pure.
+uint32_t SeedGlobalRpsBaseline(const nighthawk::client::CommandLineOptions& options,
+                               uint32_t worker_count);
 
 // ---------------------------------------------------------------------------
 // M2: the staged next-phase preview (spec §4 knob state machine). While a

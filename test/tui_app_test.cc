@@ -50,7 +50,7 @@ TEST(KeyMapTest, BindingsMatchTheDocumentedTable) {
       {"d", "differential (default: last two pure)"},
       {"N", "noise-floor view (plain n stays dialog)"},
       {"e", "stage an edit for the next phase (knobs tab; esc discards)"},
-      {"u", "turn the rps knob (knobs tab, live run; the PHASE TOTAL)"},
+      {"u", "turn the rps knob (knobs tab, live run; the total across workers)"},
   };
   ASSERT_EQ(bindings.size(), expected.size());
   for (size_t i = 0; i < expected.size(); ++i) {

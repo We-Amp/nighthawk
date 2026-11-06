@@ -325,9 +325,9 @@ TEST(LayoutTest, KnobsTabRendersTheKnobPane) {
   for (const std::string& line : screenLines(element, 100, 30)) {
     text += line + "\n";
   }
-  // M3: the pane is live — the phase-total semantics render, the
+  // M3: the pane is live — the total-across-workers semantics render, the
   // display-only banner is gone.
-  EXPECT_NE(text.find("phase total"), std::string::npos);
+  EXPECT_NE(text.find("total across the active workers"), std::string::npos);
   EXPECT_NE(text.find("LIVE"), std::string::npos);
   EXPECT_NE(text.find("PHASE-GATED"), std::string::npos);
   EXPECT_NE(text.find("100"), std::string::npos);

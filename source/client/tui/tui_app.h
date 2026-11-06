@@ -298,8 +298,8 @@ public:
 
   // --- M3 live knob steering (Task 8, spec §4 B) ---------------------------
   //
-  // Turns the rps knob to `new_rps` (the PHASE TOTAL per the global-rps
-  // ruling: the engine divides across the active workers at fan-out) on the
+  // Turns the rps knob to `new_rps` (the total across the active workers
+  // per the global-rps ruling: the engine divides it at fan-out) on the
   // in-flight run: one KnobDelta goes out via the feed's update channel, the
   // knob state moves to pending-apply (the timeline marks NOTHING yet), and
   // the engine's verdict arrives via onUpdateResult. kFailedPrecondition
@@ -366,7 +366,7 @@ private:
   // inputs; NOT the timeline marks — those are the acks above).
   std::vector<EpochMark> epoch_marks_;
   std::string last_seen_epoch_id_;
-  // Send-time context for the session record: the attempted phase-total
+  // Send-time context for the session record: the attempted global-total
   // rps, the phase it was sent from, and whether the run's ramp plugin
   // makes the rps delta a ramp bend (C1).
   uint32_t pending_new_rps_ = 0;
