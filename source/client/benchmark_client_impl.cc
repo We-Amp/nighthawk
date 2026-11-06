@@ -354,6 +354,17 @@ void BenchmarkClientHttpImpl::handleResponseData(const Envoy::Buffer::Instance& 
 }
 
 void BenchmarkClientHttpImpl::onPoolFailure(Envoy::Http::ConnectionPool::PoolFailureReason reason) {
+  // FORK-ONLY (We-Amp): a request that fails at the connection pool is
+  // complete as an attempt, but only onComplete moved requests_completed_,
+  // so the failed attempt stayed in the in-flight count FOREVER. The phase
+  // boundary drain watches the client's in-flight count (it is the drain
+  // observable), so one pool failure made inFlightRequests() never reach
+  // zero again: every later boundary drained censored at the full budget
+  // (the M3 acceptance's `drain 30.0s gap 0.0s cens` at 16 workers, where
+  // the open-loop bend load provably overflows the workers' pools --
+  // initiated-completed stuck at exactly one leaked request per worker).
+  // Count the failure so the in-flight observable can return to zero.
+  requests_completed_++;
   switch (reason) {
   case Envoy::Http::ConnectionPool::PoolFailureReason::Overflow:
     benchmark_client_counters_.pool_overflow_.inc();

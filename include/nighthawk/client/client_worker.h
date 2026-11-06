@@ -111,10 +111,14 @@ public:
    * FORK-ONLY (We-Amp): M3 Task 6 -- registers an observer invoked on the
    * worker's dispatcher inside the sequencer's stop hook when a NON-final
    * phase ends (the boundary begins, possibly EARLY via a termination
-   * predicate). The process uses it to open the boundary-drain live-update
-   * gate. Set before the worker thread starts; default no-op.
+   * predicate). The fire carries the boundary index the stop hook belongs
+   * to: the process scopes the boundary-drain live-update gate open by it,
+   * so a straggler whose sequencer stops only after its boundary was
+   * collected (and the successor began) reports a stale index the process
+   * can ignore instead of re-opening the gate mid-successor-phase. Set
+   * before the worker thread starts; default no-op.
    */
-  virtual void setSequencerStopObserver(std::function<void()> observer) {
+  virtual void setSequencerStopObserver(std::function<void(uint32_t)> observer) {
     std::ignore = observer;
   }
 

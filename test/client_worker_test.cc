@@ -350,5 +350,71 @@ TEST_F(ClientWorkerPhaseTest, StragglerStopAfterNextBeginCompletesOnlyItsOwnAck)
   worker.shutdown();
 }
 
+// FORK-ONLY (m3-drain-pair): the boundary-drain gate's scoping input. The
+// stop hook fires the process observer from inside the straggler's late
+// stop; the fire must carry the boundary index the hook belongs to -- never
+// the successor's -- so the process can scope the gate open by index and
+// ignore the stale fire (see BoundaryDrainGateTest).
+TEST_F(ClientWorkerPhaseTest, StragglerLateStopReportsItsOwnBoundaryIndex) {
+  ClientWorkerImpl worker(*api_, tls_, cluster_manager_ptr_, benchmark_client_factory_,
+                          predicate_factory_, sequencer_factory_, request_generator_factory_,
+                          store_, 0, api_->timeSource().monotonicTime(), tracer_,
+                          ClientWorkerImpl::HardCodedWarmupStyle::OFF, {}, {},
+                          /*live_snapshot_interval=*/{}, /*phase_driven_run=*/true);
+  std::atomic<uint64_t> in_flight{1}; // phase 0's hung request
+  ON_CALL(*benchmark_client_, inFlightRequests())
+      .WillByDefault(Invoke([&in_flight]() { return in_flight.load(); }));
+  ON_CALL(*benchmark_client_, tryStartRequest(_)).WillByDefault(Return(false));
+
+  std::mutex observed_mutex;
+  std::vector<uint32_t> observed;
+  worker.setSequencerStopObserver([&](uint32_t boundary_index) {
+    std::lock_guard<std::mutex> lock(observed_mutex);
+    observed.push_back(boundary_index);
+  });
+
+  worker.start();
+  ASSERT_EQ(std::future_status::ready, worker.readyFuture().wait_for(std::chrono::seconds(5)));
+
+  nighthawk::client::PhaseSpec phase;
+  phase.set_name("phase");
+  phase.set_requests_per_second(1);
+  phase.mutable_duration()->set_seconds(1);
+
+  auto future0 = worker.beginPhaseAsync(0, phase, /*final_phase=*/false);
+  auto future1 = worker.beginPhaseAsync(1, phase, /*final_phase=*/false);
+  const auto wait_until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (predicate_factory_.created() < 2 && std::chrono::steady_clock::now() < wait_until) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GE(predicate_factory_.created(), 2u);
+
+  // The straggler stops AFTER the successor's begin ran; its hung in-flight
+  // request completes so its boundary drain watch fires inside the stop.
+  predicate_factory_.terminate(0);
+  in_flight.store(0);
+  ASSERT_EQ(std::future_status::ready, future0.wait_for(std::chrono::seconds(5)));
+  EXPECT_GE(future0.get().sequencer_stop_monotonic_ns, 0);
+
+  // Exactly one observer fire, and it carries the STRAGGLER's boundary (0):
+  // the successor's boundary index (1) never escapes a boundary-1 stop hook,
+  // because phase 1's sequencer has not stopped here.
+  {
+    std::lock_guard<std::mutex> lock(observed_mutex);
+    ASSERT_EQ(1, observed.size());
+    EXPECT_EQ(0u, observed[0])
+        << "the straggler's late stop must report its own boundary index";
+  }
+
+  // The successor's lifecycle is intact.
+  predicate_factory_.terminate(1);
+  ASSERT_EQ(std::future_status::ready, future1.wait_for(std::chrono::seconds(5)));
+  EXPECT_GE(future1.get().sequencer_stop_monotonic_ns, 0);
+
+  worker.goIdleAsync(/*exit_dispatcher=*/true);
+  worker.waitForCompletion();
+  worker.shutdown();
+}
+
 } // namespace Client
 } // namespace Nighthawk

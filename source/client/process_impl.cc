@@ -877,7 +877,7 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
     // begins); runPhases closes the gate when the drain is collected. Set
     // before the worker thread starts.
     workers_.back()->setSequencerStopObserver(
-        [this]() { setBoundaryDrainInProgress(true); });
+        [this](uint32_t boundary_index) { openBoundaryDrainGate(boundary_index); });
     if (options_.hasPhaseVector()) {
       // FORK-ONLY (We-Amp): the phase orchestrator waits on these before
       // posting the first begin-phase: begin-phase must not land while a
@@ -1342,9 +1342,12 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
 // termination predicate), cleared by runPhases when the boundary's drain is
 // collected. An update arriving inside the window is rejected with a clear
 // reason.
-void ProcessImpl::setBoundaryDrainInProgress(bool in_progress) {
-  std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
-  boundary_drain_in_progress_ = in_progress;
+void ProcessImpl::openBoundaryDrainGate(uint32_t boundary_index) {
+  boundary_drain_gate_.open(boundary_index);
+}
+
+void ProcessImpl::closeBoundaryDrainGate(uint32_t boundary_index) {
+  boundary_drain_gate_.close(boundary_index);
 }
 
 void ProcessImpl::setCurrentPhaseId(absl::string_view phase_id,
@@ -1402,7 +1405,7 @@ std::string ProcessImpl::currentPhaseId() const {
 
 absl::Status ProcessImpl::liveUpdateAdmissionStatus() const {
   std::lock_guard<std::mutex> lock(current_phase_id_mutex_);
-  if (boundary_drain_in_progress_) {
+  if (boundary_drain_gate_.in_progress()) {
     return absl::FailedPreconditionError(
         "the run is inside a phase boundary drain; live updates are rejected "
         "there (the operating point is undefined mid-drain, and a bend is "
@@ -1762,7 +1765,7 @@ void ProcessImpl::runPhases() {
           std::chrono::duration_cast<std::chrono::milliseconds>(phase_duration_ns) +
           std::chrono::milliseconds(1000));
       orchestrator.collectDrainAcks(drain_acks, drain_budget, phase_index, stop_grace);
-      setBoundaryDrainInProgress(false);
+      closeBoundaryDrainGate(phase_index);
     }
   }
 
