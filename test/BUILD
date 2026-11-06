@@ -96,6 +96,20 @@ cc_test(
         "//api/client:grpc_service_lib",
         "//source/client/headless:client_headless",
         "//source/client/mcp:mcp_lib",
+# FORK-ONLY (We-Amp): the MCP profile-window + differential tools' contract
+# pins (MCP plan Task 4), driven against the same wire-faithful in-proc
+# NighthawkService double the steering suite pins plus a stub admin endpoint
+# answering the POST-only /cpuprofiler mutators, and fixture profile bytes
+# through the volume-mount retriever. Plain cc_test, same quarantine
+# reasoning as mcp_tools_test.
+cc_test(
+    name = "mcp_profile_test",
+    srcs = ["mcp_profile_test.cc"],
+    deps = [
+        "//api/client:grpc_service_lib",
+        "//api/pprof:profile_cc_proto",
+        "//source/client/mcp:mcp_lib",
+        "//source/client/tui:profile_pipeline_lib",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",

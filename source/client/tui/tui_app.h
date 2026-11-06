@@ -28,6 +28,7 @@
 #include "source/client/tui/layout.h"
 #include "source/client/tui/pprof_worker_pool.h"
 #include "source/client/tui/profile_fetcher.h"
+#include "source/client/tui/profile_pipeline.h"
 #include "source/client/tui/profile_windows.h"
 #include "source/client/tui/run_feed.h"
 #include "source/client/tui/start_run_dialog.h"
@@ -39,75 +40,11 @@ namespace Tui {
 
 // The clock anchor pair (ClockAnchor) and the completed-work merge
 // (MergeCompletedSeries) moved to the headless extraction
-// (source/client/headless/series_view.h) — same namespace, so the TUI's call
-// sites read unchanged.
-
-// The M1 profiling configuration, gathered from the nighthawk_tui flags (plan
-// task 6: --admin-base, --profile-retriever, --profile-mount, --scp-host,
-// --sut-profile-path, --profile-staging, --pprof-tool, --sut-binary,
-// --profile-window-seconds, plus the PPROF_BINARY_PATH environment for the
-// symbolizer child).
-struct ProfilePipelineConfig {
-  enum class RetrieverKind { kVolumeMount, kScp };
-
-  AdminEndpoints admin;
-  RetrieverKind retriever_kind = RetrieverKind::kVolumeMount;
-  // Retriever: the mount root (bind-mount translation by basename) or the
-  // scp destination ("user@host").
-  std::string mount_root;
-  std::string scp_host;
-  // The SUT-side path the profiler writes (admin.profile_path); the
-  // retriever fetches this path.
-  std::string sut_profile_path;
-  // Local staging directory fetched profiles land in.
-  std::string staging_dir;
-  // The --pprof-tool argv prefix (symbolizer provenance + invocation).
-  std::vector<std::string> pprof_tool_argv{"go", "tool", "pprof"};
-  // PPROF_BINARY_PATH value for the symbolizer child env (binary
-  // reachability); empty = not provided.
-  std::string pprof_binary_path;
-  // The SUT binary path inside the layout (--sut-binary); empty = no
-  // symbolization attempted (the raw-proto fallback path only).
-  std::string sut_binary_path;
-  // Default profile window length for the p flow (5s; the dialog variant of
-  // the plan sketch was collapsed into this fixed default + flag — see the
-  // task report).
-  int window_seconds = 5;
-  // TEST-ONLY seam (M1 final fixes): delays FetchProfile's retrieval inside
-  // the pool job so a test can land the run's end inside the retrieval
-  // window (the straddle-belt case). Production keeps 0.
-  int test_retriever_delay_ms = 0;
-  // TEST-ONLY seam (M2 fix round, same pattern): REPLACES the run's captured
-  // boundary events for the split alignment, so a wiring test can place the
-  // boundary deterministically (fixed offsets from its own t0) instead of
-  // racing a live phase run's emit timing. Production keeps it empty — the
-  // real intake is the streamed events.
-  std::vector<nighthawk::client::PhaseBoundaryEvent> test_boundary_events;
-};
-
-// One pool job's captured inputs: everything StopProfileWindowAndFold grabs
-// on the steering thread, so the job itself touches only its own copies plus
-// the stores. Captured BEFORE the fetch — a run that ends while the fetch
-// runs is exactly the excluded-and-marked straddle case.
-struct ProfileJobInput {
-  ClockAnchor anchor;
-  int64_t run_start_unix_ns = 0;
-  bool run_finished = false;
-  int64_t run_end_unix_ns = 0;
-  uint64_t worker_count = 1;
-  std::vector<CounterPoint> completed_series;
-  // M2 Task 7: the run's streamed boundary events and the phase specs —
-  // non-empty events switch the alignment to the split-at-boundary producer
-  // (engine intervals joined on the (wall, monotonic) pairs, DQ-3); empty
-  // events keep the M1 legacy single-interval path.
-  std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events;
-  std::vector<nighthawk::client::PhaseSpec> phase_specs;
-  // M3 Task 8: the run's applied knob-epoch change marks (epoch id + the
-  // engine (wall, monotonic) pair at each bend), captured from the live
-  // snapshots' epoch-change markers. A window straddling one of these
-  // splits AT it (spec 8.5), even in a legacy single-phase run.
-  std::vector<EpochMark> epoch_marks;
-};
+// (source/client/headless/series_view.h); the pipeline configuration
+// (ProfilePipelineConfig), the pool-job input (ProfileJobInput), and the ONE
+// fetch -> symbolize -> fold -> align pipeline moved to the FTXUI-free
+// profile_pipeline.h (the MCP plan Task 4 extraction) — same namespace, so
+// the TUI's call sites read unchanged.
 
 // FORK-ONLY (We-Amp): the headless run/session lifecycle carrier behind the
 // interactive shell — the exact pipeline the TUI drives (feed -> ApplySnapshot

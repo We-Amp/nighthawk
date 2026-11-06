@@ -8,14 +8,18 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "absl/status/status.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 
 #include "api/client/service.pb.h"
@@ -25,6 +29,8 @@
 #include "source/client/mcp/json_util.h"
 #include "source/client/mcp/mcp_resources.h"
 #include "source/client/tui/knob_rules.h"
+#include "source/client/tui/profile_pipeline.h"
+#include "source/client/tui/profile_session_conversion.h"
 #include "source/client/tui/session_conversion.h"
 #include "source/client/tui/start_run_dialog.h"
 
@@ -575,6 +581,29 @@ void SteeringController::OnSnapshot(const nighthawk::client::LiveSnapshot& snaps
     nighthawk::client::SessionRecord record;
     *record.mutable_metric_series() = Tui::ToMetricSeries(snapshot);
     series_records_.push_back(record.metric_series());
+    // The clock anchor: the FIRST live snapshot's (wall, monotonic) pair —
+    // the §8.5 join key the profile pipeline maps window intervals through.
+    if (!anchor_.valid()) {
+      anchor_.wall_time_unix_ns = snapshot.wall_time_unix_ns();
+      anchor_.monotonic_ns = snapshot.monotonic_ns();
+    }
+    // The epoch-change marks (the window-split inputs; the TUI RunController
+    // pattern): one mark per marker-bearing snapshot, deduped by epoch id.
+    if (snapshot.epoch_changed() && !snapshot.epoch_id().empty() &&
+        snapshot.epoch_id() != last_seen_epoch_id_) {
+      last_seen_epoch_id_ = snapshot.epoch_id();
+      epoch_marks_.push_back(Tui::EpochMark{snapshot.epoch_id(), snapshot.wall_time_unix_ns(),
+                                            snapshot.monotonic_ns()});
+    }
+    // The per-counter series (the completed-work denominator's input),
+    // capped like the RunViewModel.
+    for (const auto& [name, value] : snapshot.counters()) {
+      std::vector<Tui::CounterPoint>& series = counter_series_[name];
+      if (series.size() >= Tui::kRunViewModelMaxPoints) {
+        series.erase(series.begin());
+      }
+      series.push_back(Tui::CounterPoint{static_cast<uint64_t>(snapshot.monotonic_ns()), value});
+    }
     if (recorder_.open()) {
       recorder_.AppendSnapshot(std::move(record));
     }
@@ -631,6 +660,9 @@ void SteeringController::OnFinished(const absl::Status& /*status*/) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     finished_ = true;
+    // The run-end stamp (the profile window interval's end for pulls against
+    // a finished run; the TUI RunController's counterpart).
+    run_end_unix_ns_ = absl::ToUnixNanos(absl::Now());
     ++finished_count_;
   }
   cv_.notify_all();
@@ -730,6 +762,22 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
     final_output_ = {};
     start_request_ = request;
     resolved_target_ = *rewritten;
+    // The profile-window alignment inputs reset per run (the TUI
+    // RunController's counterparts): the run stamp, the anchor, the counter
+    // series, the epoch marks, and the worker count (the 8.4
+    // non-comparability key; 1 when the request left it unset).
+    run_start_unix_ns_ = started_unix_ns;
+    run_end_unix_ns_ = 0;
+    anchor_ = Tui::ClockAnchor{};
+    counter_series_.clear();
+    epoch_marks_.clear();
+    last_seen_epoch_id_.clear();
+    const std::string& concurrency = request.options().concurrency().value();
+    uint32_t parsed = 0;
+    worker_count_ =
+        (!concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0)
+            ? parsed
+            : 1;
   }
   Struct result;
   SetBool(result, "run_started", true);
@@ -1034,6 +1082,23 @@ void SteeringController::GracefulStop() {
   SealSession(/*completed=*/completed_);
 }
 
+Tui::ProfileJobInput SteeringController::CaptureProfileContext() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  Tui::ProfileJobInput input;
+  input.anchor = anchor_;
+  input.run_start_unix_ns = run_start_unix_ns_;
+  input.run_finished = finished_;
+  input.run_end_unix_ns = run_end_unix_ns_;
+  input.worker_count = worker_count_;
+  input.completed_series = Tui::MergeCompletedSeries(counter_series_);
+  input.boundary_events = boundary_events_;
+  for (const nighthawk::client::PhaseSpec& phase : start_request_.options().phases()) {
+    input.phase_specs.push_back(phase);
+  }
+  input.epoch_marks = epoch_marks_;
+  return input;
+}
+
 void RegisterSteeringTools(ToolRegistry& registry, SteeringController& controller) {
   ToolSpec start_run;
   start_run.name = "start_run";
@@ -1070,6 +1135,461 @@ void RegisterSteeringTools(ToolRegistry& registry, SteeringController& controlle
     return controller.GetStatus(arguments);
   };
   registry.Register(std::move(get_status));
+}
+
+// --- MCP plan Task 4: the profile-window + differential tools ---------------
+
+namespace {
+
+constexpr char kNotConfiguredMessage[] =
+    "profiling is not configured (pass --profile-mount or --scp-host)";
+
+constexpr char kPullSchema[] = R"json(
+    {"type": "object",
+     "properties": {
+       "duration_s": {"type": "integer",
+                      "description": "The window length in seconds (the SUT CPU profiler samples for exactly this long). Default: the --profile-window-seconds flag (5)."}},
+     "required": [],
+     "additionalProperties": false})json";
+
+constexpr char kPullDescription[] =
+    "Pulls one CPU profile window from the SUT and folds it into a "
+    "phase-aligned, per-unit-of-work normalizable profile window. Args: "
+    "duration_s (integer, optional; default 5). BLOCKS for duration_s (the "
+    "stated bound: the window's own length plus two small admin POSTs), then "
+    "answers {window_id, status:'folding'}; poll window_status{id} until "
+    "'ready' or 'failed:<reason>'. Requires profiling configured "
+    "(--profile-mount or --scp-host; otherwise the honest not-configured "
+    "error) and a run whose stamps the window aligns against. One window at "
+    "a time: a second pull while one is staged or folding is refused. "
+    "Windows land pure or excluded-and-marked (purity recorded); only pure "
+    "windows are differential-comparable.";
+
+constexpr char kWindowStatusSchema[] = R"json(
+    {"type": "object",
+     "properties": {
+       "id": {"type": "integer",
+              "description": "The server-assigned window id (monotonic from 1; pull_profile_window answers it)."}},
+     "required": ["id"],
+     "additionalProperties": false})json";
+
+constexpr char kWindowStatusDescription[] =
+    "Reads one profile window's lifecycle state. Args: id (integer, "
+    "required) — SERVER-ASSIGNED only: ids come from pull_profile_window, "
+    "monotonic from 1; a non-positive or unknown id is refused naming that "
+    "discipline. Returns {id, status, note?}: status is staged|folding|"
+    "ready|failed:<reason> (the note carries the pipeline's outcome line for "
+    "a ready window).";
+
+constexpr char kDiffSchema[] = R"json(
+    {"type": "object",
+     "properties": {
+       "a": {"type": "integer",
+             "description": "The BASE window's server-assigned id."},
+       "b": {"type": "integer",
+             "description": "The CURRENT window's server-assigned id."}},
+     "required": ["a", "b"],
+     "additionalProperties": false})json";
+
+constexpr char kDiffDescription[] =
+    "Differentially profiles two landed windows, normalized per unit of "
+    "work. Args: a, b (integers, required; SERVER-ASSIGNED window ids — "
+    "monotonic from 1; a is the base, b the current). The result is the "
+    "union-tree differential {label, comparable, base_window, current_window, "
+    "base_total_per_work, cur_total_per_work, diffs:[{function, file, line, "
+    "base_per_work, cur_per_work, delta_ratio}...]}. An epoch-separated pair "
+    "(windows pulled on either side of an applied steer) is labeled 'knob "
+    "effect: <a> -> <b>'; a same-state pair is REFUSED with isError:true — "
+    "its differential is the noise floor, not an effect. A worker-count "
+    "change computes with comparable:false and the reason; impure or "
+    "mixed-type (cpu vs alloc) pairs are refused with the reason verbatim.";
+
+// The common id validation: server-assigned ints only (positive; the
+// tracker's monotonic ids start at 1).
+absl::StatusOr<int64_t> ValidateWindowId(const Struct& arguments, absl::string_view field) {
+  const Value* id = FindField(arguments, field);
+  if (id == nullptr) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("diff_windows/window_status require the '", field,
+                     "' argument (the dispatcher schema pins it required)"));
+  }
+  const int64_t window_id = IntegerOf(*id);
+  if (window_id <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "'", field, "' must be a server-assigned window id (positive, monotonic from 1); ",
+        window_id, " is not one — ids are never agent-chosen"));
+  }
+  return window_id;
+}
+
+} // namespace
+
+ProfileController::ProfileController(SteeringController& steering, ProfileToolOptions options)
+    : steering_(steering), options_(std::move(options)) {
+  if (options_.configured) {
+    // The retriever mirrors the TUI's ConfigureProfiling split: volume-mount
+    // translation or scp, then the fetcher owns it.
+    std::unique_ptr<Tui::ProfileRetriever> retriever =
+        options_.pipeline.retriever_kind == Tui::ProfilePipelineConfig::RetrieverKind::kScp
+            ? std::unique_ptr<Tui::ProfileRetriever>(
+                  std::make_unique<Tui::ScpRetriever>(options_.pipeline.scp_host))
+            : std::unique_ptr<Tui::ProfileRetriever>(
+                  std::make_unique<Tui::VolumeMountRetriever>(options_.pipeline.mount_root));
+    fetcher_ = std::make_unique<Tui::ProfileFetcher>(
+        Tui::AdminClient(options_.pipeline.admin), std::move(retriever),
+        options_.pipeline.sut_profile_path, options_.pipeline.staging_dir);
+  }
+}
+
+ProfileController::~ProfileController() {
+  // pool_ is declared last and destroyed first: its destructor drains the
+  // queue and joins the workers, so in-flight fold jobs land (and mark the
+  // tracker) before the state they touch goes away. The jobs reference
+  // steering_ (alive: declared before this controller at every call site).
+}
+
+absl::StatusOr<google::protobuf::Struct>
+ProfileController::PullProfileWindow(const google::protobuf::Struct& arguments) {
+  if (!options_.configured) {
+    return absl::FailedPreconditionError(kNotConfiguredMessage);
+  }
+  int64_t window_seconds = options_.pipeline.window_seconds;
+  if (const Value* duration = FindField(arguments, "duration_s"); duration != nullptr) {
+    window_seconds = IntegerOf(*duration);
+    if (window_seconds <= 0) {
+      return absl::InvalidArgumentError("duration_s must be > 0");
+    }
+  }
+
+  // The run-context guard (the TUI p-flow's messages): a window without run
+  // stamps to align against is refused, and the work-units join needs the
+  // run's first flush.
+  {
+    const Tui::ProfileJobInput context = steering_.CaptureProfileContext();
+    if (context.run_start_unix_ns == 0) {
+      return absl::FailedPreconditionError(
+          "no run to align against: pull profile windows during a run - only "
+          "windows pulled inside a run can be pure");
+    }
+    if (!context.anchor.valid()) {
+      return absl::FailedPreconditionError(
+          "no snapshot anchor yet: the work-units join needs the run's first flush");
+    }
+  }
+  // The single-flight discipline (the tracker's; the TUI messages).
+  if (steering_.fold_tracker().folding_id() != 0) {
+    return absl::FailedPreconditionError(
+        "a profile window is still folding: wait for it to land before opening the next");
+  }
+  if (steering_.fold_tracker().open_id() != 0) {
+    return absl::FailedPreconditionError("a profile window is already open");
+  }
+
+  auto staged = steering_.fold_tracker().Stage();
+  if (!staged.ok()) {
+    return staged.status();
+  }
+  // One small POST on the calling thread (the profile_fetcher.h threading
+  // contract; the blocking fetch belongs to the pool job below).
+  const absl::Status armed = fetcher_->StartWindow(static_cast<int>(window_seconds));
+  if (!armed.ok()) {
+    // The collector arm failed: the staged window fails with the reason.
+    (void)steering_.fold_tracker().MarkFailed(*staged, std::string(armed.message()));
+    return armed;
+  }
+
+  // The window itself: the SUT profiler samples while this (deferred) wait
+  // holds — the stated bound is exactly duration_s.
+  absl::SleepFor(absl::Seconds(window_seconds));
+
+  // The deferred-close fix (the TUI's): the interval ends HERE, before the
+  // fold job is even submitted. A failed disable gets the best-effort
+  // recovery disable and fails the window honestly — no retrieval may race a
+  // live profiler.
+  const absl::Status stopped = fetcher_->StopWindow();
+  if (!stopped.ok()) {
+    Tui::AdminClient recovery(options_.pipeline.admin);
+    (void)recovery.EnableCpuProfiler(false);
+    (void)steering_.fold_tracker().MarkFailed(*staged, std::string(stopped.message()));
+    return stopped;
+  }
+
+  // Capture the job inputs AFTER the close (the interval end is fixed by the
+  // stamps above); a run ending while the fetch runs is the straddle case,
+  // upgraded inside the job from a fresh capture.
+  Tui::ProfileJobInput input = steering_.CaptureProfileContext();
+  Tui::PprofWorkerPool* pool = &pool_;
+  ProfileController* self = this;
+  const int64_t window_id = *staged;
+  // staged -> folding: the fold job is in flight from here (its terminal
+  // ready/failed transitions land from the job thread).
+  const absl::Status folding = steering_.fold_tracker().MarkFolding(window_id);
+  if (!folding.ok()) {
+    return folding;
+  }
+  pool->Submit([self, window_id, input]() { self->FinishProfileWindowJob(window_id, input); });
+
+  Struct out;
+  SetInt(out, "window_id", window_id);
+  SetString(out, "status", "folding");
+  return out;
+}
+
+void ProfileController::FinishProfileWindowJob(int64_t window_id, Tui::ProfileJobInput input) {
+  // Retrieval only: the profiler was disabled before the job was submitted
+  // (the profile_fetcher.h split contract).
+  absl::StatusOr<Tui::FetchedProfile> fetched = fetcher_->FetchProfile();
+  if (!fetched.ok()) {
+    (void)steering_.fold_tracker().MarkFailed(window_id, std::string(fetched.status().message()));
+    return;
+  }
+
+  // Straddle belt (the TUI's): the run may have ENDED while this retrieval
+  // ran; upgrade the stamps from a fresh capture when the terminal record
+  // has landed. Without one the capture-time classification stands (taken
+  // conservatively — never fabricated purity).
+  {
+    const Tui::ProfileJobInput fresh = steering_.CaptureProfileContext();
+    if (fresh.run_finished && !input.run_finished) {
+      input.run_finished = true;
+      input.run_end_unix_ns = fresh.run_end_unix_ns;
+    }
+  }
+
+  // Clock-offset uncertainty (plan major-fix): the observed mac<->SUT offset
+  // beyond the admin Date granularity. Unavailable (no clock surface) -> 0,
+  // recorded-absent.
+  int64_t uncertainty_ns = 0;
+  Tui::AdminClient job_admin(options_.pipeline.admin);
+  const absl::StatusOr<int64_t> sut_now = job_admin.FetchSutUnixTimeNs();
+  if (sut_now.ok()) {
+    const int64_t observed =
+        std::abs(*sut_now - absl::ToUnixNanos(absl::Now()));
+    uncertainty_ns = std::max<int64_t>(0, observed - Tui::kDateGranularityNs);
+  }
+
+  Tui::ProfileJobOutcome outcome =
+      Tui::RunProfilePipeline(options_.pipeline, *fetched, input, uncertainty_ns);
+
+  if (!outcome.windows.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      windows_by_id_[window_id].insert(windows_by_id_[window_id].end(), outcome.windows.begin(),
+                                       outcome.windows.end());
+    }
+    // Append to the immutable store (the render/consumer side only reads).
+    auto windows = window_store_.load();
+    std::vector<Tui::ProfileWindow> updated =
+        windows != nullptr ? *windows : std::vector<Tui::ProfileWindow>();
+    for (Tui::ProfileWindow& window : outcome.windows) {
+      updated.push_back(window);
+    }
+    window_store_.store(std::move(updated));
+
+    // Session records: the raw staged bytes ride along (the TUI's
+    // self-describing session). The recorder is a leaf; an append landing
+    // after the seal counts as a drop by the writer's contract.
+    if (steering_.recorder().open()) {
+      for (const Tui::ProfileWindow& window : outcome.windows) {
+        nighthawk::client::SessionRecord record;
+        *record.mutable_profile_window() =
+            Tui::ToProfileWindowRecord(window, outcome.raw_bytes, outcome.symbolizer_tool);
+        steering_.recorder().AppendSnapshot(std::move(record));
+      }
+    }
+  }
+
+  // Terminal tracker state: windows landed -> ready with the outcome note;
+  // the pipeline produced nothing -> failed with the note as the reason.
+  if (!outcome.windows.empty()) {
+    (void)steering_.fold_tracker().MarkReady(window_id, outcome.note);
+  } else {
+    (void)steering_.fold_tracker().MarkFailed(window_id, outcome.note);
+  }
+}
+
+absl::StatusOr<google::protobuf::Struct>
+ProfileController::WindowStatus(const google::protobuf::Struct& arguments) {
+  if (!options_.configured) {
+    return absl::FailedPreconditionError(kNotConfiguredMessage);
+  }
+  auto id_or = ValidateWindowId(arguments, "id");
+  if (!id_or.ok()) {
+    return id_or.status();
+  }
+  auto status = steering_.fold_tracker().Status(*id_or);
+  if (!status.ok()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "unknown window id ", *id_or,
+        ": window ids are server-assigned (monotonic from 1, answered by "
+        "pull_profile_window) — never agent-chosen"));
+  }
+  Struct out;
+  SetInt(out, "id", *id_or);
+  switch (status->state) {
+    case Tui::FoldTracker::State::kStaged:
+      SetString(out, "status", "staged");
+      break;
+    case Tui::FoldTracker::State::kFolding:
+      SetString(out, "status", "folding");
+      break;
+    case Tui::FoldTracker::State::kReady:
+      SetString(out, "status", "ready");
+      if (!status->note.empty()) {
+        SetString(out, "note", status->note);
+      }
+      break;
+    case Tui::FoldTracker::State::kFailed:
+      SetString(out, "status", absl::StrCat("failed:", status->failure_reason));
+      break;
+  }
+  return out;
+}
+
+absl::StatusOr<Tui::ProfileWindow> ProfileController::LandedPureWindow(int64_t id) {
+  auto status = steering_.fold_tracker().Status(id);
+  if (!status.ok()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "unknown window id ", id,
+        ": window ids are server-assigned (monotonic from 1, answered by "
+        "pull_profile_window) — never agent-chosen"));
+  }
+  if (status->state == Tui::FoldTracker::State::kStaged) {
+    return absl::FailedPreconditionError(absl::StrCat("window ", id, " is still staged"));
+  }
+  if (status->state == Tui::FoldTracker::State::kFolding) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "window ", id, " is still folding: poll window_status until it lands"));
+  }
+  if (status->state == Tui::FoldTracker::State::kFailed) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("window ", id, " failed: ", status->failure_reason));
+  }
+  std::vector<Tui::ProfileWindow> parts;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = windows_by_id_.find(id);
+    if (it != windows_by_id_.end()) {
+      parts = it->second;
+    }
+  }
+  std::vector<Tui::ProfileWindow> pure;
+  for (const Tui::ProfileWindow& window : parts) {
+    if (window.purity_fraction >= 1.0) {
+      pure.push_back(window);
+    }
+  }
+  if (pure.empty()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "window ", id, " landed no PURE window (excluded-and-marked: ",
+        status->note.empty() ? "the pipeline produced only impure parts" : status->note,
+        "); windows are differential-comparable only when pure"));
+  }
+  if (pure.size() > 1) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "window ", id, " landed ", pure.size(),
+        " pure parts (a boundary split); the differential addresses one "
+        "window per id"));
+  }
+  return pure.front();
+}
+
+absl::StatusOr<google::protobuf::Struct>
+ProfileController::DiffWindows(const google::protobuf::Struct& arguments) {
+  if (!options_.configured) {
+    return absl::FailedPreconditionError(kNotConfiguredMessage);
+  }
+  auto base_id = ValidateWindowId(arguments, "a");
+  if (!base_id.ok()) {
+    return base_id.status();
+  }
+  auto cur_id = ValidateWindowId(arguments, "b");
+  if (!cur_id.ok()) {
+    return cur_id.status();
+  }
+  if (*base_id == *cur_id) {
+    return absl::InvalidArgumentError(
+        "diff_windows requires two DISTINCT window ids (a is the base, b the current)");
+  }
+  auto base = LandedPureWindow(*base_id);
+  if (!base.ok()) {
+    return base.status();
+  }
+  auto current = LandedPureWindow(*cur_id);
+  if (!current.ok()) {
+    return current.status();
+  }
+
+  // The same-state refusal: windows under the SAME knob epoch measure the
+  // noise floor, not a knob effect (8.4) — the tool refuses instead of
+  // dressing noise up as a result.
+  if (Tui::SameStatePair(*base, *current)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "windows ", *base_id, " and ", *cur_id, " carry the same knob epoch ('",
+        base->epoch_id.empty() ? "(none)" : base->epoch_id,
+        "'): no applied change separates them, so their differential is the "
+        "NOISE FLOOR, not a knob effect — pull windows on either side of a "
+        "steer for the knob effect"));
+  }
+
+  auto diff = Tui::ComputeDifferential(*base, *current);
+  if (!diff.ok()) {
+    return diff.status();
+  }
+
+  Struct out;
+  SetString(out, "label", Tui::DifferentialPairLabel(*base, *current));
+  SetInt(out, "base_window", *base_id);
+  SetInt(out, "current_window", *cur_id);
+  SetBool(out, "comparable", diff->comparable);
+  if (!diff->comparable) {
+    SetString(out, "incomparable_reason", diff->incomparable_reason);
+  }
+  SetDouble(out, "base_total_per_work", diff->base_total_per_work);
+  SetDouble(out, "cur_total_per_work", diff->cur_total_per_work);
+  Value& diffs = (*out.mutable_fields())["diffs"];
+  diffs.mutable_list_value();
+  for (const Tui::DifferentialNodeDiff& node : diff->diffs) {
+    Struct entry;
+    SetString(entry, "function", node.frame != nullptr ? node.frame->function : "");
+    SetString(entry, "file", node.frame != nullptr ? node.frame->file : "");
+    SetInt(entry, "line", node.frame != nullptr ? node.frame->line : 0);
+    SetDouble(entry, "base_per_work", node.base_per_work);
+    SetDouble(entry, "cur_per_work", node.cur_per_work);
+    SetDouble(entry, "delta_ratio", node.delta_ratio);
+    *diffs.mutable_list_value()->add_values() = ToValue(entry);
+  }
+  return out;
+}
+
+void RegisterProfileTools(ToolRegistry& registry, ProfileController& controller) {
+  ToolSpec pull;
+  pull.name = "pull_profile_window";
+  pull.description = kPullDescription;
+  pull.input_schema = ParseJsonObject(kPullSchema).value();
+  pull.deferred = true;
+  pull.handler = [&controller](const Struct& arguments) {
+    return controller.PullProfileWindow(arguments);
+  };
+  registry.Register(std::move(pull));
+
+  ToolSpec window_status;
+  window_status.name = "window_status";
+  window_status.description = kWindowStatusDescription;
+  window_status.input_schema = ParseJsonObject(kWindowStatusSchema).value();
+  window_status.handler = [&controller](const Struct& arguments) {
+    return controller.WindowStatus(arguments);
+  };
+  registry.Register(std::move(window_status));
+
+  ToolSpec diff_windows;
+  diff_windows.name = "diff_windows";
+  diff_windows.description = kDiffDescription;
+  diff_windows.input_schema = ParseJsonObject(kDiffSchema).value();
+  diff_windows.handler = [&controller](const Struct& arguments) {
+    return controller.DiffWindows(arguments);
+  };
+  registry.Register(std::move(diff_windows));
 }
 
 } // namespace Client

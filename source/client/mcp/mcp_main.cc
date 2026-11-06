@@ -13,6 +13,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "grpc++/grpc++.h"
 #include "tclap/CmdLine.h"
@@ -110,11 +111,17 @@ int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& ou
   steering.session_prefix = "nighthawk-session";
   SteeringController controller(channel, steering);
 
+  // Declared AFTER the steering controller (destroyed FIRST): the profile
+  // controller's destructor joins its worker pool while the steering
+  // controller it borrows from is still alive.
+  ProfileController profile_controller(controller, flags.profile);
+
   ToolRegistry tools;
   ResourceRegistry resources;
   RegisterEchoTool(tools);
   RegisterSteeringTools(tools, controller);
   RegisterTelemetryResources(resources, controller);
+  RegisterProfileTools(tools, profile_controller);
 
   // The waiter pool: the bounded tool waits (steer 4s, cancel_run 35s) run
   // here, OFF the dispatch loop, so ping answers during a wait.
@@ -233,6 +240,47 @@ int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out
                                   "Bound (seconds) for cancel_run's final-output wait (+5s "
                                   "grace); expiry surfaces as a timed-out tool error.",
                                   false, 30, "seconds", cmd);
+    // The M1 profiling flags, mirroring the TUI's surface. Profiling is
+    // configured when a profile mount (volume retriever) or scp host (rig
+    // variant) is given; without one the profile tools exist and refuse with
+    // the honest not-configured error.
+    TCLAP::ValueArg<std::string> admin_base(
+        "", "admin-base", "SUT admin endpoint base URL. Default: http://127.0.0.1:9901.", false,
+        "http://127.0.0.1:9901", "string", cmd);
+    TCLAP::ValueArg<std::string> profile_retriever(
+        "", "profile-retriever", "Profile retriever kind: mount or scp. Default: mount.", false,
+        "mount", "string", cmd);
+    TCLAP::ValueArg<std::string> profile_mount(
+        "", "profile-mount",
+        "Local path of the SUT profile bind mount (the mount retriever reads there). Empty = "
+        "profiling unconfigured.",
+        false, "", "string", cmd);
+    TCLAP::ValueArg<std::string> scp_host(
+        "", "scp-host", "scp destination (user@host) for the rig retriever.", false, "", "string",
+        cmd);
+    TCLAP::ValueArg<std::string> sut_profile_path(
+        "", "sut-profile-path",
+        "SUT-side path the CPU profiler writes (admin.profile_path). Default: "
+        "/var/local/profiling/envoy.prof.",
+        false, "/var/local/profiling/envoy.prof", "string", cmd);
+    TCLAP::ValueArg<std::string> profile_staging(
+        "", "profile-staging",
+        "Local staging directory for fetched profiles. Default: /tmp/nh-profiles.", false,
+        "/tmp/nh-profiles", "string", cmd);
+    TCLAP::ValueArg<std::string> pprof_tool(
+        "", "pprof-tool",
+        "Symbolizer argv prefix, space separated (SUBPROCESS ONLY - never a linked dependency). "
+        "Default: \"go tool pprof\".",
+        false, "go tool pprof", "string", cmd);
+    TCLAP::ValueArg<std::string> sut_binary(
+        "", "sut-binary",
+        "SUT binary path inside the PPROF_BINARY_PATH layout (binary reachability for "
+        "symbolization). Empty = no symbolization attempted.",
+        false, "", "string", cmd);
+    TCLAP::ValueArg<long> profile_window_seconds("", "profile-window-seconds",
+                                                 "Default profile window length for "
+                                                 "pull_profile_window. Default: 5.",
+                                                 false, 5, "int", cmd);
     cmd.parse(argc, argv);
 
     McpServerFlags flags;
@@ -249,6 +297,34 @@ int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out
       err << absl::StrCat("nighthawk_mcp: ", cidrs.message(), "\n");
       return 1;
     }
+
+    // The profile flag surface (Task 4), the TUI's configured rule. An
+    // unknown retriever kind is a startup failure naming the flag (the
+    // mount/scp choice is not silently guessed).
+    const std::string retriever_kind = profile_retriever.getValue();
+    if (retriever_kind != "mount" && retriever_kind != "scp") {
+      err << absl::StrCat("nighthawk_mcp: --profile-retriever must be 'mount' or 'scp', got '",
+                          retriever_kind, "'\n");
+      return 1;
+    }
+    flags.profile.configured =
+        !profile_mount.getValue().empty() || !scp_host.getValue().empty();
+    flags.profile.pipeline.admin.admin_base = admin_base.getValue();
+    flags.profile.pipeline.retriever_kind =
+        (retriever_kind == "scp" || !scp_host.getValue().empty())
+            ? Tui::ProfilePipelineConfig::RetrieverKind::kScp
+            : Tui::ProfilePipelineConfig::RetrieverKind::kVolumeMount;
+    flags.profile.pipeline.mount_root = profile_mount.getValue();
+    flags.profile.pipeline.scp_host = scp_host.getValue();
+    flags.profile.pipeline.sut_profile_path = sut_profile_path.getValue();
+    flags.profile.pipeline.staging_dir = profile_staging.getValue();
+    // The argv prefix splits on plain spaces ("go tool pprof").
+    flags.profile.pipeline.pprof_tool_argv =
+        absl::StrSplit(pprof_tool.getValue(), ' ', absl::SkipEmpty());
+    flags.profile.pipeline.sut_binary_path = sut_binary.getValue();
+    flags.profile.pipeline.window_seconds = static_cast<int>(profile_window_seconds.getValue());
+    const char* binary_layout = std::getenv("PPROF_BINARY_PATH");
+    flags.profile.pipeline.pprof_binary_path = binary_layout != nullptr ? binary_layout : "";
 
     return RunMcpServer(flags, in, out, err);
   } catch (TCLAP::ArgException& e) {

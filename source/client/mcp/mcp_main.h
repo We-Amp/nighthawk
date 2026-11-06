@@ -38,6 +38,8 @@
 #include <thread>
 #include <vector>
 
+#include "source/client/mcp/mcp_tools.h"
+
 namespace Nighthawk {
 namespace Client {
 
@@ -49,6 +51,13 @@ struct McpServerFlags {
   std::vector<std::string> allow_target_cidrs;
   long long max_rps = 100000;
   long long timeout_s = 30;
+  // The profile tool surface (Task 4): the full profile flag surface
+  // (--admin-base, --profile-retriever, --profile-mount, --scp-host,
+  // --sut-profile-path, --profile-staging, --pprof-tool, --sut-binary,
+  // --profile-window-seconds), configured exactly like the TUI's
+  // (--profile-mount or --scp-host given = configured). Absent profile
+  // flags leave the tools registered but honest (the not-configured error).
+  ProfileToolOptions profile;
 };
 
 // A tiny fixed-size task pool: the MCP dispatcher's waiter threads run the

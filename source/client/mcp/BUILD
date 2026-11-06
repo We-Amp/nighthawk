@@ -39,9 +39,14 @@ envoy_cc_library(
         "//api/client:base_cc_proto",
         "//source/client/headless:client_headless",
         "//source/client/tui:knob_rules_lib",
+        # The FTXUI-free profile pipeline (MCP plan Task 4): the window/diff
+        # machinery the profile tools drive (moved out of tui_lib for exactly
+        # this — the cquery guard proves the graph clean).
+        "//source/client/tui:profile_pipeline_lib",
         "//source/client/tui:run_feed_lib",
         "//source/client/tui:session_conversion_lib",
         "//source/client/tui:start_run_dialog_lib",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
