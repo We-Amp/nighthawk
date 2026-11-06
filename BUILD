@@ -130,3 +130,15 @@ envoy_cc_binary(
         "@grpc//:grpc++",
     ],
 )
+
+# FORK-ONLY (We-Amp): the MCP stdio server (MCP plan Task 1). Not in the
+# engine filegroup and free of the -lrt linkopt, same reasoning as
+# nighthawk_tui; mcp_lib carries no grpc++ code, so none is linked here. The
+# quarantined dependency surface runs over this binary's graph too (see
+# source/client/tui/README.md).
+envoy_cc_binary(
+    name = "nighthawk_mcp",
+    deps = [
+        "//source/exe:mcp_entry_lib",
+    ],
+)

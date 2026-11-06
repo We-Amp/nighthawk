@@ -99,3 +99,18 @@ envoy_cc_library(
     ],
     alwayslink = True,
 )
+
+# FORK-ONLY (We-Amp): entry point for the nighthawk_mcp binary (MCP plan
+# Task 1). Thin by the repo convention — the flag surface, the stdio loop,
+# and the SIGTERM wiring live in //source/client/mcp:mcp_lib so tests drive
+# them in-process. Kept free of the engine's version_linkstamp / symbolize
+# deps for the same quarantine reason as the session dump entry.
+envoy_cc_library(
+    name = "mcp_entry_lib",
+    srcs = ["mcp_main_entry.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//source/client/mcp:mcp_lib",
+    ],
+    alwayslink = True,
+)

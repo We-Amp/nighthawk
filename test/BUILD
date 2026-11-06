@@ -40,6 +40,23 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): the MCP transport + dispatch skeleton contract pins
+# (MCP plan Task 1). Plain cc_test for the same quarantine reason as the
+# headless/TUI tests: mcp_lib carries no Envoy C++ sources and no test-helper
+# stack.
+cc_test(
+    name = "mcp_server_test",
+    srcs = ["mcp_server_test.cc"],
+    deps = [
+        "//source/client/mcp:mcp_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@googletest//:gtest_main",
+        "@protobuf//:struct_cc_proto",
+    ],
+)
+
 # FORK-ONLY (We-Amp): session file format, writer/reader, and queue drop
 # contract tests. Plain cc_test for the same reason as tui_app_test: the TUI
 # quarantine keeps this off Envoy's C++ sources and test helpers.
