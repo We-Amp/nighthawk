@@ -54,6 +54,27 @@ struct StampedPoint {
   std::string epoch_id;
 };
 
+// The percentile-series names the nighthawk://series resource renders the
+// latency band under — the TUI band chart's legend (charts.cc: "# p50
+// + p90 . p99 ms"), values in nanoseconds. One series per percentile, the
+// same stamps the counters carry.
+inline constexpr char kLatencyP50SeriesName[] = "latency.p50";
+inline constexpr char kLatencyP90SeriesName[] = "latency.p90";
+inline constexpr char kLatencyP99SeriesName[] = "latency.p99";
+
+// One stamped point of the latency band: the p50/p90/p99 triple ONE flush
+// carried, with the same stamps as StampedPoint (anchor-joined wall,
+// phase id, knob epoch).
+struct LatencyBandPoint {
+  int64_t monotonic_ns = 0;
+  uint64_t p50_ns = 0;
+  uint64_t p90_ns = 0;
+  uint64_t p99_ns = 0;
+  int64_t wall_time_unix_ns = 0;
+  std::string phase_id;
+  std::string epoch_id;
+};
+
 // FORK-ONLY (We-Amp): read-only stamped access to a run's per-series points
 // (MCP plan Task 0). Built from the run's persisted MetricSeriesRecords —
 // the same records SessionRecorder writes — so a telemetry consumer (the
@@ -89,6 +110,17 @@ public:
    * @return the points, or kNotFound when no record carried that name.
    */
   absl::StatusOr<std::vector<StampedPoint>> Series(absl::string_view name) const;
+
+  /**
+   * The run's latency band (the TUI chart's data, rebuilt from the same
+   * seam): per flush record, the FIRST statistic with samples — the
+   * aggregator's statistics order is unspecified, so the sampled statistic
+   * is found by scanning, never assumed at index 0; a flush whose every
+   * statistic has count == 0 leaves a band GAP (the zero-count rule — no
+   * percentiles are meaningful there, and zeros are never painted). Each
+   * point carries the record's p50/p90/p99 triple, stamped like Series().
+   */
+  absl::StatusOr<std::vector<LatencyBandPoint>> LatencyBand() const;
 
   /**
    * The first-snapshot anchor pair (invalid when the view is empty).

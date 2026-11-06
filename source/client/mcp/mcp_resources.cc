@@ -43,8 +43,11 @@ constexpr char kSeriesResourceDescription[] =
     "wall_time_unix_ns, value, phase_id, epoch_id}: the wall stamp is JOINED "
     "through the run's first-snapshot clock anchor (one join key for the "
     "whole view), phase_id is present on every point, epoch_id from the "
-    "first applied live change onward. SUT-derived strings render only as "
-    "values. Reads the live series the server holds; nighthawk://session "
+    "first applied live change onward. The TUI's latency band rides "
+    "alongside as the percentile series latency.p50/latency.p90/latency.p99 "
+    "(values in ns): per-flush p50/p90/p99 from the same first-sampled-"
+    "statistic seam the band chart consumes. SUT-derived strings render only "
+    "as values. Reads the live series the server holds; nighthawk://session "
     "reads the persisted file, whose sealed prefix may lag by the writer's "
     "buffered frames.";
 
@@ -207,6 +210,40 @@ google::protobuf::Struct RenderSeriesPayload(
       *point_list.mutable_list_value()->add_values() = ToValue(rendered);
     }
     *series_list.mutable_list_value()->add_values() = ToValue(series);
+  }
+
+  // The TUI's latency band as percentile series (the dogfooding gap): the
+  // same seam the band chart consumes, rendered per flush as p50/p90/p99
+  // points (values in ns) with the counters' stamps — an optimizing agent
+  // reading this resource gets the latency signal the TUI paints, not just
+  // the counters.
+  auto band = view.LatencyBand();
+  if (band.ok()) {
+    struct PercentileSeriesSpec {
+      const char* name;
+      uint64_t Tui::LatencyBandPoint::*percentile;
+    };
+    const PercentileSeriesSpec kPercentileSeries[] = {
+        {Tui::kLatencyP50SeriesName, &Tui::LatencyBandPoint::p50_ns},
+        {Tui::kLatencyP90SeriesName, &Tui::LatencyBandPoint::p90_ns},
+        {Tui::kLatencyP99SeriesName, &Tui::LatencyBandPoint::p99_ns},
+    };
+    for (const PercentileSeriesSpec& spec : kPercentileSeries) {
+      Struct series;
+      SetString(series, "name", spec.name);
+      Value& point_list = (*series.mutable_fields())["points"];
+      point_list.mutable_list_value();
+      for (const Tui::LatencyBandPoint& point : *band) {
+        Struct rendered;
+        SetInt(rendered, "monotonic_ns", point.monotonic_ns);
+        SetInt(rendered, "wall_time_unix_ns", point.wall_time_unix_ns);
+        SetInt(rendered, "value", static_cast<int64_t>(point.*spec.percentile));
+        SetString(rendered, "phase_id", point.phase_id);
+        SetString(rendered, "epoch_id", point.epoch_id);
+        *point_list.mutable_list_value()->add_values() = ToValue(rendered);
+      }
+      *series_list.mutable_list_value()->add_values() = ToValue(series);
+    }
   }
   return out;
 }

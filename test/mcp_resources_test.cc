@@ -215,6 +215,15 @@ private:
     for (const auto& [name, value] : options_.extra_counters) {
       (*snapshot->mutable_counters())[name] = value;
     }
+    // The latency statistic the TUI band (and the percentile series) reads:
+    // a fixed p50/p90 floor, and a p99 that RISES with the applied epoch —
+    // the applied-change fault delay the double models.
+    auto* stat = snapshot->add_statistics();
+    stat->set_id("benchmark.http_latency");
+    stat->set_count(static_cast<uint64_t>(monotonic_ns_));
+    stat->set_p50_ns(1'000);
+    stat->set_p90_ns(2'000);
+    stat->set_p99_ns(run_epoch_ > 0 ? 9'000 : 3'000);
     return response;
   }
 
@@ -634,6 +643,89 @@ TEST(McpResourcesTest, SeriesCarriesWallJoinPhaseAndEpoch) {
   // Client and SUT-side series, side by side.
   EXPECT_NE(std::find(names.begin(), names.end(), "benchmark.http_2xx"), names.end());
   EXPECT_NE(std::find(names.begin(), names.end(), "sut.cpu_ticks"), names.end());
+}
+
+// The percentile-series pin (the dogfooding gap): a phased run's series
+// resource carries the TUI's latency band as percentile series — per-flush
+// p50/p90/p99 points, phase+epoch stamped like the counters, the anchor
+// wall join, values sane (p50 <= p90 <= p99) and the post-bend p99 carrying
+// the applied fault delay the double models.
+TEST(McpResourcesTest, SeriesCarriesLatencyPercentiles) {
+  FakeServiceOptions service_options;
+  service_options.phases = {"warm", "spike"};
+  service_options.ticks_per_phase = 2;
+  auto harness = MakeHarness(service_options);
+  CallToolOrDie(*harness, "start_run",
+                absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                              R"json(/", "rps": 10, "duration_s": 60})json"));
+  WaitForStatus(*harness, absl::Seconds(5), [](const Struct& status) {
+    return Text(Field(StructOf(Field(status, "current")), "phase_id")) == "spike";
+  });
+  ASSERT_FALSE(IsIsError(CallToolOrDie(*harness, "steer", R"json({"rps": 20})json")));
+  WaitForStatus(*harness, absl::Seconds(5), [](const Struct& status) {
+    return Text(Field(StructOf(Field(status, "current")), "epoch_id")) == "epoch-1";
+  });
+
+  Struct payload = ReadPayloadOrDie(*harness, "nighthawk://series");
+  const Struct& anchor = StructOf(Field(payload, "anchor"));
+  const int64_t anchor_wall = static_cast<int64_t>(Field(anchor, "wall_time_unix_ns").number_value());
+  const int64_t anchor_monotonic = static_cast<int64_t>(Field(anchor, "monotonic_ns").number_value());
+
+  // One series per percentile, named after the TUI band's legend, plus the
+  // plain counters still side by side.
+  std::map<std::string, const Struct*> series_by_name;
+  for (const Value& entry : Field(payload, "series").list_value().values()) {
+    const Struct& one = StructOf(entry);
+    series_by_name[Text(Field(one, "name"))] = &one;
+  }
+  ASSERT_NE(series_by_name.find("benchmark.http_2xx"), series_by_name.end())
+      << "the counters stay addressable alongside the percentiles";
+  for (const char* name : {"latency.p50", "latency.p90", "latency.p99"}) {
+    ASSERT_NE(series_by_name.find(name), series_by_name.end()) << name << " must be present";
+  }
+
+  bool saw_pre_bend_p99 = false;
+  bool saw_post_bend_p99 = false;
+  for (const auto& [name, series] : series_by_name) {
+    if (name != "latency.p50" && name != "latency.p90" && name != "latency.p99") {
+      continue;
+    }
+    const Value& points = Field(*series, "points");
+    ASSERT_GT(points.list_value().values_size(), 0) << name;
+    for (const Value& point_value : points.list_value().values()) {
+      const Struct& point = StructOf(point_value);
+      const int64_t monotonic =
+          static_cast<int64_t>(Field(point, "monotonic_ns").number_value());
+      const int64_t wall = static_cast<int64_t>(Field(point, "wall_time_unix_ns").number_value());
+      const int64_t drift = (wall - monotonic) - (anchor_wall - anchor_monotonic);
+      EXPECT_LE(drift < 0 ? -drift : drift, 2048) << name;
+      EXPECT_FALSE(Text(Field(point, "phase_id")).empty()) << name;
+      const std::string epoch = Text(Field(point, "epoch_id"));
+      EXPECT_TRUE(epoch.empty() || epoch == "epoch-1") << name;
+    }
+    if (name == "latency.p50") {
+      EXPECT_EQ(Field(StructOf(points.list_value().values(0)), "value").number_value(), 1'000);
+    } else if (name == "latency.p90") {
+      EXPECT_EQ(Field(StructOf(points.list_value().values(0)), "value").number_value(), 2'000);
+    } else {
+      for (const Value& point_value : points.list_value().values()) {
+        const Struct& point = StructOf(point_value);
+        const double value = Field(point, "value").number_value();
+        // Sane: the p99 series sits at or above the p50 floor.
+        EXPECT_GE(value, 1'000) << name;
+        if (value == 3'000) {
+          saw_pre_bend_p99 = true;
+          EXPECT_TRUE(Text(Field(point, "epoch_id")).empty()) << "pre-bend p99: no epoch yet";
+        } else if (value == 9'000) {
+          saw_post_bend_p99 = true;
+          EXPECT_EQ(Text(Field(point, "epoch_id")), "epoch-1")
+              << "post-bend points carry the knob epoch";
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(saw_pre_bend_p99) << "the pre-bend p99 value must appear";
+  EXPECT_TRUE(saw_post_bend_p99) << "the post-bend p99 (the applied fault delay) must appear";
 }
 
 // SUT-derived strings render only as VALUES: a scrape counter name carrying

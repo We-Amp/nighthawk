@@ -106,6 +106,36 @@ absl::StatusOr<std::vector<StampedPoint>> SeriesView::Series(absl::string_view n
   return points;
 }
 
+absl::StatusOr<std::vector<LatencyBandPoint>> SeriesView::LatencyBand() const {
+  std::vector<LatencyBandPoint> band;
+  for (const nighthawk::client::MetricSeriesRecord& record : records_) {
+    // The FIRST statistic with samples — the same scan ApplySnapshot's band
+    // runs (the order is unspecified; a zero-count response-class statistic
+    // often sits at index 0).
+    const nighthawk::client::StatisticSnapshot* sampled = nullptr;
+    for (const nighthawk::client::StatisticSnapshot& stat : record.statistics()) {
+      if (stat.count() > 0) {
+        sampled = &stat;
+        break;
+      }
+    }
+    if (sampled == nullptr) {
+      continue; // the zero-count gap: percentiles are meaningless there
+    }
+    LatencyBandPoint point;
+    point.monotonic_ns = record.monotonic_ns();
+    point.p50_ns = sampled->p50_ns();
+    point.p90_ns = sampled->p90_ns();
+    point.p99_ns = sampled->p99_ns();
+    // The anchor wall join — the record's own wall field is NOT used.
+    point.wall_time_unix_ns = point.monotonic_ns + (anchor_.wall_time_unix_ns - anchor_.monotonic_ns);
+    point.phase_id = record.phase_id();
+    point.epoch_id = record.epoch_id();
+    band.push_back(std::move(point));
+  }
+  return band;
+}
+
 const ClockAnchor& SeriesView::anchor() const { return anchor_; }
 
 } // namespace Tui

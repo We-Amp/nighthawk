@@ -365,6 +365,103 @@ TEST(SeriesViewTest, EmptyViewIsInvalidAnchorAndNoSeries) {
   EXPECT_TRUE(view.SeriesNames().empty());
 }
 
+// The latency band's records: the FIRST flush models the unspecified
+// statistics order (statistics[0] is a zero-count response-class statistic,
+// the sampled latency statistic sits elsewhere), the SECOND carries the
+// bend's epoch stamp and a post-bend latency shape. The second record's wall
+// stamp is deliberately NOT the anchor-projected value (the join pin).
+std::vector<nighthawk::client::MetricSeriesRecord> LatencyRecords() {
+  nighthawk::client::MetricSeriesRecord first;
+  first.set_wall_time_unix_ns(1'000);
+  first.set_monotonic_ns(10'000);
+  first.set_phase_id("warm");
+  first.set_epoch_id("");
+  auto* zero = first.add_statistics();
+  zero->set_id("benchmark.latency_1xx"); // count 0: percentiles meaningless
+  auto* sampled = first.add_statistics();
+  sampled->set_id("benchmark.latency_2xx");
+  sampled->set_count(7);
+  sampled->set_p50_ns(1'000);
+  sampled->set_p90_ns(2'000);
+  sampled->set_p99_ns(3'000);
+  (*first.mutable_counters())["benchmark.http_2xx"] = 10;
+
+  nighthawk::client::MetricSeriesRecord second;
+  second.set_wall_time_unix_ns(999'000); // deliberately NOT the joined value
+  second.set_monotonic_ns(12'000);
+  second.set_phase_id("spike");
+  second.set_epoch_id("epoch-1");
+  auto* post = second.add_statistics();
+  post->set_id("benchmark.latency_2xx");
+  post->set_count(9);
+  post->set_p50_ns(1'100);
+  post->set_p90_ns(2'200);
+  post->set_p99_ns(9'000);
+
+  return {first, second};
+}
+
+// The latency band seam (the dogfood gap): MetricSeriesRecord.statistics is
+// the same data ApplySnapshot's band consumes — per flush record, the FIRST
+// statistic with samples (the zero-count scan rule), its p50/p90/p99 triple
+// stamped phase+epoch and anchor-joined wall, exactly like the counters.
+TEST(SeriesViewTest, LatencyBandUsesFirstSampledStatisticWithStamps) {
+  SeriesView view(LatencyRecords());
+  auto band = view.LatencyBand();
+  ASSERT_TRUE(band.ok()) << band.status();
+  ASSERT_EQ(band->size(), 2u);
+  EXPECT_EQ((*band)[0].monotonic_ns, 10'000);
+  EXPECT_EQ((*band)[0].wall_time_unix_ns, 1'000);
+  EXPECT_EQ((*band)[0].p50_ns, 1'000u);
+  EXPECT_EQ((*band)[0].p90_ns, 2'000u);
+  EXPECT_EQ((*band)[0].p99_ns, 3'000u);
+  EXPECT_EQ((*band)[0].phase_id, "warm");
+  EXPECT_EQ((*band)[0].epoch_id, "");
+  // The second point's wall is JOINED through the first-snapshot anchor
+  // (12'000 + (1'000 - 10'000) = 3'000); the record's own wall field does
+  // not leak through.
+  EXPECT_EQ((*band)[1].monotonic_ns, 12'000);
+  EXPECT_EQ((*band)[1].wall_time_unix_ns, 3'000);
+  EXPECT_NE((*band)[1].wall_time_unix_ns, 999'000);
+  EXPECT_EQ((*band)[1].phase_id, "spike");
+  EXPECT_EQ((*band)[1].epoch_id, "epoch-1");
+  EXPECT_EQ((*band)[1].p50_ns, 1'100u);
+  EXPECT_EQ((*band)[1].p90_ns, 2'200u);
+  EXPECT_EQ((*band)[1].p99_ns, 9'000u);
+}
+
+// A flush whose every statistic has count == 0 is a band GAP (the TUI's
+// zero-count rule): the band carries only the sampled flushes, never zeros
+// painted at the chart's bottom.
+TEST(SeriesViewTest, LatencyBandGapsOnZeroCountFlush) {
+  auto records = LatencyRecords();
+  nighthawk::client::MetricSeriesRecord dry;
+  dry.set_wall_time_unix_ns(2'000);
+  dry.set_monotonic_ns(11'000);
+  dry.set_phase_id("warm");
+  dry.add_statistics()->set_id("benchmark.latency_1xx"); // count 0
+  records.insert(records.begin() + 1, dry);
+  SeriesView view(records);
+  auto band = view.LatencyBand();
+  ASSERT_TRUE(band.ok()) << band.status();
+  ASSERT_EQ(band->size(), 2u);
+  EXPECT_EQ((*band)[0].monotonic_ns, 10'000);
+  EXPECT_EQ((*band)[1].monotonic_ns, 12'000);
+}
+
+// No sampled statistic anywhere: an honest empty band, not a fault.
+TEST(SeriesViewTest, LatencyBandEmptyWithoutSampledStatistics) {
+  nighthawk::client::MetricSeriesRecord dry;
+  dry.set_wall_time_unix_ns(1'000);
+  dry.set_monotonic_ns(10'000);
+  dry.set_phase_id("main");
+  dry.add_statistics()->set_id("benchmark.latency_1xx"); // count 0
+  SeriesView view({dry});
+  auto band = view.LatencyBand();
+  ASSERT_TRUE(band.ok()) << band.status();
+  EXPECT_TRUE(band->empty());
+}
+
 // The moved completed-work merge keeps its M0b semantics after the extraction
 // (the union-stamp last-value-at-or-before sum the §8.4 denominator uses).
 TEST(SeriesViewTest, MergeCompletedSeriesSemanticsUnchanged) {
