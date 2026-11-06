@@ -109,6 +109,31 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): the MCP security floor's contract pins (MCP plan Task
+# 5): the ONE canonical target parse + shared CheckTarget, the shared
+# start/steer load ceiling, the boundary validator over resources/read, the
+# startup flag validation, the stale-result-front fix, and the profile
+# window's host-blocking cap. Plain cc_test, same quarantine reasoning as
+# mcp_tools_test.
+cc_test(
+    name = "mcp_security_test",
+    srcs = ["mcp_security_test.cc"],
+    deps = [
+        "//api/client:grpc_service_lib",
+        "//source/client/mcp:mcp_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@googletest//:gtest_main",
+        # mcp_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 # FORK-ONLY (We-Amp): the MCP telemetry resources' contract pins (MCP plan
 # Task 3), driven over the same wire-faithful in-proc NighthawkService double
 # as mcp_tools_test, extended with a phased snapshot sequence (streamed

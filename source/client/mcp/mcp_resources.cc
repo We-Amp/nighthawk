@@ -20,6 +20,8 @@ void SetString(Struct& s, absl::string_view key, absl::string_view value) {
 void SetBool(Struct& s, absl::string_view key, bool value) {
   (*s.mutable_fields())[std::string(key)].set_bool_value(value);
 }
+// int64→double is lossy above 2^53 (ULP > 1); our stamps/counters stay far
+// below that bound.
 void SetInt(Struct& s, absl::string_view key, int64_t value) {
   (*s.mutable_fields())[std::string(key)].set_number_value(static_cast<double>(value));
 }

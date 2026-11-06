@@ -76,6 +76,16 @@ bool TypeMatches(const std::string& expected, const Value& value) {
   return true;
 }
 
+// The resources/read params schema: the boundary validator covers the
+// resource surface TOO (Task 5) — exactly one closed field, 'uri' (string,
+// required); anything else is a field-naming invalid-params, the same
+// validator tools/call arguments go through.
+constexpr char kResourceReadParamsSchema[] = R"json(
+    {"type": "object",
+     "properties": {"uri": {"type": "string"}},
+     "required": ["uri"],
+     "additionalProperties": false})json";
+
 } // namespace
 
 McpServer::McpServer(ToolRegistry& tools, ResourceRegistry& resources, LineSink sink, LogSink log,
@@ -307,6 +317,17 @@ Struct McpServer::HandleResourcesList() {
 }
 
 absl::StatusOr<Struct> McpServer::HandleResourcesRead(const Struct& params) {
+  // The boundary validator covers resources too (Task 5): the params object
+  // is closed-schema validated exactly like tools/call arguments — unknown
+  // fields and wrong types are field-naming invalid-params, and the resource
+  // boundary itself stays exact-match below (no traversal, no agent-shaped
+  // ids).
+  static const Struct* const read_schema =
+      new Struct(*ParseJsonObject(kResourceReadParamsSchema));
+  absl::Status valid = ValidateArguments(*read_schema, params);
+  if (!valid.ok()) {
+    return valid;
+  }
   const Value& uri_value = Field(params, "uri");
   if (uri_value.kind_case() != Value::kStringValue) {
     return absl::InvalidArgumentError("Invalid params: 'uri' (string) is required");

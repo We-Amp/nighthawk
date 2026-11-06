@@ -58,7 +58,11 @@ message CancellationRequest {
 // the reader thread, before any other response that run will produce.
 // Clients therefore keep at most one arm in flight awaiting an ack, and
 // match received update_results FIFO against their own outstanding-arm
-// order.
+// order. The matching key is the SEND SEQUENCE: a result belongs to the
+// arm whose send preceded its arrival, so a result that was already queued
+// when a later arm was sent is stale for that arm and must be dropped, not
+// consumed (an arm's own verdict — the guard rejection or the applier-bound
+// ack — always arrives after that arm's send).
 //
 // Late-rejection drop window: an update that resolves after the run ended,
 // or after a cancellation was accepted, resolves WITHOUT any stream write —

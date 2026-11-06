@@ -101,6 +101,73 @@ void WaiterPool::WorkerLoop() {
   }
 }
 
+absl::Status ValidateStartupFlags(const McpServerFlags& flags) {
+  // The target allowlist: every entry must parse as addr/len.
+  const absl::Status cidrs = ValidateCidrs(flags.allow_target_cidrs);
+  if (!cidrs.ok()) {
+    return cidrs;
+  }
+  // The load ceiling must be a positive figure (a ceiling of 0 or below
+  // would refuse every run with a nonsense message — a misconfiguration).
+  if (flags.max_rps <= 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("--max-rps must be > 0, got ", flags.max_rps));
+  }
+  if (flags.timeout_s <= 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("--timeout must be > 0, got ", flags.timeout_s));
+  }
+  // The service endpoint: host:port (bracketed IPv6 literals allowed), the
+  // port numeric in range — a malformed endpoint would otherwise surface as
+  // a confusing gRPC failure on the first tool call.
+  {
+    absl::string_view hostport = flags.service_address;
+    absl::string_view host = hostport;
+    absl::string_view port;
+    if (!hostport.empty() && hostport[0] == '[') {
+      const size_t close = hostport.find(']');
+      if (close == absl::string_view::npos) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "--service-address '", flags.service_address,
+            "' is malformed: unterminated IPv6 literal (expected [host]:port)"));
+      }
+      host = hostport.substr(1, close - 1);
+      port = hostport.substr(close + 1);
+      if (!port.empty() && port[0] != ':') {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "--service-address '", flags.service_address,
+            "' is malformed: text after the IPv6 literal"));
+      }
+      port = port.empty() ? port : port.substr(1);
+    } else {
+      const size_t colon = hostport.rfind(':');
+      if (colon != absl::string_view::npos) {
+        host = hostport.substr(0, colon);
+        port = hostport.substr(colon + 1);
+      }
+    }
+    if (host.empty()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "--service-address '", flags.service_address, "' is malformed: empty host"));
+    }
+    int port_number = 0;
+    if (!absl::SimpleAtoi(port, &port_number) || port_number < 1 || port_number > 65535) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "--service-address '", flags.service_address,
+          "' is malformed: the port must be a number in 1..65535"));
+    }
+  }
+  // The profile window default is pull_profile_window's host-blocking bound;
+  // the same cap as the tool argument bounds it (kMaxProfileWindowSeconds).
+  if (flags.profile.pipeline.window_seconds < 1 ||
+      flags.profile.pipeline.window_seconds > kMaxProfileWindowSeconds) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "--profile-window-seconds must be in 1..", kMaxProfileWindowSeconds, ", got ",
+        flags.profile.pipeline.window_seconds));
+  }
+  return absl::OkStatus();
+}
+
 int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& out,
                  std::ostream& err) {
   const auto channel = grpc::CreateChannel(flags.service_address, grpc::InsecureChannelCredentials());
@@ -290,14 +357,6 @@ int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out
     flags.max_rps = max_rps.getValue();
     flags.timeout_s = timeout.getValue();
 
-    // Malformed --allow-target-cidr values are a startup failure, before
-    // any protocol line is spoken.
-    const absl::Status cidrs = ValidateCidrs(flags.allow_target_cidrs);
-    if (!cidrs.ok()) {
-      err << absl::StrCat("nighthawk_mcp: ", cidrs.message(), "\n");
-      return 1;
-    }
-
     // The profile flag surface (Task 4), the TUI's configured rule. An
     // unknown retriever kind is a startup failure naming the flag (the
     // mount/scp choice is not silently guessed).
@@ -325,6 +384,16 @@ int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out
     flags.profile.pipeline.window_seconds = static_cast<int>(profile_window_seconds.getValue());
     const char* binary_layout = std::getenv("PPROF_BINARY_PATH");
     flags.profile.pipeline.pprof_binary_path = binary_layout != nullptr ? binary_layout : "";
+
+    // The startup flag validation (Task 5): malformed values are a startup
+    // failure — the reason on stderr, exit non-zero — before any protocol
+    // line is spoken. Runs over the FULLY-populated flag surface (the
+    // profile window default included).
+    const absl::Status startup = ValidateStartupFlags(flags);
+    if (!startup.ok()) {
+      err << absl::StrCat("nighthawk_mcp: ", startup.message(), "\n");
+      return 1;
+    }
 
     return RunMcpServer(flags, in, out, err);
   } catch (TCLAP::ArgException& e) {

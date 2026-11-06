@@ -147,6 +147,49 @@ using HostResolver =
 // offending entry.
 absl::Status ValidateCidrs(const std::vector<std::string>& cidrs);
 
+// --- the security floor (MCP plan Task 5) -----------------------------------
+//
+// ONE canonical parse, ONE target check, ONE ceiling — every entry that
+// takes a target or a load figure goes through these, so the confusion
+// cases (userinfo tricks, IPv6-mapped forms, mixed resolution results)
+// cannot diverge between surfaces.
+
+// The canonical target-uri parse: ONE parse path for every consumer. The
+// host is what follows the LAST '@' in the authority (the userinfo trick
+// pins there), bracketed IPv6 literals keep their port after ']', and a
+// zone id (%en0) is stripped — link-local scoping this server has no
+// business following.
+struct ParsedTarget {
+  std::string scheme;
+  std::string userinfo; // "" when absent; never inspected, kept for the rewrite
+  std::string host;     // lowercase, brackets and zone stripped
+  std::string port;     // "" when absent
+  std::string path_query;
+};
+
+absl::StatusOr<ParsedTarget> ParseTargetUri(absl::string_view uri);
+
+// The single shared target check — resolve -> check EVERY resolved address
+// against loopback ∪ `allow_cidrs` -> rewrite-to-IP — for EVERY entry that
+// takes a target (start_run today; any future target-taking entry must call
+// this, not re-implement it). Refusals happen before any engine connection
+// and name the offending address.
+absl::StatusOr<std::string> CheckTarget(absl::string_view uri,
+                                        const std::vector<std::string>& allow_cidrs,
+                                        HostResolver resolver);
+
+// The shared load-ceiling check behind start_run (the declared total AND
+// each phase's rps) and steer: `declared` above `max_rps` refuses with the
+// cap-naming error. `subject` names the refused figure ("declared total
+// rps", or "phase 'warm' total rps").
+absl::Status CheckRpsCeiling(long long declared, long long max_rps,
+                             absl::string_view subject = "declared total rps");
+
+// The host-blocking cap for a profile window (pull_profile_window blocks
+// for the whole window): the tool's duration_s and the --profile-window-
+// seconds default are both bounded by this. Named in the tool description.
+constexpr int64_t kMaxProfileWindowSeconds = 300;
+
 // The run-driving carrier behind the steering tools. One in-flight run at a
 // time (the feed's own discipline); every callback lands on the feed's read
 // thread and hops into this controller's mutex. Handlers are called by the
@@ -241,9 +284,10 @@ private:
   void OnUpdateResult(const nighthawk::client::UpdateResult& result);
   void OnFinished(const absl::Status& status);
 
-  // The scope-check (resolve -> check-all -> rewrite-to-IP) for one target
-  // uri. Returns the rewritten uri (resolved IP substituted for the host).
-  absl::StatusOr<std::string> ScopeAndRewriteTarget(absl::string_view uri);
+  // Drops queued update results no remaining waiter can ever claim (their
+  // seq predates every waiter's send): a timed-out steer's late ack must not
+  // wedge the queue front (mutex_ held by the caller).
+  void PurgeUnclaimableResults();
 
   // Seals the open session (run end record, completed flag); no-op when no
   // session is open. Caller holds no lock (the recorder is a leaf).

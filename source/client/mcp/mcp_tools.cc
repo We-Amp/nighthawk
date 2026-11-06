@@ -132,6 +132,8 @@ void SetString(Struct& s, absl::string_view key, absl::string_view value) {
 void SetBool(Struct& s, absl::string_view key, bool value) {
   (*s.mutable_fields())[std::string(key)].set_bool_value(value);
 }
+// int64→double is lossy above 2^53 (ULP > 1); our stamps/counters stay far
+// below that bound.
 void SetInt(Struct& s, absl::string_view key, int64_t value) {
   (*s.mutable_fields())[std::string(key)].set_number_value(static_cast<double>(value));
 }
@@ -277,81 +279,6 @@ std::string NormalizeAddress(const std::string& addr, int* family) {
   return addr;
 }
 
-// The one canonical target-uri parser (Global Constraints: ONE parser, so
-// userinfo tricks and bracket forms cannot diverge between checks).
-struct ParsedTarget {
-  std::string scheme;
-  std::string userinfo; // "" when absent; never inspected, kept for the rewrite
-  std::string host;     // lowercase, brackets and zone stripped
-  std::string port;     // "" when absent
-  std::string path_query;
-};
-
-absl::StatusOr<ParsedTarget> ParseTargetUri(absl::string_view uri) {
-  const size_t scheme_end = uri.find("://");
-  if (scheme_end == absl::string_view::npos || scheme_end == 0) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "invalid target uri '", uri, "': expected <scheme>://<host>[:<port>]/<path>"));
-  }
-  ParsedTarget target;
-  target.scheme = std::string(uri.substr(0, scheme_end));
-  const absl::string_view rest = uri.substr(scheme_end + 3);
-  const size_t authority_end = rest.find_first_of("/?#");
-  const absl::string_view authority =
-      authority_end == absl::string_view::npos ? rest : rest.substr(0, authority_end);
-  target.path_query =
-      authority_end == absl::string_view::npos ? "" : std::string(rest.substr(authority_end));
-
-  absl::string_view hostport = authority;
-  const size_t at = authority.rfind('@');
-  if (at != absl::string_view::npos) {
-    // Userinfo precedes the LAST '@': the host is what follows it, never the
-    // text before it (the userinfo trick).
-    target.userinfo = std::string(authority.substr(0, at));
-    hostport = authority.substr(at + 1);
-  }
-  if (hostport.empty()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("invalid target uri '", uri, "': empty host"));
-  }
-  if (hostport[0] == '[') {
-    const size_t close = hostport.find(']');
-    if (close == absl::string_view::npos) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("invalid target uri '", uri, "': unterminated IPv6 literal"));
-    }
-    target.host = std::string(hostport.substr(1, close - 1));
-    const absl::string_view after = hostport.substr(close + 1);
-    if (!after.empty()) {
-      if (after[0] != ':') {
-        return absl::InvalidArgumentError(
-            absl::StrCat("invalid target uri '", uri, "': text after the IPv6 literal"));
-      }
-      target.port = std::string(after.substr(1));
-    }
-  } else {
-    const size_t colon = hostport.rfind(':');
-    if (colon != absl::string_view::npos) {
-      target.host = std::string(hostport.substr(0, colon));
-      target.port = std::string(hostport.substr(colon + 1));
-    } else {
-      target.host = std::string(hostport);
-    }
-  }
-  target.host = absl::AsciiStrToLower(target.host);
-  // Zone id (fe80::1%en0): stripped — the zone is link-local scoping this
-  // server has no business following.
-  const size_t zone = target.host.find('%');
-  if (zone != std::string::npos) {
-    target.host = target.host.substr(0, zone);
-  }
-  if (target.host.empty()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("invalid target uri '", uri, "': empty host"));
-  }
-  return target;
-}
-
 // The default resolver: getaddrinfo, ALL addresses, numeric output.
 absl::StatusOr<std::vector<std::string>> DefaultResolveHost(absl::string_view host) {
   addrinfo hints{};
@@ -466,15 +393,86 @@ absl::Status ValidateCidrs(const std::vector<std::string>& cidrs) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> SteeringController::ScopeAndRewriteTarget(absl::string_view uri) {
+// The one canonical target-uri parser (Global Constraints: ONE parser, so
+// userinfo tricks and bracket forms cannot diverge between checks) — the
+// single definition every target-taking entry parses through.
+absl::StatusOr<ParsedTarget> ParseTargetUri(absl::string_view uri) {
+  const size_t scheme_end = uri.find("://");
+  if (scheme_end == absl::string_view::npos || scheme_end == 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "invalid target uri '", uri, "': expected <scheme>://<host>[:<port>]/<path>"));
+  }
+  ParsedTarget target;
+  target.scheme = std::string(uri.substr(0, scheme_end));
+  const absl::string_view rest = uri.substr(scheme_end + 3);
+  const size_t authority_end = rest.find_first_of("/?#");
+  const absl::string_view authority =
+      authority_end == absl::string_view::npos ? rest : rest.substr(0, authority_end);
+  target.path_query =
+      authority_end == absl::string_view::npos ? "" : std::string(rest.substr(authority_end));
+
+  absl::string_view hostport = authority;
+  const size_t at = authority.rfind('@');
+  if (at != absl::string_view::npos) {
+    // Userinfo precedes the LAST '@': the host is what follows it, never the
+    // text before it (the userinfo trick).
+    target.userinfo = std::string(authority.substr(0, at));
+    hostport = authority.substr(at + 1);
+  }
+  if (hostport.empty()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid target uri '", uri, "': empty host"));
+  }
+  if (hostport[0] == '[') {
+    const size_t close = hostport.find(']');
+    if (close == absl::string_view::npos) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid target uri '", uri, "': unterminated IPv6 literal"));
+    }
+    target.host = std::string(hostport.substr(1, close - 1));
+    const absl::string_view after = hostport.substr(close + 1);
+    if (!after.empty()) {
+      if (after[0] != ':') {
+        return absl::InvalidArgumentError(
+            absl::StrCat("invalid target uri '", uri, "': text after the IPv6 literal"));
+      }
+      target.port = std::string(after.substr(1));
+    }
+  } else {
+    const size_t colon = hostport.rfind(':');
+    if (colon != absl::string_view::npos) {
+      target.host = std::string(hostport.substr(0, colon));
+      target.port = std::string(hostport.substr(colon + 1));
+    } else {
+      target.host = std::string(hostport);
+    }
+  }
+  target.host = absl::AsciiStrToLower(target.host);
+  // Zone id (fe80::1%en0): stripped — the zone is link-local scoping this
+  // server has no business following.
+  const size_t zone = target.host.find('%');
+  if (zone != std::string::npos) {
+    target.host = target.host.substr(0, zone);
+  }
+  if (target.host.empty()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid target uri '", uri, "': empty host"));
+  }
+  return target;
+}
+
+absl::StatusOr<std::string> CheckTarget(absl::string_view uri,
+                                        const std::vector<std::string>& allow_cidrs,
+                                        HostResolver resolver) {
+  // ONE parse path: the canonical parser above.
   auto target = ParseTargetUri(uri);
   if (!target.ok()) {
     return target.status();
   }
 
   std::vector<Cidr> cidrs;
-  cidrs.reserve(options_.allow_target_cidrs.size());
-  for (const std::string& entry : options_.allow_target_cidrs) {
+  cidrs.reserve(allow_cidrs.size());
+  for (const std::string& entry : allow_cidrs) {
     auto parsed = ParseCidr(entry);
     if (!parsed.ok()) {
       return parsed.status();
@@ -493,7 +491,7 @@ absl::StatusOr<std::string> SteeringController::ScopeAndRewriteTarget(absl::stri
     int family = AF_UNSPEC;
     addresses.push_back(NormalizeAddress(target->host, &family));
   } else {
-    auto resolved = (resolver_ ? resolver_ : DefaultResolveHost)(target->host);
+    auto resolved = (resolver ? resolver : DefaultResolveHost)(target->host);
     if (!resolved.ok()) {
       return absl::InvalidArgumentError(absl::StrCat(
           "target '", uri, "' cannot be resolved: ", resolved.status().message(),
@@ -535,6 +533,14 @@ absl::StatusOr<std::string> SteeringController::ScopeAndRewriteTarget(absl::stri
   return absl::StrCat(target->scheme, "://",
                       target->userinfo.empty() ? "" : target->userinfo + "@", host_text,
                       target->port.empty() ? "" : ":" + target->port, target->path_query);
+}
+
+absl::Status CheckRpsCeiling(long long declared, long long max_rps, absl::string_view subject) {
+  if (declared > max_rps) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        subject, " ", declared, " exceeds the load ceiling of ", max_rps, " rps (--max-rps)"));
+  }
+  return absl::OkStatus();
 }
 
 SteeringController::SteeringController(const std::shared_ptr<grpc::ChannelInterface>& channel,
@@ -671,21 +677,21 @@ void SteeringController::OnFinished(const absl::Status& /*status*/) {
 absl::StatusOr<google::protobuf::Struct>
 SteeringController::StartRun(const google::protobuf::Struct& arguments) {
   // 1. The scope check binds at CONNECT: resolve, check all, rewrite —
-  //    before anything else touches the engine.
+  //    before anything else touches the engine. THE shared CheckTarget (the
+  //    single canonical parse + check-everywhere; Task 5).
   const Value* uri = FindField(arguments, "uri");
-  auto rewritten = ScopeAndRewriteTarget(uri->string_value());
+  auto rewritten = CheckTarget(uri->string_value(), options_.allow_target_cidrs, resolver_);
   if (!rewritten.ok()) {
     return rewritten.status();
   }
 
-  // 2. The load ceiling: the declared global total at start_run.
+  // 2. The load ceiling: the declared global total at start_run (the shared
+  //    CheckRpsCeiling — the same check steer applies).
   const Value* rps = FindField(arguments, "rps");
   if (rps != nullptr) {
-    const int64_t declared = IntegerOf(*rps);
-    if (declared > options_.max_rps) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "declared total rps ", declared, " exceeds the load ceiling of ",
-          options_.max_rps, " rps (--max-rps)"));
+    const absl::Status ceiling = CheckRpsCeiling(IntegerOf(*rps), options_.max_rps);
+    if (!ceiling.ok()) {
+      return ceiling;
     }
   }
   const Value* phases = FindField(arguments, "phases");
@@ -693,11 +699,11 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
     auto parsed = Tui::StartRunDialogModel::ParsePhasesField(phases->string_value());
     if (parsed.ok()) {
       for (const nighthawk::client::PhaseSpec& phase : *parsed) {
-        if (phase.requests_per_second() > options_.max_rps) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "phase '", phase.name(), "' declares total rps ",
-              phase.requests_per_second(), " which exceeds the load ceiling of ",
-              options_.max_rps, " rps (--max-rps)"));
+        const absl::Status ceiling = CheckRpsCeiling(
+            phase.requests_per_second(), options_.max_rps,
+            absl::StrCat("phase '", phase.name(), "' total rps"));
+        if (!ceiling.ok()) {
+          return ceiling;
         }
       }
     }
@@ -795,11 +801,11 @@ SteeringController::Steer(const google::protobuf::Struct& arguments) {
         "steer requires at least one of 'rps', 'ramp_time_s'");
   }
   if (rps != nullptr) {
-    const int64_t declared = IntegerOf(*rps);
-    if (declared > options_.max_rps) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "declared total rps ", declared, " exceeds the load ceiling of ",
-          options_.max_rps, " rps (--max-rps)"));
+    // The ceiling is the shared start_run/steer check: a steer's declared
+    // total is refused exactly like a start_run's (Task 5 pin).
+    const absl::Status ceiling = CheckRpsCeiling(IntegerOf(*rps), options_.max_rps);
+    if (!ceiling.ok()) {
+      return ceiling;
     }
   }
 
@@ -832,6 +838,10 @@ SteeringController::Steer(const google::protobuf::Struct& arguments) {
     my_seq = ++next_seq_;
     overlap = !steer_waiters_.empty();
     steer_waiters_.push_back(SteerWaiter{my_seq, overlap});
+    // A timed-out steer's late ack may already sit at the queue front; drop
+    // whatever no remaining waiter can claim so it cannot wedge THIS wait
+    // (T2-M1).
+    PurgeUnclaimableResults();
   }
   // No client-side one-in-flight refusal: a second steer while one is
   // pending reaches the engine and is rejected by its one-in-flight guard
@@ -879,6 +889,11 @@ SteeringController::Steer(const google::protobuf::Struct& arguments) {
           return false;
         }
       }
+      // Once no overlap waiter remains, a front the non-overlap waiter sent
+      // AFTER (a timed-out steer's late ack) is unclaimable forever — purge
+      // it so the oldest result with seq > my_seq becomes consumable
+      // (T2-M1: the stale-result-front wedge).
+      PurgeUnclaimableResults();
       return !update_results_.empty() && update_results_.front().seq > my_seq;
     };
     if (!cv_.wait_until(lock, absl::ToChronoTime(deadline), my_turn)) {
@@ -913,6 +928,28 @@ void SteeringController::UnregisterSteerWaiter(int64_t seq) {
       steer_waiters_.erase(it);
       return;
     }
+  }
+}
+
+void SteeringController::PurgeUnclaimableResults() {
+  // mutex_ held by the caller. A queued result is claimable only by a waiter
+  // that sent BEFORE the result arrived (seq < result seq — "arrived after
+  // my send"). When no remaining waiter precedes the front, nobody can ever
+  // match it: drop it (and any equally orphaned result behind it) so a
+  // timed-out steer's late ack cannot wedge the queue front against results
+  // that ARE claimable (T2-M1).
+  while (!update_results_.empty()) {
+    bool claimable = false;
+    for (const SteerWaiter& waiter : steer_waiters_) {
+      if (waiter.seq < update_results_.front().seq) {
+        claimable = true;
+        break;
+      }
+    }
+    if (claimable) {
+      return;
+    }
+    update_results_.pop_front();
   }
 }
 
@@ -1148,22 +1185,24 @@ constexpr char kPullSchema[] = R"json(
     {"type": "object",
      "properties": {
        "duration_s": {"type": "integer",
-                      "description": "The window length in seconds (the SUT CPU profiler samples for exactly this long). Default: the --profile-window-seconds flag (5)."}},
+                      "description": "The window length in seconds (the SUT CPU profiler samples for exactly this long). Default: the --profile-window-seconds flag (5). Capped at 300: the tool blocks for the whole window on the server host."}},
      "required": [],
      "additionalProperties": false})json";
 
 constexpr char kPullDescription[] =
     "Pulls one CPU profile window from the SUT and folds it into a "
     "phase-aligned, per-unit-of-work normalizable profile window. Args: "
-    "duration_s (integer, optional; default 5). BLOCKS for duration_s (the "
-    "stated bound: the window's own length plus two small admin POSTs), then "
-    "answers {window_id, status:'folding'}; poll window_status{id} until "
-    "'ready' or 'failed:<reason>'. Requires profiling configured "
-    "(--profile-mount or --scp-host; otherwise the honest not-configured "
-    "error) and a run whose stamps the window aligns against. One window at "
-    "a time: a second pull while one is staged or folding is refused. "
-    "Windows land pure or excluded-and-marked (purity recorded); only pure "
-    "windows are differential-comparable.";
+    "duration_s (integer, optional; default 5; CAPPED AT 300 s — the tool "
+    "blocks the server host for the whole window, so the cap bounds that "
+    "block). BLOCKS for duration_s (the stated bound: the window's own "
+    "length plus two small admin POSTs), then answers {window_id, "
+    "status:'folding'}; poll window_status{id} until 'ready' or "
+    "'failed:<reason>'. Requires profiling configured (--profile-mount or "
+    "--scp-host; otherwise the honest not-configured error) and a run whose "
+    "stamps the window aligns against. One window at a time: a second pull "
+    "while one is staged or folding is refused. Windows land pure or "
+    "excluded-and-marked (purity recorded); only pure windows are "
+    "differential-comparable.";
 
 constexpr char kWindowStatusSchema[] = R"json(
     {"type": "object",
@@ -1250,15 +1289,24 @@ ProfileController::~ProfileController() {
 
 absl::StatusOr<google::protobuf::Struct>
 ProfileController::PullProfileWindow(const google::protobuf::Struct& arguments) {
-  if (!options_.configured) {
-    return absl::FailedPreconditionError(kNotConfiguredMessage);
-  }
+  // The window length is validated FIRST (arg-boundary before posture): the
+  // pull blocks the server host for the whole window, so the host-blocking
+  // cap bounds it no matter the profiling posture (T4-Low). The default (the
+  // --profile-window-seconds flag) is bounded by the same cap, at startup.
   int64_t window_seconds = options_.pipeline.window_seconds;
   if (const Value* duration = FindField(arguments, "duration_s"); duration != nullptr) {
     window_seconds = IntegerOf(*duration);
     if (window_seconds <= 0) {
       return absl::InvalidArgumentError("duration_s must be > 0");
     }
+  }
+  if (window_seconds > kMaxProfileWindowSeconds) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "duration_s ", window_seconds, " exceeds the host-blocking cap of ",
+        kMaxProfileWindowSeconds, " s: the pull blocks for the whole window"));
+  }
+  if (!options_.configured) {
+    return absl::FailedPreconditionError(kNotConfiguredMessage);
   }
 
   // The run-context guard (the TUI p-flow's messages): a window without run

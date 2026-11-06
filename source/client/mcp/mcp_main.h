@@ -91,6 +91,15 @@ private:
   bool drained_ = false;
 };
 
+// The startup flag validation (the security round's StartupFlagValidation):
+// every flag the server will honor is checked BEFORE any protocol line is
+// spoken, and a malformed value is a startup failure — the reason on stderr,
+// exit non-zero. Covers --allow-target-cidr (ValidateCidrs), --max-rps and
+// --timeout (positive), --service-address (a parseable host:port endpoint),
+// and --profile-window-seconds (1..kMaxProfileWindowSeconds — it is
+// pull_profile_window's host-blocking default).
+absl::Status ValidateStartupFlags(const McpServerFlags& flags);
+
 // Runs the stdio transport loop to completion (EOF on `in`). Returns the
 // process exit code (0 on a clean shutdown). Protocol responses go to `out`
 // as canonical JSON lines; diagnostics go to `err`.
@@ -98,8 +107,10 @@ int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& ou
                  std::ostream& err);
 
 // Parses the flag surface with TCLAP (malformed values are a startup
-// failure via TCLAP; a malformed --allow-target-cidr is a startup failure
-// with a stderr message), then runs RunMcpServer.
+// failure via TCLAP; a malformed value that TCLAP cannot catch — CIDR text,
+// a non-positive ceiling or timeout, an unparseable service endpoint, an
+// out-of-range profile window — fails ValidateStartupFlags with a stderr
+// message), then runs RunMcpServer.
 int RunMcpServerMain(int argc, char* argv[], std::istream& in, std::ostream& out,
                      std::ostream& err);
 
