@@ -86,7 +86,11 @@ public:
   // shared client choke point, which strips live_streaming for legacy
   // consumers. The stream is deliberately NOT half-closed here (DQ-2): it
   // stays writable for SendUpdate/SendCancellation, and the feed half-closes
-  // after the final output arrives. Returns kFailedPrecondition if a run is
+  // after the final output arrives. The previous run's stream and context are
+  // released only after that run's read thread has been joined (running()
+  // reads false from the run's final output onward -- before the read thread
+  // has exited its post-output tail -- so the join, not the flag, is what
+  // makes the teardown safe). Returns kFailedPrecondition if a run is
   // already in flight; a stop() immediately followed by start() also returns
   // kFailedPrecondition, until the stopped run's on_finished has landed
   // (inherent to the single read-thread design, not a bug).

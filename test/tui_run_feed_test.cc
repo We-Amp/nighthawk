@@ -602,6 +602,64 @@ TEST_F(RunFeedTest, RunFeedUpdateTimeoutSurfacesPending) {
   EXPECT_TRUE(recorder.completed);
 }
 
+// The stop/restart race, feed-side: running() reads false from the run's
+// final output onward, while the read thread is still executing its
+// post-output tail (the unlocked Read() and Finish() on the stream, the
+// pending-update surfacing, on_finished). A start() landing in that window
+// must join the old read thread BEFORE releasing the previous run's stream:
+// resetting it under the live thread would destroy the stream that thread is
+// still dereferencing (use-after-free), and destroy it without the Finish()
+// the grpc++ contract requires. The hogging applier below keeps the service's
+// run scope alive past the run's end, which holds the old stream's trailing
+// status back and pins the window open deterministically: the read thread
+// sits in Read() with running() false while the second start() lands.
+TEST_F(RunFeedTest, StartJoinsReadThreadBeforeTearingDownItsStream) {
+  service().SetUpdateApplierFactoryForTest(
+      []() { return std::make_unique<DeadlineHoggingApplier>(); });
+
+  FeedRecorder recorder;
+  recorder.arm();
+  RunFeed feed(channel(), recorder.callbacks());
+
+  EXPECT_EQ(feed.start(makeStartRequest(listener().uri(), /*rps=*/10, /*duration_seconds=*/2,
+                                        /*stats_flush_interval=*/1)),
+            absl::OkStatus());
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(10), [&recorder]() { return !recorder.snapshots.empty(); }));
+
+  // An update whose applier hogs its full deadline keeps the service's run
+  // scope alive past the run's end, so the old stream stays open (no trailing
+  // status) well after running() flips false.
+  nighthawk::client::UpdateRequest update;
+  update.mutable_deltas()->Add()->mutable_requests_per_second()->set_value(20);
+  EXPECT_EQ(feed.SendUpdate(update), absl::OkStatus());
+
+  // Run 1's output arrived and running() reads false -- the read thread is
+  // now inside its post-output tail, blocked in Read() on the old stream.
+  ASSERT_TRUE(recorder.waitFor(absl::Seconds(30), [&recorder, &feed]() {
+    return recorder.completed && !feed.running();
+  }));
+
+  // Back-to-back start into that window: the previous run's stream must not
+  // be torn down until its read thread is gone.
+  absl::Status restart = feed.start(makeStartRequest(listener().uri(), 10, 2, 1));
+  EXPECT_EQ(restart, absl::OkStatus()) << restart.ToString();
+
+  // Both runs end: run 1's finish lands once the service lets its stream go,
+  // run 2 completes naturally after it -- the follow-up run's output is the
+  // proof the restart really served a fresh run on a fresh stream.
+  ASSERT_TRUE(
+      recorder.waitFor(absl::Seconds(60), [&recorder]() { return recorder.finished_count >= 2; }));
+  {
+    std::lock_guard<std::mutex> lock(recorder.mutex);
+    EXPECT_GE(recorder.finished_count, 2);
+    EXPECT_TRUE(recorder.finished_status.ok()) << recorder.finished_status.ToString();
+    EXPECT_TRUE(recorder.completed);
+    EXPECT_GT(recorder.final_output.results_size(), 0);
+    EXPECT_EQ(recorder.events.back(), "finished");
+  }
+}
+
 // The explicit cancellation arm keeps the stream alive: the run ends promptly
 // AND its final output still arrives (on_completed), then on_finished OK —
 // unlike stop(), which yields no responses after the cancel.

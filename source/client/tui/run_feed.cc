@@ -56,10 +56,6 @@ absl::Status RunFeed::start(const nighthawk::client::StartRequest& start_request
     // deadlock when the old read thread is inside its on_finished callback and
     // that callback calls stop() (the one sanctioned re-entrant call).
     to_join = std::move(read_thread_);
-    // The previous run's stream and context can be released before a fresh
-    // pair is opened.
-    stream_.reset();
-    context_.reset();
     update_pending_count_ = 0;
   }
   if (to_join.joinable()) {
@@ -76,6 +72,17 @@ absl::Status RunFeed::start(const nighthawk::client::StartRequest& start_request
     if (!options->has_stats_flush_interval()) {
       options->mutable_stats_flush_interval()->set_value(1);
     }
+
+    // Release the previous run's stream and context ONLY now, after its read
+    // thread is joined above. running_ legitimately reads false while that
+    // thread is still executing its post-output tail (the unlocked Read() and
+    // Finish() on the stream, the pending-update surfacing, on_finished), so
+    // passing the running_ check is no proof the stream is unused -- the
+    // joined thread is. Resetting under it would destroy the stream the old
+    // read thread is still dereferencing (use-after-free), and would destroy
+    // it without the Finish() the grpc++ contract requires.
+    stream_.reset();
+    context_.reset();
 
     context_ = std::make_unique<grpc::ClientContext>();
     // grpc++ requires Finish() on the stream before it is destroyed; the read
