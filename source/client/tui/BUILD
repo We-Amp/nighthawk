@@ -62,6 +62,50 @@ envoy_cc_library(
     ],
 )
 
+# FORK-ONLY (We-Amp): the FTXUI-free profile pipeline (MCP plan Task 4's
+# quarantine need): the SUT admin client, the fetch orchestration, the
+# window/diff machinery, the pprof fold + symbolizer + worker pool, the
+# session conversion, and the ONE pool-job pipeline — moved out of tui_lib
+# (which links FTXUI) so the nighthawk_mcp graph can consume the
+# window/differential machinery without the terminal stack. tui_lib consumes
+# it unchanged; the flamegraph pipeline suite pins the behavior.
+envoy_cc_library(
+    name = "profile_pipeline_lib",
+    srcs = [
+        "admin_client.cc",
+        "pprof_fold.cc",
+        "pprof_worker_pool.cc",
+        "profile_fetcher.cc",
+        "profile_pipeline.cc",
+        "profile_session_conversion.cc",
+        "profile_symbolizer.cc",
+        "profile_windows.cc",
+    ],
+    hdrs = [
+        "admin_client.h",
+        "pprof_fold.h",
+        "pprof_worker_pool.h",
+        "profile_fetcher.h",
+        "profile_pipeline.h",
+        "profile_session_conversion.h",
+        "profile_symbolizer.h",
+        "profile_windows.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/client:base_cc_proto",
+        "//api/pprof:profile_cc_proto",
+        "//source/client/headless:client_headless",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@protobuf//src/google/protobuf/io:gzip_stream",
+    ],
+)
+
 # FORK-ONLY (We-Amp): TUI library skeleton. Quarantined dependency surface:
 # only FTXUI, TCLAP, the generated nighthawk client protos, and their
 # transitive proto/grpc deps — no @envoy//source C++ targets. The standing
@@ -69,34 +113,20 @@ envoy_cc_library(
 envoy_cc_library(
     name = "tui_lib",
     srcs = [
-        "admin_client.cc",
         "charts.cc",
         "flamegraph.cc",
         "knob_pane.cc",
         "layout.cc",
-        "pprof_fold.cc",
-        "pprof_worker_pool.cc",
-        "profile_fetcher.cc",
-        "profile_session_conversion.cc",
-        "profile_symbolizer.cc",
-        "profile_windows.cc",
         "status_bar.cc",
         "sut_stats.cc",
         "tui_app.cc",
     ],
     hdrs = [
-        "admin_client.h",
         "charts.h",
         "flamegraph.h",
         "input_mode.h",
         "knob_pane.h",
         "layout.h",
-        "pprof_fold.h",
-        "pprof_worker_pool.h",
-        "profile_fetcher.h",
-        "profile_session_conversion.h",
-        "profile_symbolizer.h",
-        "profile_windows.h",
         "status_bar.h",
         "sut_stats.h",
         "tui_app.h",
@@ -117,6 +147,7 @@ envoy_cc_library(
         # The FTXUI-free sub-libraries above (moved out of this target so the
         # nighthawk_mcp graph can consume them without FTXUI).
         ":knob_rules_lib",
+        ":profile_pipeline_lib",
         ":run_feed_lib",
         ":session_conversion_lib",
         ":start_run_dialog_lib",

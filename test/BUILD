@@ -82,6 +82,33 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): the MCP profile-window + differential tools' contract
+# pins (MCP plan Task 4), driven against the same wire-faithful in-proc
+# NighthawkService double the steering suite pins plus a stub admin endpoint
+# answering the POST-only /cpuprofiler mutators, and fixture profile bytes
+# through the volume-mount retriever. Plain cc_test, same quarantine
+# reasoning as mcp_tools_test.
+cc_test(
+    name = "mcp_profile_test",
+    srcs = ["mcp_profile_test.cc"],
+    deps = [
+        "//api/client:grpc_service_lib",
+        "//api/pprof:profile_cc_proto",
+        "//source/client/mcp:mcp_lib",
+        "//source/client/tui:profile_pipeline_lib",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@googletest//:gtest_main",
+        # mcp_lib carries grpc++ code (run_feed); plain cc_test consumers must
+        # link grpc explicitly (same as tui_app_test).
+        "@grpc//:grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
 # FORK-ONLY (We-Amp): session file format, writer/reader, and queue drop
 # contract tests. Plain cc_test for the same reason as tui_app_test: the TUI
 # quarantine keeps this off Envoy's C++ sources and test helpers.

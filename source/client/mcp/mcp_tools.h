@@ -14,18 +14,25 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 
 #include "google/protobuf/struct.pb.h"
 
 #include "source/client/headless/fold_tracker.h"
+#include "source/client/headless/run_view_model.h"
+#include "source/client/headless/series_view.h"
 #include "source/client/headless/session_recorder.h"
+#include "source/client/tui/pprof_worker_pool.h"
+#include "source/client/tui/profile_pipeline.h"
+#include "source/client/tui/profile_windows.h"
 #include "source/client/tui/run_feed.h"
 
 namespace Nighthawk {
@@ -193,6 +200,19 @@ public:
   // Idempotent; safe to call with nothing in flight.
   void GracefulStop();
 
+  // The profile tools' run-context capture (Task 4): the anchor, the run
+  // stamps, the worker count, the completed-work series, the streamed
+  // boundary events + phase specs, and the epoch-change marks of the current
+  // or most recent run — the ProfileJobInput the fold pipeline aligns
+  // against. Thread-safe (the profile controller calls it from a waiter
+  // thread AND from a pool job for the straddle upgrade).
+  Tui::ProfileJobInput CaptureProfileContext();
+
+  // The session recorder and the fold tracker (both referenced by the
+  // profile controller; this controller outlives it).
+  Tui::SessionRecorder& recorder() { return recorder_; }
+  Tui::FoldTracker& fold_tracker() { return fold_tracker_; }
+
 private:
   // Builds the feed callback set (the handlers below); called once at
   // construction — feed_ is the LAST-initialized member, so every callback
@@ -229,6 +249,18 @@ private:
   nighthawk::client::LiveSnapshot last_snapshot_;
   bool has_snapshot_ = false;
   std::vector<nighthawk::client::PhaseBoundaryEvent> boundary_events_;
+  // The profile-window alignment inputs (Task 4), the TUI RunController's
+  // counterparts: the first-snapshot anchor (the 8.5 join key), the run
+  // stamps, the start request's worker count, the per-counter series (the
+  // completed-work denominator's input, capped like the RunViewModel), and
+  // the snapshot-carried epoch-change marks (the window-split inputs).
+  Tui::ClockAnchor anchor_;
+  int64_t run_start_unix_ns_ = 0;
+  int64_t run_end_unix_ns_ = 0;
+  uint64_t worker_count_ = 1;
+  absl::flat_hash_map<std::string, std::vector<Tui::CounterPoint>> counter_series_;
+  std::vector<Tui::EpochMark> epoch_marks_;
+  std::string last_seen_epoch_id_;
   // Update acks not yet consumed by a steer wait, with their arrival
   // sequence; correlation between results and waiters follows the engine's
   // delivery discipline (see Steer — the guard's rejections arrive in arm
@@ -274,6 +306,109 @@ private:
 // semantics, the ceiling, and the error shape. steer and cancel_run are
 // deferred (their bounded waits run on the dispatcher's waiter pool).
 void RegisterSteeringTools(ToolRegistry& registry, SteeringController& controller);
+
+// --- MCP plan Task 4: the profile-window + differential tools ---------------
+//
+// The window surface (pull_profile_window, window_status, diff_windows) over
+// the TUI's profile pipeline (the FTXUI-free profile_pipeline_lib) + T0's
+// FoldTracker — the exact p-flow the TUI drives, minus the terminal. The
+// Global Constraints bind here:
+//   - The full profile flag surface (--admin-base, --profile-retriever,
+//     --profile-mount, --scp-host, --sut-profile-path, --profile-staging,
+//     --pprof-tool, --sut-binary, --profile-window-seconds) configures the
+//     pipeline exactly like the TUI's (--profile-mount or --scp-host given =
+//     configured). Absent profile flags leave the tools REGISTERED but
+//     honest: every one refuses with "profiling is not configured ...".
+//   - Window ids are SERVER-ASSIGNED monotonic ints (T0's FoldTracker); an
+//     agent never supplies an index, and a non-positive or unknown id is
+//     refused naming the discipline.
+//   - pull_profile_window blocks for its duration_s (the stated bound: the
+//     window's own length plus two small admin POSTs) and runs deferred (on
+//     the dispatcher's waiter pool), then submits the fold job and answers
+//     {window_id, status:"folding"}; window_status{id} polls the tracker
+//     until ready / failed:<reason>.
+struct ProfileToolOptions {
+  // True when a profile mount or scp host was given (the TUI's configured
+  // rule); false = every profile tool refuses with the honest
+  // not-configured error.
+  bool configured = false;
+  // The pipeline configuration (mirrors the TUI flags).
+  Tui::ProfilePipelineConfig pipeline;
+};
+
+// The window-driving carrier behind the profile tools. One window in flight
+// at a time (the tracker's single-flight discipline). Handlers are called by
+// the dispatcher: window_status/diff_windows inline, pull_profile_window on
+// a waiter thread (its duration_s window must not occupy the dispatch loop).
+// The fold job runs on this controller's own PprofWorkerPool.
+class ProfileController {
+public:
+  // @param steering the steering controller whose run context windows align
+  //   against (and whose session recorder receives the window records); MUST
+  //   outlive this controller (declare it first).
+  // @param options the flag-derived posture (configured + pipeline config).
+  ProfileController(SteeringController& steering, ProfileToolOptions options);
+  // Joins the worker pool: in-flight fold jobs land (and mark the tracker)
+  // before any state they touch goes away.
+  ~ProfileController();
+
+  ProfileController(const ProfileController&) = delete;
+  ProfileController& operator=(const ProfileController&) = delete;
+
+  // pull_profile_window handler (deferred: blocks duration_s). Stage ->
+  // arm the SUT collector (one small POST) -> hold the window for
+  // duration_s -> disable the collector (one small POST) -> submit the fold
+  // job -> {window_id, status:"folding"}. Every refusal is an error status
+  // whose message is the tool's isError text verbatim; a failed arm/disable
+  // marks the staged window failed:<reason> and surfaces the reason.
+  absl::StatusOr<google::protobuf::Struct> PullProfileWindow(
+      const google::protobuf::Struct& arguments);
+
+  // window_status handler. {id, status, note?} — status is
+  // staged|folding|ready|failed:<reason>; the id must be a server-assigned
+  // int (positive; unknown ids are refused naming the discipline).
+  absl::StatusOr<google::protobuf::Struct> WindowStatus(
+      const google::protobuf::Struct& arguments);
+
+  // diff_windows handler. The normalized per-unit-of-work differential of
+  // two LANDED windows: union-tree per-frame deltas + totals + the pair
+  // label. An epoch-separated pair (windows pulled on either side of an
+  // applied steer) is labeled "knob effect: <a> -> <b>"; a same-state pair
+  // is REFUSED (its differential is the noise floor, not an effect). A
+  // worker-count change computes with comparable:false + the reason;
+  // impure/mixed-type pairs are refused with the pipeline's reason verbatim.
+  absl::StatusOr<google::protobuf::Struct> DiffWindows(
+      const google::protobuf::Struct& arguments);
+
+private:
+  // The pool-job body behind PullProfileWindow: fetch -> (straddle upgrade)
+  // -> clock-uncertainty read -> RunProfilePipeline -> store + session
+  // records -> tracker ready/failed. `window_id` is the tracker id assigned
+  // at Stage().
+  void FinishProfileWindowJob(int64_t window_id, Tui::ProfileJobInput input);
+
+  // One landed window's single PURE part for the differential (refusing
+  // honestly when none or several landed).
+  absl::StatusOr<Tui::ProfileWindow> LandedPureWindow(int64_t id);
+
+  SteeringController& steering_;
+  ProfileToolOptions options_;
+  // Null when profiling is not configured (the fetcher is never touched).
+  std::unique_ptr<Tui::ProfileFetcher> fetcher_;
+  // The windows each tracker id produced (the differential's lookup).
+  std::map<int64_t, std::vector<Tui::ProfileWindow>> windows_by_id_;
+  mutable std::mutex mutex_;
+  Tui::ProfileWindowStore window_store_;
+  // Declared LAST: destroyed FIRST, joining in-flight fold jobs before any
+  // state they touch (the RunController pattern).
+  Tui::PprofWorkerPool pool_;
+};
+
+// Registers the three profile tools on `registry`, bound to `controller`.
+// Descriptions are the agent-facing copy (args, server-assigned ids, the
+// not-configured posture, and the error shape). pull_profile_window is
+// deferred (its duration_s window runs on the dispatcher's waiter pool).
+void RegisterProfileTools(ToolRegistry& registry, ProfileController& controller);
 
 } // namespace Client
 } // namespace Nighthawk

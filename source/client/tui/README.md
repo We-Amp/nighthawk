@@ -16,6 +16,13 @@ series view layered on them — the MCP server's library surface). Run it with
 **that intersection must stay empty too**, and by construction so must FTXUI
 in `deps(client_headless)` — the headless pieces carry no terminal stack.
 
+The FTXUI-free profile pipeline (`profile_pipeline_lib`, the MCP plan Task 4
+extraction: admin client, fetch orchestration, window/diff machinery, pprof
+fold/symbolizer/worker pool, session conversion, and the ONE pool-job
+pipeline) is covered the same way — substitute
+`//source/client/tui:profile_pipeline_lib` — and transitively by the guard
+over the `nighthawk_mcp` binary that consumes it.
+
 Both label streams are counted before the intersection is trusted: the counts
 go to stderr, and either a zero count or a non-empty `comm` output fails the
 check (nonzero exit) — stdout must stay empty. A count of zero means the
