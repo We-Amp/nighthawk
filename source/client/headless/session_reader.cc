@@ -1,8 +1,8 @@
-#include "source/client/tui/session_reader.h"
+#include "source/client/headless/session_reader.h"
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-#include "source/client/tui/session_framing.h"
+#include "source/client/headless/session_framing.h"
 
 namespace Nighthawk {
 namespace Client {

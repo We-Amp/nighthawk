@@ -27,10 +27,7 @@ envoy_cc_library(
         "profile_symbolizer.cc",
         "profile_windows.cc",
         "run_feed.cc",
-        "run_view_model.cc",
         "session_conversion.cc",
-        "session_reader.cc",
-        "session_writer.cc",
         "start_run_dialog.cc",
         "status_bar.cc",
         "sut_stats.cc",
@@ -50,11 +47,7 @@ envoy_cc_library(
         "profile_symbolizer.h",
         "profile_windows.h",
         "run_feed.h",
-        "run_view_model.h",
         "session_conversion.h",
-        "session_framing.h",
-        "session_reader.h",
-        "session_writer.h",
         "start_run_dialog.h",
         "status_bar.h",
         "sut_stats.h",
@@ -65,6 +58,11 @@ envoy_cc_library(
         "//api/client:base_cc_proto",
         "//api/client:grpc_service_lib",
         "//api/pprof:profile_cc_proto",
+        # The headless extraction (MCP plan Task 0): the session writer/
+        # reader/framing pieces, the run view model, and the session
+        # recorder / fold tracker / series view layered on them. FTXUI-free,
+        # quarantine-clean (the cquery guard proves it).
+        "//source/client/headless:client_headless",
         # The pure phase-vector validation the dialog reuses (proto+absl deps
         # only — quarantine-clean; the cquery guard proves it).
         "//source/client:options_validation_phases_lib",

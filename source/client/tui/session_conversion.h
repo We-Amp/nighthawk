@@ -15,7 +15,8 @@ namespace Tui {
 
 // FORK-ONLY (We-Amp): the pure proto conversions between the run feed's wire
 // messages and the session file's records. No threading, no I/O — the writer
-// thread contract stays in session_writer.h and the callers in tui_app.
+// thread contract stays in source/client/headless/session_writer.h and the
+// callers in tui_app.
 
 // The session file format version ToSessionHeader stamps into the header; the
 // reader accepts exactly this version (session_reader.cc).

@@ -48,8 +48,8 @@
 
 #include "source/client/service_impl.h"
 #include "source/client/tui/profile_windows.h"
-#include "source/client/tui/session_reader.h"
-#include "source/client/tui/session_writer.h"
+#include "source/client/headless/session_reader.h"
+#include "source/client/headless/session_writer.h"
 #include "source/client/tui/tui_app.h"
 
 using namespace std::chrono_literals;

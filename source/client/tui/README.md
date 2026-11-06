@@ -9,6 +9,13 @@ re-run in Task 7 on a clean checkout). **The output must stay empty**:
 a=$(bazel cquery --config=macos 'deps(//source/client/tui:tui_lib)' --output=label 2>/dev/null | sort); b=$(bazel cquery --config=macos 'kind("cc.* rule", @envoy//source/...)' --output=label 2>/dev/null | sort); printf 'tui_deps=%s envoy_cc=%s\n' "$(echo "$a" | wc -l)" "$(echo "$b" | wc -l)" >&2; [ "$(echo "$a" | wc -l)" -gt 0 ] && [ "$(echo "$b" | wc -l)" -gt 0 ] && comm -12 <(echo "$a") <(echo "$b")
 ```
 
+The same guard covers the headless extraction (the session writer/reader/
+framing pieces, the run view model, and the session recorder / fold tracker /
+series view layered on them — the MCP server's library surface). Run it with
+`//source/client/headless:client_headless` substituted for the tui_lib label;
+**that intersection must stay empty too**, and by construction so must FTXUI
+in `deps(client_headless)` — the headless pieces carry no terminal stack.
+
 Both label streams are counted before the intersection is trusted: the counts
 go to stderr, and either a zero count or a non-empty `comm` output fails the
 check (nonzero exit) — stdout must stay empty. A count of zero means the

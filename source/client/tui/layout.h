@@ -12,7 +12,7 @@
 #include "source/client/tui/flamegraph.h"
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/knob_pane.h"
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 #include "source/client/tui/start_run_dialog.h"
 #include "source/client/tui/status_bar.h"
 

@@ -26,7 +26,7 @@ namespace Tui {
 // ("byte_offset"/"type"/"monotonic_ns" per frame) written next to it.
 //
 // Dependency quarantine: this library and everything it pulls in must stay
-// clear of @envoy//source/... C++ targets (see source/client/tui/README.md
+// clear of @envoy//source/... C++ targets (see source/client/tui/README.md (the same guard runs over //source/client/headless:client_headless)
 // for the standing guard that enforces this).
 
 // Options for SessionWriter::open.

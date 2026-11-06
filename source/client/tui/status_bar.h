@@ -11,7 +11,7 @@
 #include "api/client/options.pb.h"
 #include "api/client/session.pb.h"
 #include "source/client/tui/input_mode.h"
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 
 namespace Nighthawk {
 namespace Client {

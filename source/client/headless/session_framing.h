@@ -15,7 +15,7 @@ namespace Tui {
 // trivial and both consumers are in this same library target.
 //
 // Dependency quarantine: this header must stay clear of @envoy//source/...
-// C++ targets (see source/client/tui/README.md for the standing guard that
+// C++ targets (see source/client/tui/README.md (the same guard runs over //source/client/headless:client_headless) for the standing guard that
 // enforces this).
 
 /**

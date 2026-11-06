@@ -13,7 +13,7 @@
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/layout.h"
 #include "source/client/tui/profile_windows.h"
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 #include "source/client/tui/start_run_dialog.h"
 #include "source/client/tui/status_bar.h"
 #include "source/client/tui/tui_app.h"

@@ -8,7 +8,7 @@
 #include <iostream>
 
 #include "google/protobuf/util/json_util.h"
-#include "source/client/tui/session_reader.h"
+#include "source/client/headless/session_reader.h"
 #include "tclap/CmdLine.h"
 
 namespace Nighthawk {

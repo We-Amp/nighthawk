@@ -5,7 +5,7 @@
 #include "absl/strings/string_view.h"
 #include "ftxui/dom/elements.hpp"
 
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 
 namespace Nighthawk {
 namespace Client {

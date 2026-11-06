@@ -420,52 +420,6 @@ void FillOverlayState(const ShellState& state, OverlayState* overlay) {
   overlay->start_rejected = state.start_rejected;
 }
 
-std::vector<CounterPoint>
-MergeCompletedSeries(const absl::flat_hash_map<std::string, std::vector<CounterPoint>>& counters) {
-  static const char* const kCompletedNames[] = {
-      "benchmark.http_1xx", "benchmark.http_2xx",      "benchmark.http_3xx",
-      "benchmark.http_4xx", "benchmark.http_5xx",      "benchmark.http_xxx",
-      "benchmark.stream_resets", "benchmark.pool_connection_failure",
-  };
-  // The union of stamps, ascending and deduplicated.
-  std::vector<uint64_t> stamps;
-  for (const char* name : kCompletedNames) {
-    auto it = counters.find(name);
-    if (it == counters.end()) {
-      continue;
-    }
-    for (const CounterPoint& point : it->second) {
-      stamps.push_back(point.monotonic_ns);
-    }
-  }
-  std::sort(stamps.begin(), stamps.end());
-  stamps.erase(std::unique(stamps.begin(), stamps.end()), stamps.end());
-
-  // C(t) per source series (last value at or before t), summed at every
-  // union stamp — the same convention CompletedWorkInMonotonicRange applies
-  // to the merged result.
-  std::vector<CounterPoint> merged;
-  merged.reserve(stamps.size());
-  for (const uint64_t stamp : stamps) {
-    uint64_t value = 0;
-    for (const char* name : kCompletedNames) {
-      auto it = counters.find(name);
-      if (it == counters.end()) {
-        continue;
-      }
-      uint64_t at_or_before = 0;
-      for (const CounterPoint& point : it->second) {
-        if (point.monotonic_ns <= stamp) {
-          at_or_before = point.value;
-        }
-      }
-      value += at_or_before;
-    }
-    merged.push_back(CounterPoint{stamp, value});
-  }
-  return merged;
-}
-
 FlamePaneState BuildFlamePane(std::shared_ptr<const std::vector<ProfileWindow>> windows,
                               const FlamegraphViewState& view, absl::string_view note,
                               const DiffOverlay* overlay) {
@@ -994,11 +948,11 @@ absl::Status RunController::StartProfileWindow() {
   // M1 final fixes: an in-flight close owns fetcher_ (its retrieval is
   // running on the pool); re-arming here would race it on the shared fetcher
   // and can tear the staged profile. Refuse until the close job lands.
-  if (folding_.load(std::memory_order_relaxed)) {
+  if (fold_tracker_.folding_id() != 0) {
     return absl::FailedPreconditionError(
         "a profile window is still folding: wait for it to land before opening the next");
   }
-  if (window_open_.exchange(true)) {
+  if (fold_tracker_.open_id() != 0) {
     return absl::FailedPreconditionError("a profile window is already open (p closes it)");
   }
   int window_seconds = 5;
@@ -1006,11 +960,19 @@ absl::Status RunController::StartProfileWindow() {
     std::lock_guard<std::mutex> lock(mutex_);
     window_seconds = profile_config_.window_seconds;
   }
+  // Stage the window first: the tracker assigns the id and holds the
+  // single-flight discipline while the collector arm is being armed.
+  auto staged = fold_tracker_.Stage();
+  if (!staged.ok()) {
+    return staged.status();
+  }
   // Single small POST on the steering thread; the blocking fetch belongs to
   // the pool job (profile_fetcher.h's threading contract).
   const absl::Status started = fetcher_->StartWindow(window_seconds);
   if (!started.ok()) {
-    window_open_.store(false, std::memory_order_relaxed);
+    // The collector arm failed: the staged window fails with the reason (the
+    // same "back to idle" visible behavior as the old flag reset).
+    (void)fold_tracker_.MarkFailed(*staged, std::string(started.message()));
     return started;
   }
   {
@@ -1045,10 +1007,13 @@ absl::Status RunController::StopProfileWindowAndFold() {
           "no snapshot anchor yet: the work-units join needs the run's first flush");
     }
   }
-  if (!window_open_.exchange(false)) {
+  const int64_t open_id = fold_tracker_.open_id();
+  if (open_id == 0) {
     return absl::FailedPreconditionError("no profile window is open (p opens one)");
   }
-  folding_.store(true, std::memory_order_relaxed);
+  if (!fold_tracker_.MarkFolding(open_id).ok()) {
+    return absl::FailedPreconditionError("no profile window is open (p opens one)");
+  }
 
   // Deferred-close fix (M1 final fixes): disable the SUT profiler HERE, on
   // the steering thread — one small POST, symmetric with StartWindow's. The
@@ -1065,7 +1030,7 @@ absl::Status RunController::StopProfileWindowAndFold() {
     // a live profiler and read a partial file.
     AdminClient recovery(profile_config_.admin);
     (void)recovery.EnableCpuProfiler(false);
-    folding_.store(false, std::memory_order_relaxed);
+    (void)fold_tracker_.MarkFailed(open_id, std::string(stopped.message()));
     {
       absl::MutexLock lock(&diff_mu_);
       flame_note_ = absl::StrCat("profile close failed: ", stopped.message(),
@@ -1133,11 +1098,12 @@ absl::Status RunController::StopProfileWindowAndFold() {
   // it touches.
   PprofWorkerPool* pool = &pool_;
   RunController* self = this;
-  pool->Submit([self, input]() { self->FinishProfileWindowJob(*input); });
+  const int64_t window_id = open_id;
+  pool->Submit([self, window_id, input]() { self->FinishProfileWindowJob(window_id, *input); });
   return absl::OkStatus();
 }
 
-void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
+void RunController::FinishProfileWindowJob(int64_t window_id, ProfileJobInput& input) {
   ProfilePipelineConfig config;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1157,7 +1123,7 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
       absl::MutexLock lock(&diff_mu_);
       flame_note_ = absl::StrCat("profile fetch failed: ", fetched.status().message());
     }
-    folding_.store(false, std::memory_order_relaxed);
+    (void)fold_tracker_.MarkFailed(window_id, std::string(fetched.status().message()));
     std::function<void()> notification;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1212,12 +1178,12 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
     // window renders, but it is not in the session file.
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (writer_ != nullptr) {
+      if (recorder_.open()) {
         for (const ProfileWindow& window : outcome.windows) {
           nighthawk::client::SessionRecord record;
           *record.mutable_profile_window() =
               ToProfileWindowRecord(window, outcome.raw_bytes, outcome.symbolizer_tool);
-          writer_->enqueue(std::move(record));
+          recorder_.AppendSnapshot(std::move(record));
         }
       } else {
         absl::StrAppend(&outcome.note, " | record not persisted: session already closed");
@@ -1229,7 +1195,14 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
     absl::MutexLock lock(&diff_mu_);
     flame_note_ = outcome.note;
   }
-  folding_.store(false, std::memory_order_relaxed);
+  // Terminal tracker state: windows landed -> ready with the outcome note;
+  // the pipeline produced nothing -> failed with the note as the reason (the
+  // same visible "back to idle" as the old flag reset, but queryable).
+  if (!outcome.windows.empty()) {
+    (void)fold_tracker_.MarkReady(window_id, outcome.note);
+  } else {
+    (void)fold_tracker_.MarkFailed(window_id, outcome.note);
+  }
   std::function<void()> notification;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1241,17 +1214,19 @@ void RunController::FinishProfileWindowJob(ProfileJobInput& input) {
 }
 
 bool RunController::profileWindowOpen() const {
-  return window_open_.load(std::memory_order_relaxed);
+  return fold_tracker_.open_id() != 0;
 }
 
 std::string RunController::profileWindowState() const {
-  if (folding_.load(std::memory_order_relaxed)) {
+  if (fold_tracker_.folding_id() != 0) {
     return "folding...";
   }
-  if (window_open_.load(std::memory_order_relaxed)) {
+  if (fold_tracker_.open_id() != 0) {
     std::lock_guard<std::mutex> lock(mutex_);
     return absl::StrCat("window open ", profile_config_.window_seconds, "s");
   }
+  // Ready and failed windows render as "idle" (the pre-extraction trio's
+  // terminal behavior); the outcome lives in flameNote().
   return "idle";
 }
 
@@ -1410,7 +1385,7 @@ void RunController::ScrapeLoop() {
 absl::Status RunController::startRun(const nighthawk::client::StartRequest& request) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (writer_ != nullptr) {
+    if (recorder_.open()) {
       // User-facing through the start-run dialog's rejection line: name the
       // way out honestly — in M0b there is no close-without-exit, q quits
       // the TUI and saves the session.
@@ -1477,36 +1452,27 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
 
   // Open the session file pair BEFORE the run starts: once feed_.start()
   // returns, snapshots can arrive on the read thread, and one delivered before
-  // a later-opened writer would be lost to the session file. A failure here
-  // surfaces without a run ever launching.
+  // a later-opened session would be lost to the session file. A failure here
+  // surfaces without a run ever launching. The session recorder (headless
+  // extraction) owns the file naming ("<prefix>-<unix_ns>.nhsession") and
+  // stamps the concrete path into the header's session id.
   const int64_t unix_ns = nowUnixNs();
-  const std::string path = absl::StrCat(session_prefix_, "-", unix_ns, ".nhsession");
-  auto writer_or =
-      SessionWriter::open(path, ToSessionHeader(request, /*session_id=*/path, unix_ns));
-  if (!writer_or.ok()) {
+  auto session_or =
+      recorder_.StartRun(session_prefix_, unix_ns, ToSessionHeader(request, /*session_id=*/"",
+                                                               unix_ns));
+  if (!session_or.ok()) {
     std::lock_guard<std::mutex> lock(mutex_);
     finished_ = true;
-    return writer_or.status();
-  }
-  // Publish the writer before the run launches: from the moment feed_.start()
-  // returns, snapshots can arrive on the read thread, and every one of them
-  // must find an open session to land in.
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    session_path_ = path;
-    writer_ = std::move(*writer_or);
+    return session_or.status();
   }
 
   const absl::Status started = feed_.start(request);
   if (!started.ok()) {
-    // No run launched; take the writer back and close the header-only session
-    // (completed=false, single close), then surface the start failure.
-    std::unique_ptr<SessionWriter> writer;
+    // No run launched; seal the header-only session (completed=false, single
+    // close), then surface the start failure.
     {
       std::lock_guard<std::mutex> lock(mutex_);
       finished_ = true;
-      writer = std::move(writer_);
-      session_path_.clear();
       run_finished_ = true;
       run_end_unix_ns_ = nowUnixNs();
     }
@@ -1516,7 +1482,7 @@ absl::Status RunController::startRun(const nighthawk::client::StartRequest& requ
     // A close error on this header-only session is not surfaced (the start
     // failure is the actionable status); the close still happened exactly
     // once.
-    (void)writer->close(run_end);
+    (void)recorder_.FlushAndSeal(run_end);
     return started;
   }
 
@@ -1571,7 +1537,9 @@ std::vector<nighthawk::client::PhaseMetadata> RunController::finalPhaseMetadata(
 
 std::string RunController::sessionPath() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return session_path_;
+  // The recorder keeps the most recent session's path after sealing (for
+  // sealed-file reads); the TUI's contract is the OPEN session's path only.
+  return recorder_.open() ? recorder_.path() : "";
 }
 
 const nighthawk::client::CommandLineOptions& RunController::knobOptions() const {
@@ -1580,8 +1548,8 @@ const nighthawk::client::CommandLineOptions& RunController::knobOptions() const 
 }
 
 absl::Status RunController::finishSession(bool completed) {
-  // Stop-if-running, then wait for on_finished: close() is single-call and
-  // strictly after the run feed's terminal event, per the session writer's
+  // Stop-if-running, then wait for on_finished: the seal is single-call and
+  // strictly after the run feed's terminal event, per the session recorder's
   // ordering contract.
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1600,19 +1568,12 @@ absl::Status RunController::finishSession(bool completed) {
         "drains without a run end record");
   }
 
-  // Single-call close: moving the writer out makes a second close impossible.
-  std::unique_ptr<SessionWriter> writer;
   nighthawk::client::Output output;
   bool has_output = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    writer = std::move(writer_);
-    session_path_.clear();
     output = final_output_;
     has_output = has_output_;
-  }
-  if (writer == nullptr) {
-    return absl::OkStatus();
   }
   nighthawk::client::RunEndRecord run_end;
   run_end.set_completed(completed);
@@ -1620,7 +1581,9 @@ absl::Status RunController::finishSession(bool completed) {
     *run_end.mutable_output() = output;
   }
   run_end.set_ended_unix_ns(nowUnixNs());
-  return writer->close(run_end);
+  // Single-call seal: FlushAndSeal moves the writer out under its own lock,
+  // so a second call is a no-op OkStatus — exactly one run end record.
+  return recorder_.FlushAndSeal(std::move(run_end));
 }
 
 absl::Status RunController::handleLoopExit() {
@@ -1663,10 +1626,10 @@ void RunController::onSnapshot(const nighthawk::client::LiveSnapshot& snapshot) 
     }
     model_ = ApplySnapshot(std::move(model_), snapshot);
     store_.store(model_);
-    if (writer_ != nullptr) {
+    if (recorder_.open()) {
       nighthawk::client::SessionRecord record;
       *record.mutable_metric_series() = ToMetricSeries(snapshot);
-      writer_->enqueue(std::move(record));
+      recorder_.AppendSnapshot(std::move(record));
     }
     notification = snapshot_notification_;
   }
@@ -1685,10 +1648,10 @@ void RunController::onPhaseEvent(const nighthawk::client::PhaseBoundaryEvent& ev
   {
     std::lock_guard<std::mutex> lock(mutex_);
     boundary_events_.push_back(event);
-    if (writer_ != nullptr) {
+    if (recorder_.open()) {
       nighthawk::client::SessionRecord record;
       *record.mutable_phase_boundary() = ToPhaseBoundaryRecord(event);
-      writer_->enqueue(std::move(record));
+      recorder_.AppendSnapshot(std::move(record));
     }
     notification = snapshot_notification_;
   }
@@ -1779,10 +1742,10 @@ void RunController::onUpdateResult(const nighthawk::client::UpdateResult& result
     if (!feed_generated) {
       nighthawk::client::KnobEpochRecord knob_record =
           ToKnobEpochRecord(result, pending_phase_id_, pending_new_rps_, pending_ramp_bent_);
-      if (writer_ != nullptr) {
+      if (recorder_.open()) {
         nighthawk::client::SessionRecord record;
         *record.mutable_knob_epoch() = knob_record;
-        writer_->enqueue(std::move(record));
+        recorder_.AppendSnapshot(std::move(record));
       }
       // Timeline truth (spec §4 B): the epoch mark lands ONLY on an applied
       // ack — a user edit, a rejection, and a timeout all mark nothing.

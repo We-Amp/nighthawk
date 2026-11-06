@@ -17,6 +17,10 @@
 #include "absl/synchronization/mutex.h"
 #include "ftxui/component/event.hpp"
 
+#include "source/client/headless/fold_tracker.h"
+#include "source/client/headless/run_view_model.h"
+#include "source/client/headless/series_view.h"
+#include "source/client/headless/session_recorder.h"
 #include "source/client/tui/admin_client.h"
 #include "source/client/tui/flamegraph.h"
 #include "source/client/tui/input_mode.h"
@@ -26,8 +30,6 @@
 #include "source/client/tui/profile_fetcher.h"
 #include "source/client/tui/profile_windows.h"
 #include "source/client/tui/run_feed.h"
-#include "source/client/tui/run_view_model.h"
-#include "source/client/tui/session_writer.h"
 #include "source/client/tui/start_run_dialog.h"
 #include "source/client/tui/sut_stats.h"
 
@@ -35,16 +37,10 @@ namespace Nighthawk {
 namespace Client {
 namespace Tui {
 
-// The clock anchor pair (spec §8.5): (engine wall, engine monotonic) from the
-// FIRST live snapshot of a run. monotonic ~= wall - (anchor.wall -
-// anchor.monotonic) maps a wall-clock interval into the engine-monotonic
-// domain the completed-work series lives in.
-struct ClockAnchor {
-  int64_t wall_time_unix_ns = 0;
-  int64_t monotonic_ns = 0;
-
-  bool valid() const { return wall_time_unix_ns != 0 || monotonic_ns != 0; }
-};
+// The clock anchor pair (ClockAnchor) and the completed-work merge
+// (MergeCompletedSeries) moved to the headless extraction
+// (source/client/headless/series_view.h) — same namespace, so the TUI's call
+// sites read unchanged.
 
 // The M1 profiling configuration, gathered from the nighthawk_tui flags (plan
 // task 6: --admin-base, --profile-retriever, --profile-mount, --scp-host,
@@ -89,16 +85,6 @@ struct ProfilePipelineConfig {
   std::vector<nighthawk::client::PhaseBoundaryEvent> test_boundary_events;
 };
 
-// The completed-work series for the §8.4 per-unit-of-work denominator: the
-// client-side request counters (the benchmark.http_* classes plus
-// stream_resets and pool_connection_failure — every sample the run produced
-// counts, per the charts' counts-shown disclosure) merged into one ascending
-// monotonic series. At each union stamp the merged value is the sum of every
-// source series' last-value-at-or-before that stamp (the same convention
-// CompletedWorkInMonotonicRange applies).
-std::vector<CounterPoint>
-MergeCompletedSeries(const absl::flat_hash_map<std::string, std::vector<CounterPoint>>& counters);
-
 // One pool job's captured inputs: everything StopProfileWindowAndFold grabs
 // on the steering thread, so the job itself touches only its own copies plus
 // the stores. Captured BEFORE the fetch — a run that ends while the fetch
@@ -125,7 +111,7 @@ struct ProfileJobInput {
 
 // FORK-ONLY (We-Amp): the headless run/session lifecycle carrier behind the
 // interactive shell — the exact pipeline the TUI drives (feed -> ApplySnapshot
-// + store + SessionWriter via ToMetricSeries; stop key -> RunFeed::stop();
+// + store + SessionRecorder via ToMetricSeries; stop key -> RunFeed::stop();
 // close strictly after on_finished), minus the terminal. FTXUI's
 // ScreenInteractive loop is not headless-testable, so all lifecycle logic
 // lives here and the shell (in tui_app.cc) only composes RenderLayout and the
@@ -154,8 +140,8 @@ public:
   // never ran). pool_ is declared after feed_, so it is destroyed FIRST of
   // all members: its destructor joins any in-flight profile/differential jobs
   // before the state they touch (window store, writer, mutexes) goes away.
-  // An open session (close() never called) drains its queued records in the
-  // writer's destructor, but writes no run end record — prefer
+  // An open session (FlushAndSeal() never called) drains its queued records in
+  // the session recorder's destructor, but writes no run end record — prefer
   // finishSession().
   ~RunController();
 
@@ -256,7 +242,7 @@ public:
   // 'p' close: submits ONE pool job — {disable + fetch + retrieve ->
   // symbolize -> LoadProfile -> FoldProfile -> PreA1RunInterval alignment ->
   // CompletedWorkInMonotonicRange through the first-snapshot anchor ->
-  // ProfileWindowStore append + SessionWriter enqueue}. Non-blocking. The
+  // ProfileWindowStore append + SessionRecorder append}. Non-blocking. The
   // window state moves to "folding..." until the job lands.
   // kFailedPrecondition when profiling is unconfigured, no window is open,
   // or no snapshot anchor exists yet (the work-units join needs the first
@@ -338,15 +324,19 @@ private:
   // interval, delta against the previous scrape, merged into the model's
   // counters map as sut.* series. Runs on scraper_ until scraping_ clears.
   void ScrapeLoop();
-  // The pool-job body behind StopProfileWindowAndFold.
-  void FinishProfileWindowJob(ProfileJobInput& input);
+  // The pool-job body behind StopProfileWindowAndFold; `window_id` is the
+  // tracker id assigned at Stage() (the job marks the window ready/failed).
+  void FinishProfileWindowJob(int64_t window_id, ProfileJobInput& input);
 
   const std::string session_prefix_;
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  std::unique_ptr<SessionWriter> writer_; // null when no session is open
-  std::string session_path_;
+  // The session file owner (headless extraction): open at startRun, appended
+  // from the feed's read thread, sealed single-call at finishSession. Its own
+  // mutex is a leaf below this class's mutex_ — never held while mutex_ is
+  // taken by another thread in the opposite order.
+  SessionRecorder recorder_;
   bool finished_ = true;   // false between startRun and the run's on_finished
   bool completed_ = false; // most recent run delivered on_completed
   bool has_output_ = false;
@@ -402,8 +392,13 @@ private:
   std::string flame_note_ ABSL_GUARDED_BY(diff_mu_);
 
   ProfileWindowStore window_store_;
-  std::atomic<bool> window_open_{false};
-  std::atomic<bool> folding_{false};
+  // The window lifecycle state machine (headless extraction): replaces the
+  // former window_open_/folding_ atomic flags — the same single-window
+  // discipline, with ids, terminal states, and failure reasons. Transitions
+  // land from the steering thread and the pool-job thread (the tracker is
+  // mutex-guarded); the render side reads through profileWindowState()/
+  // profileWindowOpen().
+  FoldTracker fold_tracker_;
   std::atomic<bool> scraping_{false};
 
   // Members the pool jobs / scrape thread touch MUST be declared before

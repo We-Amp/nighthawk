@@ -33,10 +33,10 @@
 #include "source/client/service_impl.h"
 #include "source/client/tui/layout.h"
 #include "source/client/tui/run_feed.h"
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 #include "source/client/tui/session_conversion.h"
-#include "source/client/tui/session_reader.h"
-#include "source/client/tui/session_writer.h"
+#include "source/client/headless/session_reader.h"
+#include "source/client/headless/session_writer.h"
 #include "source/client/tui/tui_app.h"
 
 using namespace std::chrono_literals;

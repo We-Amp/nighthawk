@@ -12,8 +12,8 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "api/client/session.pb.h"
-#include "source/client/tui/session_reader.h"
-#include "source/client/tui/session_writer.h"
+#include "source/client/headless/session_reader.h"
+#include "source/client/headless/session_writer.h"
 
 namespace Nighthawk {
 namespace Client {

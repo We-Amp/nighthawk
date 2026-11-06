@@ -92,7 +92,9 @@ envoy_cc_library(
     srcs = ["session_dump_main_entry.cc"],
     visibility = ["//visibility:public"],
     deps = [
-        "//source/client/tui:tui_lib",
+        # The session reader lives in the headless extraction (no tui_lib, no
+        # FTXUI — the dump binary builds without the terminal stack).
+        "//source/client/headless:client_headless",
         "@tclap//:tclap",
     ],
     alwayslink = True,

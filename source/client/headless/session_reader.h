@@ -26,7 +26,7 @@ namespace Tui {
  * by the first next() call, so records still come back in file order.
  *
  * Dependency quarantine: this library and everything it pulls in must stay
- * clear of @envoy//source/... C++ targets (see source/client/tui/README.md
+ * clear of @envoy//source/... C++ targets (see source/client/tui/README.md (the same guard runs over //source/client/headless:client_headless)
  * for the standing guard that enforces this).
  */
 class SessionReader {

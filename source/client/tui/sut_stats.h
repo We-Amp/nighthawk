@@ -26,7 +26,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 
 namespace Nighthawk {
 namespace Client {

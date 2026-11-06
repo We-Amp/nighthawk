@@ -24,6 +24,22 @@ cc_test(
     ],
 )
 
+# FORK-ONLY (We-Amp): the headless extraction contract pins (MCP plan Task 0).
+# Plain cc_test for the same quarantine reason as the tui_* tests:
+# client_headless carries no Envoy C++ sources and no test-helper stack.
+cc_test(
+    name = "headless_extraction_test",
+    srcs = ["headless_extraction_test.cc"],
+    deps = [
+        "//source/client/headless:client_headless",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # FORK-ONLY (We-Amp): session file format, writer/reader, and queue drop
 # contract tests. Plain cc_test for the same reason as tui_app_test: the TUI
 # quarantine keeps this off Envoy's C++ sources and test helpers.

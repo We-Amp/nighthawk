@@ -23,7 +23,7 @@
 #include "api/client/live.pb.h"
 #include "api/client/options.pb.h"
 #include "source/client/tui/pprof_fold.h"
-#include "source/client/tui/run_view_model.h"
+#include "source/client/headless/run_view_model.h"
 
 namespace Nighthawk {
 namespace Client {
