@@ -64,8 +64,13 @@ void EmitJsonString(absl::string_view s, std::string* out) {
 // Formats a double losslessly for the emit->parse round trip: the shortest
 // %g form that reads back bit-identical, falling back to %.17g.
 std::string FormatNumber(double v) {
-  if (std::isfinite(v) && v == static_cast<double>(static_cast<int64_t>(v)) &&
-      std::abs(v) < 9.0e15) {
+  // The range check MUST come before the cast: casting a double whose
+  // magnitude exceeds int64_t's range to int64_t is undefined behavior, and
+  // an agent-supplied number (1e30 through an rps argument) reaches here
+  // first. Only after |v| is proven inside the range is the integral test
+  // (whose cast is then well-defined) allowed to fire.
+  if (std::isfinite(v) && std::abs(v) < 9.0e15 &&
+      v == static_cast<double>(static_cast<int64_t>(v))) {
     // Integral values (ids, counts, rps figures) emit without a fraction.
     return absl::StrCat(static_cast<int64_t>(v));
   }

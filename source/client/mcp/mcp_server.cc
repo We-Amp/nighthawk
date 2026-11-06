@@ -1,6 +1,7 @@
 // FORK-ONLY (We-Amp): see mcp_server.h.
 #include "source/client/mcp/mcp_server.h"
 
+#include <cmath>
 #include <map>
 #include <optional>
 #include <string>
@@ -53,8 +54,16 @@ bool TypeMatches(const std::string& expected, const Value& value) {
     return value.kind_case() == Value::kNumberValue;
   }
   if (expected == "integer") {
-    return value.kind_case() == Value::kNumberValue &&
-           value.number_value() == static_cast<double>(static_cast<int64_t>(value.number_value()));
+    if (value.kind_case() != Value::kNumberValue) {
+      return false;
+    }
+    // The range check MUST come before the cast: casting a double whose
+    // magnitude exceeds int64_t's range to int64_t is undefined behavior,
+    // and an agent-supplied argument (1e30 through an rps field) reaches
+    // here first. Out-of-range numbers are simply not integers.
+    const double v = value.number_value();
+    return std::isfinite(v) && std::abs(v) < 9.0e15 &&
+           v == static_cast<double>(static_cast<int64_t>(v));
   }
   if (expected == "object") {
     return IsObject(value);

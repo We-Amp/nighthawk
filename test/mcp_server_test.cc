@@ -325,6 +325,56 @@ TEST(McpServerTest, EmptyRegistriesListEmptyArrays) {
             0);
 }
 
+// Carried T1 review fix pin: a number whose magnitude exceeds int64_t's
+// range must not be cast to int64_t before the range check (undefined
+// behavior). The canonical emitter formats it losslessly through the %g
+// fallback, and the parsed value round-trips exactly.
+TEST(McpServerTest, HugeNumberEmitsAndParsesLosslessly) {
+  Value number;
+  number.set_number_value(1e30);
+  auto emitted = ParseJsonObject(absl::StrCat("{\"n\": ", EmitCanonical(number), "}"));
+  ASSERT_TRUE(emitted.ok()) << emitted.status();
+  EXPECT_EQ(Number(Field(*emitted, "n")), 1e30);
+
+  Value negative;
+  negative.set_number_value(-1e30);
+  auto emitted_negative = ParseJsonObject(absl::StrCat("{\"n\": ", EmitCanonical(negative), "}"));
+  ASSERT_TRUE(emitted_negative.ok()) << emitted_negative.status();
+  EXPECT_EQ(Number(Field(*emitted_negative, "n")), -1e30);
+}
+
+// Carried T1 review fix pin: an integer-typed argument carrying a huge
+// number (1e30) is rejected as invalid-params naming the field — the
+// type check must not cast it to int64_t (undefined behavior) on the way.
+TEST(McpServerTest, HugeIntegerArgIsRejectedNotCast) {
+  ToolRegistry tools;
+  ResourceRegistry resources;
+  ToolSpec counter;
+  counter.name = "counter";
+  counter.description = "takes an integer";
+  counter.input_schema = ParseJsonObject(R"json(
+      {"type": "object",
+       "properties": {"n": {"type": "integer"}},
+       "required": ["n"],
+       "additionalProperties": false})json").value();
+  counter.handler = [](const Struct& arguments) -> absl::StatusOr<Struct> {
+    Struct result;
+    (*result.mutable_fields())["n"] = arguments.fields().at("n");
+    return result;
+  };
+  tools.Register(counter);
+  McpServer server(tools, resources, [](absl::string_view) {});
+  DoInitialize(server);
+  auto response = RequestAndParse(server, 13, "tools/call",
+                                  R"json({"name": "counter",
+                                          "arguments": {"n": 1e30}})json");
+  ASSERT_TRUE(response.ok()) << response.status();
+  const Struct& error = StructOf(Field(*response, "error"));
+  EXPECT_EQ(Number(Field(error, "code")), -32602);
+  EXPECT_TRUE(Text(Field(error, "message")).find("n") != std::string::npos)
+      << Text(Field(error, "message"));
+}
+
 TEST(McpServerTest, LogsGoToStderrNotStdout) {
   McpServerFlags flags;
   std::istringstream in(absl::StrCat(
