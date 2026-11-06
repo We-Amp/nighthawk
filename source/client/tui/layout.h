@@ -64,6 +64,11 @@ struct OverlayState {
   // The M2 phase-vector entry's draft (comma-separated
   // name:rps:duration[:concurrency[:connections]] entries).
   std::string phases_field;
+  // The M3 knob-turn draft (kEditingKnob): the typed digits echo on the
+  // knobs pane while the editor owns the keyboard. The draft is a live
+  // steering input (enter sends it to the engine); before the fix round it
+  // was invisible — the operator typed the value blind.
+  std::string knob_draft;
   // 0=uri, 1=rps, 2=duration (StartRunDialogModel::DialogField numbering);
   // the active field's value renders with a reverse-video caret.
   int active_field = 0;

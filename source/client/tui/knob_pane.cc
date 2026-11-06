@@ -212,6 +212,15 @@ bool RpsTurnBendsRamp(const nighthawk::client::CommandLineOptions& options) {
          options.rate_limiter_plugin_config().name() == kRampingPluginName;
 }
 
+bool LiveKnobTurnSurfaceable(const LiveKnobTurn& turn) {
+  // The pristine tracker (never seeded, nothing pending, no note) says
+  // nothing; every other state does. A rejected/failed-pending outcome
+  // carries its note — that is the state that must stay visible after run
+  // end (the fix round: the old run-in-flight frame gate dropped exactly it).
+  return !turn.acked_value.empty() || !turn.pending_value.empty() || !turn.note.empty() ||
+         turn.state == KnobTurnState::kPendingApply;
+}
+
 ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height) {
   if (width <= 0 || height <= 0) {
     return ftxui::emptyElement();
@@ -240,7 +249,23 @@ ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int 
   default:
     break;
   }
-  rows.push_back(ftxui::text(line.substr(0, static_cast<size_t>(std::max(1, width)))));
+  // Width discipline: an overlong line is never flat-truncated. The old
+  // tail-chop hid the note's end and the "(u dismisses)" affordance behind
+  // the pane edge exactly when the reason was long enough to matter. The
+  // HEAD (knob name, values, state marker) and the TAIL (the reason's end,
+  // the dismissal affordance) both survive; the middle is ellipsized.
+  static constexpr absl::string_view kEllipsis = "...";
+  if (static_cast<int>(line.size()) > width) {
+    if (width <= 3) {
+      line = line.substr(0, static_cast<size_t>(std::max(1, width)));
+    } else {
+      const size_t tail_keep = static_cast<size_t>(width) / 3;
+      const size_t head_keep = static_cast<size_t>(width) - tail_keep - kEllipsis.size();
+      line = absl::StrCat(line.substr(0, head_keep), kEllipsis,
+                          line.substr(line.size() - tail_keep));
+    }
+  }
+  rows.push_back(ftxui::text(line));
   return ftxui::vbox(std::move(rows));
 }
 

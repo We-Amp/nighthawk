@@ -125,6 +125,16 @@ private:
 // total disclosure. Pure.
 ftxui::Element RenderLiveKnobTurns(const LiveKnobTurn& rps_turn, int width, int height);
 
+// Whether the knobs tab must render the live-turn line: true whenever the
+// tracker has anything to say — a non-empty acked value, a pending turn, or a
+// rejection/failed-pending note. Only the pristine (never-seeded) state stays
+// hidden. This is the shell's FRAME GATE, not the feed's: the failed-pending
+// outcome lands exactly when the run's in-flight flag is gone (the feed fires
+// its run-end pending surfacing immediately before on_finished), so gating
+// the frame on run-in-flight hid the failed state from the operator entirely.
+// Pure.
+bool LiveKnobTurnSurfaceable(const LiveKnobTurn& turn);
+
 // Whether an rps turn on this run is a ramp bend (C1): the engine treats a
 // live rps delta as ramp re-parameterization ONLY on a run configured with
 // the linear-ramping rate limiter plugin — the exact name the engine's

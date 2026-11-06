@@ -586,6 +586,27 @@ ftxui::Element RenderLayout(int width, int height, int active_tab, InputMode mod
     if (rps_turn != nullptr) {
       rows.push_back(RenderLiveKnobTurns(*rps_turn, width, height - 5));
     }
+    // The knob-turn draft echo (fix round): while the u-key editor owns the
+    // keyboard, the typed value renders here. The draft is a live steering
+    // input — enter sends an irreversible delta to the engine — so the old
+    // no-echo state (typing blind behind the inverted "editing" mode cell)
+    // was a defect. The line names the knob, echoes the draft, and states
+    // the pending-send affordance.
+    if (mode == InputMode::kEditingKnob) {
+      static const std::string kEmptyDraft;
+      const std::string& draft = overlay == nullptr ? kEmptyDraft : overlay->knob_draft;
+      rows.push_back(ftxui::text(absl::StrCat("rps turn draft: ", draft,
+                                              "  [enter sends / esc cancels]")
+                                     .substr(0, static_cast<size_t>(std::max(0, width)))));
+    }
+    // The controller's transient note (the same line the flame pane renders)
+    // routes to the knobs pane too (fix round): knob-flow refusals surface
+    // via NoteFlameStatus, which rendered only on tab 1 — invisible exactly
+    // where the u/e key was pressed.
+    if (flame != nullptr && !flame->note.empty()) {
+      rows.push_back(ftxui::text(flame->note.substr(0, static_cast<size_t>(std::max(0, width)))) |
+                     ftxui::dim);
+    }
     rows.push_back(RenderKnobPane(current, width, height - 5));
     if (staged_preview != nullptr && !staged_preview->empty()) {
       rows.push_back(RenderNextPhasePreviewBlock(*staged_preview,
