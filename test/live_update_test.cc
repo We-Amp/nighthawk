@@ -23,6 +23,7 @@
 
 #include "source/client/factories_impl.h"
 #include "source/client/live_update_orchestrator.h"
+#include "source/client/options_impl.h"
 #include "source/client/live_update_validator.h"
 #include "source/client/process_impl.h"
 #include "source/common/ramp_reanchor.h"
@@ -1937,6 +1938,66 @@ TEST_F(LiveCapabilityFanOutTest, FanOutRefusedWhenUpdatesDisabled) {
   EXPECT_THAT(result.rejection_reason(), HasSubstr("shutting down"));
   EXPECT_TRUE(post_order_.empty());
   EXPECT_EQ(in_flight_fan_outs_, 0) << "the fence registration must always pair";
+}
+
+// --- The plugin branch of SequencerFactoryImpl::create vs the per-phase rps
+// override. The phase path's override is the worker's divided share of the
+// phase's declared GLOBAL rate (the burstfix division), and the plugin branch
+// must pace the per-phase limiter at it -- exactly like the linear branch
+// does. The regression: the plugin branch silently discarded the override and
+// built every per-phase limiter at the top-level flag (offered load =
+// active_workers x flag on every phase of a plugin run). ---
+
+TEST(SequencerFactoryPluginOverrideTest, PluginLimiterPacesAtPerPhaseRpsOverride) {
+  Envoy::Stats::IsolatedStoreImpl stats_store;
+  Envoy::Api::ApiPtr api = Envoy::Api::createApiForTest(stats_store);
+  Envoy::Event::DispatcherPtr dispatcher = api->allocateDispatcher("factory_plugin_override_test");
+
+  // A real OptionsImpl (the proto path the service materializes), top-level
+  // flag 100: an override-consuming plugin branch must never pace at it.
+  nighthawk::client::CommandLineOptions command_line;
+  command_line.mutable_requests_per_second()->set_value(100);
+  command_line.mutable_duration()->set_seconds(10);
+  command_line.mutable_uri()->set_value("http://127.0.0.1:1/");
+  auto* plugin_config = command_line.mutable_rate_limiter_plugin_config();
+  plugin_config->set_name("nighthawk.linear-ramping-rate-limiter-plugin");
+  nighthawk::rate_limiter::LinearRampingRateLimiterConfig plugin_proto;
+  plugin_proto.mutable_ramp_time()->set_seconds(1);
+  std::ignore = plugin_config->mutable_typed_config()->PackFrom(plugin_proto);
+  OptionsImpl options(command_line);
+
+  SequencerFactoryImpl factory(options);
+  LiveTunableRateLimiter* captured = nullptr;
+  const SequencerTarget dummy_target = [](const CompletionCallback& f) -> bool {
+    f(true, true);
+    return true;
+  };
+  auto sequencer =
+      factory.create(api->timeSource(), *dispatcher, dummy_target,
+                     std::make_unique<NiceMock<MockTerminationPredicate>>(),
+                     *stats_store.rootScope(), api->timeSource().monotonicTime() + 10ms, *api,
+                     /*requests_per_second_override=*/10, &captured);
+  ASSERT_NE(sequencer.get(), nullptr);
+  ASSERT_NE(captured, nullptr);
+  // The captured handle is the INNER plugin limiter (captured before the
+  // ScheduledStartingRateLimiter wrap): the physical pacer of this phase.
+  auto* limiter = dynamic_cast<RateLimiter*>(captured);
+  ASSERT_NE(limiter, nullptr);
+
+  // Drive the captured limiter in real time, starting at its first attempt:
+  // the 1s ramp completes, then it paces at its schedule rate. It must pace
+  // at the override (10/s), never at the top-level flag (100/s).
+  int acquired = 0;
+  const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (limiter->tryAcquireOne()) {
+      ++acquired;
+    }
+  }
+  // ~2.5s from the first attempt: ~5 releases (the ramp's integral) plus ~15
+  // at the 10/s target. The flag-paced limiter would hand out ~250.
+  EXPECT_LT(acquired, 60)
+      << "the plugin limiter must pace at the per-phase rps override, not the top-level flag";
 }
 
 } // namespace

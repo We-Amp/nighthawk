@@ -17,6 +17,9 @@
 #include "source/common/protobuf/utility.h"
 #include "source/common/ramp_reanchor.h"
 
+#include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
+
 namespace Nighthawk {
 
 using namespace std::chrono_literals;
@@ -321,7 +324,22 @@ RateLimiterPtr LinearRampingRateLimiterImplFactory::createRateLimiterPlugin(
   if (ramp_time <= 0ns) {
     throw NighthawkException("ramp_time must be positive and > 0ns");
   }
-  if (!options.noDuration() && ramp_time > options.duration()) {
+  // FORK-ONLY (We-Amp): a phase run rejects the top-level duration (the
+  // per-phase durations own the run's shape), so the honest ramp bound there
+  // is the phase vector's TOTAL duration -- bounding against the top-level
+  // duration's 5s default would cap every phase run's ramp while citing a
+  // flag the user is forbidden to set on that shape.
+  if (options.hasPhaseVector()) {
+    std::chrono::nanoseconds phases_total(0ns);
+    for (const nighthawk::client::PhaseSpec& phase : options.phases()) {
+      phases_total += std::chrono::seconds(phase.duration().seconds());
+    }
+    if (ramp_time > phases_total) {
+      throw NighthawkException(absl::StrCat(
+          "ramp_time must be less than or equal to the phase vector's total duration (",
+          absl::FormatDuration(absl::Nanoseconds(phases_total.count())), ")"));
+    }
+  } else if (!options.noDuration() && ramp_time > options.duration()) {
     throw NighthawkException(
         "ramp_time must be less than or equal to time specified by --duration");
   }

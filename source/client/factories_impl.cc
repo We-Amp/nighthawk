@@ -16,6 +16,7 @@
 
 #include "source/client/benchmark_client_impl.h"
 #include "source/client/output_collector_impl.h"
+#include "source/client/options_impl.h"
 #include "source/client/output_formatter_impl.h"
 #include "source/common/platform_util_impl.h"
 #include "source/common/rate_limiter_impl.h"
@@ -107,8 +108,24 @@ SequencerPtr SequencerFactoryImpl::create(
 
   // Check if there is a rate limiter plugin to load and use.
   if (options_.rateLimiterPluginConfig().has_value()) {
-    absl::StatusOr<RateLimiterPtr> plugin_or =
-        LoadRateLimiterPlugin(options_.rateLimiterPluginConfig().value(), api, time_source);
+    // FORK-ONLY (We-Amp): the per-phase rps override is the worker's divided
+    // share of the phase's declared GLOBAL rate (the same burstfix division
+    // the linear branch consumes below). The plugin factory reads its rate
+    // through the Options seam, so hand it a cloned Options with the
+    // override applied; discarding the override here rebuilt every per-phase
+    // plugin limiter at the top-level flag -- offered load =
+    // active_workers x flag on every phase, the multiplication class the
+    // burstfix killed on the linear path, alive on the plugin path.
+    std::unique_ptr<Options> plugin_options_storage;
+    const Options* options_for_plugin = &options_;
+    if (requests_per_second_override.has_value()) {
+      auto command_line = options_.toCommandLineOptions();
+      command_line->mutable_requests_per_second()->set_value(*requests_per_second_override);
+      plugin_options_storage = std::make_unique<OptionsImpl>(*command_line);
+      options_for_plugin = plugin_options_storage.get();
+    }
+    absl::StatusOr<RateLimiterPtr> plugin_or = LoadRateLimiterPlugin(
+        options_.rateLimiterPluginConfig().value(), api, time_source, *options_for_plugin);
     if (!plugin_or.ok()) {
       throw NighthawkException(
           absl::StrCat("Rate Limiter plugin loading error: ", plugin_or.status().message()));
@@ -167,13 +184,13 @@ SequencerPtr SequencerFactoryImpl::create(
 
 absl::StatusOr<RateLimiterPtr> SequencerFactoryImpl::LoadRateLimiterPlugin(
     const envoy::config::core::v3::TypedExtensionConfig& config, Envoy::Api::Api& api,
-    Envoy::TimeSource& time_source) const {
+    Envoy::TimeSource& time_source, const Options& options) const {
   try {
     auto& config_factory =
         Envoy::Config::Utility::getAndCheckFactoryByName<RateLimiterPluginConfigFactory>(
             config.name());
     return config_factory.createRateLimiterPlugin(config.typed_config(), api, time_source,
-                                                  options_);
+                                                  options);
   } catch (const Envoy::EnvoyException& e) {
     return absl::InvalidArgumentError(
         absl::StrCat("Could not load plugin: ", config.name(), ": ", e.what()));
