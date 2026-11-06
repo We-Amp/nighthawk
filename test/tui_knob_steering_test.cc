@@ -1,5 +1,6 @@
 #include <grpc++/grpc++.h>
 
+#include <algorithm>
 #include <fstream>
 #include <ios>
 #include <ostream>
@@ -16,9 +17,12 @@
 #include "api/client/session.pb.h"
 #include "api/client/service.pb.h"
 #include "source/client/tui/knob_pane.h"
+#include "source/client/tui/layout.h"
+#include "source/client/tui/run_view_model.h"
 #include "source/client/tui/session_conversion.h"
 #include "source/client/tui/session_reader.h"
 #include "source/client/tui/session_writer.h"
+#include "source/client/tui/start_run_dialog.h"
 #include "source/client/tui/status_bar.h"
 #include "source/client/tui/tui_app.h"
 
@@ -449,6 +453,188 @@ TEST(RampBentRuleTest, OnlyTheLinearRampingPluginBends) {
   nighthawk::client::CommandLineOptions empty_name;
   empty_name.mutable_rate_limiter_plugin_config()->set_name("");
   EXPECT_FALSE(RpsTurnBendsRamp(empty_name));
+}
+
+// ---------------------------------------------------------------------------
+// Fix round: the failed-pending surfacing must survive the run's END. The
+// shell's frame gate used to read runInProgress(); the feed fires its run-end
+// pending surfacing exactly when that flag is gone, so the failed frame never
+// reached the screen. The gate now reads the TRACKER (the pure
+// LiveKnobTurnSurfaceable predicate): the frame renders whenever the tracker
+// has anything to say — including a failed-pending outcome that landed after
+// on_finished.
+// ---------------------------------------------------------------------------
+
+TEST(ShellGateTest, FailedPendingTurnStaysSurfaceableAfterRunEnd) {
+  // The pristine (never-seeded) tracker has nothing to say: the gate stays
+  // closed and the knobs pane renders the plain vocabulary only.
+  KnobTurnTracker pristine;
+  EXPECT_FALSE(LiveKnobTurnSurfaceable(pristine.rps()));
+
+  KnobTurnTracker tracker;
+  tracker.SeedAckedValue(100);
+  EXPECT_TRUE(LiveKnobTurnSurfaceable(tracker.rps())) << "a seeded acked value is surfaceable";
+  tracker.BeginRpsTurn(300);
+  EXPECT_TRUE(LiveKnobTurnSurfaceable(tracker.rps())) << "a pending turn is surfaceable";
+
+  // The run ends with the turn un-acked: the feed-generated result resolves
+  // it failed-pending (this is the exact state the old run-in-flight gate
+  // hid). The gate must stay OPEN, and the frame the shell paints must carry
+  // the marker AND the reason.
+  tracker.OnUpdateResult(rejectedAck("run-feed: 1 update(s) were still pending when the "
+                                     "stream ended; the service never acked them"));
+  ASSERT_EQ(tracker.rps().state, KnobTurnState::kFailedPending);
+  EXPECT_TRUE(LiveKnobTurnSurfaceable(tracker.rps()))
+      << "a failed-pending outcome must stay visible after run end";
+
+  OverlayState overlay;
+  const ftxui::Element frame =
+      RenderLayout(100, 30, /*active_tab=*/2, InputMode::kNavigate, RunViewModel{},
+                   StartRunDialogModel{}, /*session_path=*/"",
+                   nighthawk::client::CommandLineOptions{}, &overlay,
+                   /*flame=*/nullptr, /*profiler_state=*/"",
+                   /*timeline=*/nullptr, /*staged_preview=*/nullptr,
+                   /*staged_workers_annotation=*/nullptr, /*boundary_stamps=*/nullptr,
+                   /*rps_turn=*/&tracker.rps());
+  const std::string text = screenText(frame, 100, 30);
+  EXPECT_NE(text.find("[failed]"), std::string::npos)
+      << "the failed marker must survive the run end:\n"
+      << text;
+  // The reason survives the run end; at the declared minimum width the long
+  // reason renders with its END intact (the width discipline keeps the tail —
+  // the reason's last words and the dismissal affordance), so the asserted
+  // phrase is one the tail carries.
+  EXPECT_NE(text.find("never acked them"), std::string::npos)
+      << "the failure reason must survive the run end:\n"
+      << text;
+
+  // Dismissal closes the surface honestly: back to the acked line (which
+  // stays, the acked value is real), never an empty pane.
+  tracker.DismissOutcome();
+  EXPECT_EQ(tracker.rps().state, KnobTurnState::kCurrentAcked);
+  EXPECT_TRUE(LiveKnobTurnSurfaceable(tracker.rps()));
+}
+
+// ---------------------------------------------------------------------------
+// Fix round: the knob-turn draft echo. The kEditingKnob draft used to be
+// invisible — the operator typed a live steering value blind. The draft line
+// renders on the knobs pane while the mode owns the keyboard: knob name,
+// typed value, and the pending-send affordance.
+// ---------------------------------------------------------------------------
+
+TEST(KnobDraftEchoTest, TypingRendersTheDraftOnTheKnobsPane) {
+  OverlayState overlay;
+  overlay.knob_draft = "300";
+
+  const ftxui::Element frame =
+      RenderLayout(100, 30, /*active_tab=*/2, InputMode::kEditingKnob, RunViewModel{},
+                   StartRunDialogModel{}, /*session_path=*/"",
+                   nighthawk::client::CommandLineOptions{}, &overlay);
+  const std::string text = screenText(frame, 100, 30);
+  EXPECT_NE(text.find("rps turn draft"), std::string::npos)
+      << "the draft line must name the knob:\n"
+      << text;
+  EXPECT_NE(text.find("300"), std::string::npos) << "the typed value must echo:\n" << text;
+  EXPECT_NE(text.find("enter sends"), std::string::npos)
+      << "the pending-send affordance must be visible:\n"
+      << text;
+
+  // An empty draft stays honest: the line renders, showing nothing typed yet.
+  overlay.knob_draft.clear();
+  const std::string empty_text =
+      screenText(RenderLayout(100, 30, 2, InputMode::kEditingKnob, RunViewModel{},
+                              StartRunDialogModel{}, "", nighthawk::client::CommandLineOptions{},
+                              &overlay),
+                 100, 30);
+  EXPECT_NE(empty_text.find("rps turn draft"), std::string::npos) << empty_text;
+
+  // Outside the editing mode the draft line is gone (no stale echo).
+  const std::string navigate_text =
+      screenText(RenderLayout(100, 30, 2, InputMode::kNavigate, RunViewModel{},
+                              StartRunDialogModel{}, "", nighthawk::client::CommandLineOptions{},
+                              &overlay),
+                 100, 30);
+  EXPECT_EQ(navigate_text.find("rps turn draft"), std::string::npos) << navigate_text;
+}
+
+TEST(KnobDraftEchoTest, FillOverlayStateCarriesTheKnobDraft) {
+  // The seam-crossing check: the shell's per-frame ShellState -> OverlayState
+  // mapping must carry the draft, or a state-level draft assertion stays
+  // green while the screen stays blind (the re-review finding's shape).
+  ShellState state;
+  state.mode = InputMode::kEditingKnob;
+  state.knob_draft = "300";
+  OverlayState overlay;
+  FillOverlayState(state, &overlay);
+  EXPECT_EQ(overlay.knob_draft, "300");
+}
+
+// ---------------------------------------------------------------------------
+// Fix round: the turn line's width discipline. The flat tail-chop hid the
+// reason and the "(u dismisses)" affordance behind the pane edge exactly when
+// the reason was long enough to matter. An overlong line now keeps the HEAD
+// (knob name, values, marker) and the TAIL (the reason's end, the dismissal
+// affordance) and ellipsizes the middle.
+// ---------------------------------------------------------------------------
+
+TEST(LiveTurnWidthTest, OverlongLineKeepsHeadAndTailEllipsizesTheMiddle) {
+  LiveKnobTurn failed{"rps", "100", "300", KnobTurnState::kFailedPending,
+                      "run-feed: 1 update(s) were still pending when the stream ended; the "
+                      "service never acked them (resolved inside the late-rejection drop "
+                      "window after run end or accepted cancellation)"};
+  const int width = 60;
+  const std::string text = screenText(RenderLiveKnobTurns(failed, width, 5), width, 5);
+  EXPECT_NE(text.find("rps: 100"), std::string::npos)
+      << "the head (name + acked value) must survive:\n"
+      << text;
+  EXPECT_NE(text.find("(u dismisses)"), std::string::npos)
+      << "the tail (dismissal affordance) must survive:\n"
+      << text;
+  EXPECT_NE(text.find("..."), std::string::npos) << "the middle must be ellipsized:\n" << text;
+  EXPECT_EQ(text.find("resolved inside the late-rejection drop window"), std::string::npos)
+      << "the middle must actually be cut, not the old flat tail-chop:\n"
+      << text;
+
+  // The ellipsized line fits the pane: no rendered row wider than the width.
+  int longest = 0;
+  for (const std::string& line : screenLines(RenderLiveKnobTurns(failed, width, 5), width, 5)) {
+    longest = std::max(longest, static_cast<int>(line.size()));
+  }
+  EXPECT_LE(longest, width);
+
+  // A line that fits is untouched (this turn line is ~230 chars; render wide).
+  const std::string fits =
+      screenText(RenderLiveKnobTurns(failed, 300, 5), 300, 5);
+  EXPECT_NE(fits.find("resolved inside the late-rejection drop window"), std::string::npos)
+      << fits;
+  EXPECT_EQ(fits.find("..."), std::string::npos) << "no ellipsis when the line fits:\n" << fits;
+}
+
+// ---------------------------------------------------------------------------
+// Fix round: knob-flow notes route to the knobs pane too. NoteFlameStatus
+// renders only on the flame tab; a u/e refusal on the knobs tab was invisible
+// exactly where the key was pressed. The knobs pane carries the same note.
+// ---------------------------------------------------------------------------
+
+TEST(KnobNoteRoutingTest, KnobsTabRendersTheStatusNote) {
+  FlamePaneState flame;
+  flame.note = "no run to steer: u turns rps while a run is live";
+  const ftxui::Element frame =
+      RenderLayout(100, 30, /*active_tab=*/2, InputMode::kNavigate, RunViewModel{},
+                   StartRunDialogModel{}, /*session_path=*/"",
+                   nighthawk::client::CommandLineOptions{}, /*overlay=*/nullptr, &flame);
+  const std::string text = screenText(frame, 100, 30);
+  EXPECT_NE(text.find("no run to steer: u turns rps while a run is live"), std::string::npos)
+      << "the note must render on the knobs pane too:\n"
+      << text;
+
+  // No note: no stray line (the empty note renders nothing).
+  const std::string quiet =
+      screenText(RenderLayout(100, 30, 2, InputMode::kNavigate, RunViewModel{},
+                              StartRunDialogModel{}, "", nighthawk::client::CommandLineOptions{},
+                              /*overlay=*/nullptr, /*flame=*/nullptr),
+                 100, 30);
+  EXPECT_EQ(quiet.find("no run to steer"), std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

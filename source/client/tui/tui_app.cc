@@ -408,6 +408,10 @@ void FillOverlayState(const ShellState& state, OverlayState* overlay) {
   overlay->rps_field = state.rps_field;
   overlay->duration_field = state.duration_field;
   overlay->phases_field = state.phases_field;
+  // The knob-turn draft rides along (fix round): dropping this copy would
+  // leave the operator typing the live steering value blind again while
+  // every state-level assertion stays green.
+  overlay->knob_draft = state.knob_draft;
   overlay->show_errors = state.show_errors;
   overlay->help_open = state.help_open;
   // The controller-rejection line rides along: dropping this copy would make
@@ -772,6 +776,19 @@ bool HandleShellEvent(const ftxui::Event& event, ShellState& state, RunControlle
       return true;
     }
     if (!controller.runInProgress()) {
+      // The post-run window (fix round): a stale rejection/failed-pending
+      // outcome still renders on the knobs pane advertising "(u dismisses)" —
+      // the turn's run is gone, but the honest surface stays until the
+      // operator clears it. The affordance must work exactly here, not
+      // refuse with "no run to steer" behind its own line.
+      const LiveKnobTurn turn = controller.rpsTurnState();
+      if (turn.state == KnobTurnState::kRejected ||
+          turn.state == KnobTurnState::kFailedPending) {
+        controller.DismissKnobOutcome();
+        controller.NoteFlameStatus("stale knob outcome dismissed");
+        force_redraw();
+        return true;
+      }
       controller.NoteFlameStatus("no run to steer: u turns rps while a run is live");
       return true;
     }
@@ -1900,8 +1917,13 @@ int runInteractive(const std::string& address, const std::string& session_prefix
             static_cast<uint32_t>(parsed), ActivePhaseIndex(knob_options, current_phase_id) + 1);
       }
     }
-    // The live rps turn state (M3): rendered on the knobs tab while a run
-    // is in flight (held in a local so the pointer outlives the render).
+    // The live rps turn state (M3): rendered on the knobs tab whenever the
+    // tracker has anything to say (held in a local so the pointer outlives
+    // the render). The frame gate reads the TRACKER, not the feed: the
+    // failed-pending outcome lands exactly when the run's in-flight flag is
+    // gone (the feed fires its run-end pending surfacing immediately before
+    // on_finished, and the asynchronous render loses that race) — the old
+    // runInProgress() gate hid the failed state from the operator entirely.
     const LiveKnobTurn rps_turn_render = controller.rpsTurnState();
     return RenderLayout(screen.dimx(), screen.dimy(), state.active_tab, state.mode, view_model,
                         state.dialog, controller.sessionPath(), knob_options, &overlay, &flame,
@@ -1909,7 +1931,7 @@ int runInteractive(const std::string& address, const std::string& session_prefix
                         staged_preview.empty() ? nullptr : &staged_preview,
                         staged_preview.empty() ? nullptr : &staged_annotation,
                         &boundary_stamps,
-                        controller.runInProgress() ? &rps_turn_render : nullptr);
+                        LiveKnobTurnSurfaceable(rps_turn_render) ? &rps_turn_render : nullptr);
   });
 
   Component app = CatchEvent(view, [&](Event event) {

@@ -214,6 +214,10 @@ public:
 
   std::string serviceAddress() const { return fmt::format("127.0.0.1:{}", grpc_server_port_); }
 
+  // Test-only access to the fixture's in-proc service (seam injection), the
+  // same pattern tui_run_feed_test uses.
+  ServiceImpl& service() { return *service_; }
+
   const std::shared_ptr<grpc::ChannelInterface>& channel() const { return channel_; }
 
   TestHttpListener& listener() {
@@ -991,6 +995,98 @@ TEST_F(SessionPipelineTest, StopThenStartSurfacesTheControllerRejection) {
   // session closes cleanly on the way out.
   EXPECT_TRUE(controller->finishSession(/*completed=*/false).ok());
   EXPECT_TRUE(controller->sessionPath().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Fix round: the failed-pending outcome must survive the run's END, and the
+// u-key dismissal must work in the post-run window. The service's hogging
+// applier (the same seam tui_run_feed_test uses) guarantees the turn never
+// gets its engine ack: the feed surfaces the pending state as a feed-generated
+// failed-pending result immediately before on_finished. The shell's old
+// runInProgress() frame gate hid exactly that frame (the flag is already gone
+// when the asynchronous render runs); the gate now reads the tracker, so the
+// failed line — and its "(u dismisses)" affordance — stays on the knobs pane
+// after run end.
+// ---------------------------------------------------------------------------
+
+// A test double for the update applier (injected via
+// ServiceImpl::SetUpdateApplierFactoryForTest): waits out its full deadline,
+// so the run always ends before the ack could ever be written.
+class DeadlineHoggingApplier : public LiveUpdateOrchestrator::Applier {
+public:
+  nighthawk::client::UpdateResult
+  ApplyDeltas(const nighthawk::client::UpdateRequest& /*request*/, const std::string& epoch_id,
+              const EngineInstant& /*bend_instant*/, absl::Time deadline) override {
+    while (absl::Now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    nighthawk::client::UpdateResult result;
+    result.set_applied(true);
+    result.set_epoch_id(epoch_id);
+    return result;
+  }
+};
+
+TEST_F(SessionPipelineTest, FailedPendingSurvivesRunEndAndDismissesPostRun) {
+  service().SetUpdateApplierFactoryForTest([]() { return std::make_unique<DeadlineHoggingApplier>(); });
+  auto controller = std::make_unique<RunController>(channel(), tempPath("tui-failed-pending"));
+
+  ASSERT_EQ(controller->startRun(makeStartRequest(listener().uri(), /*rps=*/10,
+                                                  /*duration_seconds=*/60)),
+            absl::OkStatus());
+  // The turn goes out while the run is live; the hogging applier holds the
+  // ack past the run's end.
+  ASSERT_EQ(controller->TurnRps(300), absl::OkStatus());
+  EXPECT_EQ(controller->rpsTurnState().state, KnobTurnState::kPendingApply);
+
+  // Stop the run: the update resolves inside the late-rejection drop window —
+  // surfaced by the feed as a "run-feed: " result immediately before
+  // on_finished, never silently cleared.
+  controller->stopRun();
+  for (int i = 0; i < 300 && controller->runInProgress(); ++i) {
+    std::this_thread::sleep_for(100ms);
+  }
+  ASSERT_FALSE(controller->runInProgress());
+  EXPECT_EQ(controller->rpsTurnState().state, KnobTurnState::kFailedPending)
+      << "the pending turn must resolve failed-pending at run end, never silently cleared";
+  EXPECT_NE(controller->rpsTurnState().note.find("run-feed: "), std::string::npos)
+      << controller->rpsTurnState().note;
+
+  // THE FIX under test: the frame the shell paints after run end carries the
+  // failed marker and the reason — composed exactly as runInteractive
+  // composes it, through the shared surfaceability gate (never a
+  // run-in-flight read).
+  const LiveKnobTurn turn = controller->rpsTurnState();
+  ASSERT_TRUE(LiveKnobTurnSurfaceable(turn));
+  OverlayState overlay;
+  const ftxui::Element frame =
+      RenderLayout(100, 30, /*active_tab=*/2, InputMode::kNavigate, RunViewModel{},
+                   StartRunDialogModel{}, controller->sessionPath(),
+                   nighthawk::client::CommandLineOptions{}, &overlay,
+                   /*flame=*/nullptr, /*profiler_state=*/"",
+                   /*timeline=*/nullptr, /*staged_preview=*/nullptr,
+                   /*staged_workers_annotation=*/nullptr, /*boundary_stamps=*/nullptr,
+                   /*rps_turn=*/&turn);
+  ftxui::Screen screen(100, 30);
+  ftxui::Render(screen, frame);
+  const std::string frame_text = screen.ToString();
+  EXPECT_NE(frame_text.find("[failed]"), std::string::npos)
+      << "the failed line must survive the run end:\n"
+      << frame_text;
+  EXPECT_NE(frame_text.find("(u dismisses)"), std::string::npos) << frame_text;
+
+  // The advertised affordance works in exactly this window: u dismisses the
+  // stale outcome post-run (consumed, mode unchanged, note cleared).
+  ShellState state;
+  state.active_tab = 2;
+  const bool consumed = HandleShellEvent(ftxui::Event::Character('u'), state, *controller,
+                                         /*force_redraw=*/[] {}, /*exit_loop=*/[] {});
+  EXPECT_TRUE(consumed);
+  EXPECT_EQ(state.mode, InputMode::kNavigate);
+  EXPECT_EQ(controller->rpsTurnState().state, KnobTurnState::kCurrentAcked);
+  EXPECT_TRUE(controller->rpsTurnState().note.empty());
+
+  EXPECT_TRUE(controller->finishSession(/*completed=*/false).ok());
 }
 
 // F3: a start whose RPC write fails must not leave a header-only session

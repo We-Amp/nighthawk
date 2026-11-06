@@ -122,12 +122,13 @@ public:
   // ack, and never silently dropped.
   //
   // ONE OUTSTANDING UPDATE AT A TIME — a client-side discipline: wait for the
-  // ack before sending the next update. The service currently has NO
-  // one-in-flight guard on the update path, so two overlapping pendings
-  // could both claim the next knob epoch; guarding it service-side is a
-  // recorded M3 follow-up. The feed serializes its own sends and never
-  // issues a second update before the previous ack or the run's terminal
-  // event.
+  // ack before sending the next update. The service ENFORCES the same rule
+  // (the orchestrator's one-in-flight guard: a second update arriving while
+  // one is in flight is rejected with a structured applied=false ack, and the
+  // guard's release shares the epoch commit's critical section, so overlapping
+  // pendings can never both claim the next knob epoch). The feed's own
+  // serialization stays as defense in depth: it never issues a second update
+  // before the previous ack or the run's terminal event.
   absl::Status SendUpdate(const nighthawk::client::UpdateRequest& request);
 
   // Writes a CancellationRequest arm on the in-flight run's stream. Unlike
