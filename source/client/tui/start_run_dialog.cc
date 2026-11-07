@@ -26,6 +26,14 @@ void StartRunDialogModel::set_duration_seconds(uint32_t seconds) { duration_seco
 
 void StartRunDialogModel::set_connections(uint32_t connections) { connections_ = connections; }
 
+void StartRunDialogModel::set_max_requests_per_connection(uint32_t max_requests_per_connection) {
+  max_requests_per_connection_ = max_requests_per_connection;
+}
+
+void StartRunDialogModel::add_request_headers(std::string name, std::string value) {
+  request_headers_.emplace_back(std::move(name), std::move(value));
+}
+
 void StartRunDialogModel::set_phases(std::vector<nighthawk::client::PhaseSpec> phases) {
   phases_ = std::move(phases);
 }
@@ -131,6 +139,22 @@ nighthawk::client::StartRequest StartRunDialogModel::build_request() const {
   // (the dialog has no field for it); 0 stays unset — the engine default.
   if (connections_ > 0) {
     options->mutable_connections()->set_value(connections_);
+  }
+  // The steering surface's churn control: 0 stays unset — the engine
+  // default. The tool boundary validates the positive floor before this.
+  if (max_requests_per_connection_ > 0) {
+    options->mutable_max_requests_per_connection()->set_value(max_requests_per_connection_);
+  }
+  // The steering surface's request headers, verbatim (the tool boundary
+  // validates the entries; the model is the single builder). They live under
+  // the static RequestOptions (the same surface the CLI's --request-header
+  // fills).
+  if (!request_headers_.empty()) {
+    for (const auto& [name, value] : request_headers_) {
+      auto* option = options->mutable_request_options()->add_request_headers();
+      option->mutable_header()->set_key(name);
+      option->mutable_header()->set_value(value);
+    }
   }
   // Presence of live_streaming is the opt-in marker; stats_flush_interval
   // defaults to 1s (the proto bounds it to [1s, 300s]).

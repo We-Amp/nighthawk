@@ -14,6 +14,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -313,6 +314,10 @@ constexpr char kStartRunSchema[] = R"json(
                   "description": "Phase run: comma-separated name:rps:duration[:concurrency[:connections]] entries (e.g. 'warm:100:5:2,spike:400:5:4:64'), replacing duration_s. Each phase rps is a declared global total under the ceiling."},
        "connections": {"type": "integer",
                        "description": "The connection count (HTTP/1)."},
+       "max_requests_per_connection": {"type": "integer",
+                                       "description": "The connection-churn control: close the connection after this many requests (1 = a new connection per request). Positive integer."},
+       "headers": {"type": "array",
+                   "description": "Request headers set on EVERY request: an array of at most 64 objects of the shape {\"name\": <string>, \"value\": <string>}. Names and values are request VALUES: an entry that is not a name/value string pair, has an empty or malformed name (colons, spaces), or smuggles CR/LF/NUL framing into a name or value is refused before any engine connection."},
        "duration_s": {"type": "integer",
                       "description": "Run duration in seconds (legacy single-phase run; mutually exclusive with phases)."}},
      "required": ["uri"],
@@ -322,18 +327,37 @@ constexpr char kStartRunDescription[] =
     "Starts a benchmark run. Args: uri (string, required), rps (integer, "
     "optional; the DECLARED GLOBAL total per second), phases (string, "
     "optional; 'name:rps:duration[:concurrency[:connections]]' entries "
-    "replacing duration_s), connections (integer, optional), duration_s "
-    "(integer, optional). Non-positive rps, connections, or duration_s is "
-    "refused naming the field ('must be a positive integer'). The target "
-    "host is resolved and EVERY resolved address is checked against "
-    "loopback and --allow-target-cidr BEFORE any engine connection: an "
-    "off-box target is refused with the scoping message, and an allowed "
-    "target is rewritten to the resolved IP so the engine cannot "
-    "re-resolve elsewhere. Redirects are refused for non-allowlisted "
-    "targets. A declared total above the --max-rps ceiling is refused "
-    "naming the cap. Errors arrive as isError:true with the reason "
-    "verbatim (scoping message, ceiling, validator text, engine "
-    "rejection). Returns {run_started, session, resolved_target}.";
+    "replacing duration_s), connections (integer, optional), "
+    "max_requests_per_connection (integer, optional; close the connection "
+    "after this many requests — 1 composes the connection-churn storm "
+    "shape), headers (array, optional; at most 64 {name, value} string "
+    "pairs set on every request), duration_s (integer, optional). "
+    "Non-positive rps, connections, max_requests_per_connection, or "
+    "duration_s is refused naming the field ('must be a positive "
+    "integer'). Header entries are request VALUES: a non-{name,value} "
+    "entry, an empty or malformed name, or CR/LF/NUL in a name or value is "
+    "refused before any engine connection. The target host is resolved and "
+    "EVERY resolved address is checked against loopback and "
+    "--allow-target-cidr BEFORE any engine connection: an off-box target "
+    "is refused with the scoping message, and an allowed target is "
+    "rewritten to the resolved IP so the engine cannot re-resolve "
+    "elsewhere. Redirects are refused for non-allowlisted targets. A "
+    "declared total above the --max-rps ceiling is refused naming the cap. "
+    "Errors arrive as isError:true with the reason verbatim (scoping "
+    "message, ceiling, validator text, engine rejection). Returns "
+    "{run_started, session, resolved_target}.";
+
+// The request-header array's security-floor cap (named in the schema and the
+// refusal).
+constexpr int kMaxStartRunHeaders = 64;
+
+// Whether a header name/value carries CR/LF/NUL framing (the header-
+// injection floor: names and values are single-line request values, never
+// framing).
+bool HeaderFieldHasFraming(const std::string& text) {
+  return text.find('\r') != std::string::npos || text.find('\n') != std::string::npos ||
+         text.find('\0') != std::string::npos;
+}
 
 constexpr char kSteerSchema[] = R"json(
     {"type": "object",
@@ -786,6 +810,67 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
           absl::StrCat("duration_s must be a positive integer (got ", value, ")"));
     }
     dialog.set_duration_seconds(static_cast<uint32_t>(value));
+  }
+  // The request-shape passthrough (drive backlog item 2): the connection-
+  // churn control and the request headers, validated at this boundary so the
+  // engine's validator text is never the first refusal.
+  if (const Value* max_per_conn =
+          FindField(arguments, "max_requests_per_connection"); max_per_conn != nullptr) {
+    const int64_t value = IntegerOf(*max_per_conn);
+    if (value <= 0) {
+      // Before the uint32 cast (the proto pins gte 1): a negative would wrap
+      // to a huge churn figure.
+      return absl::InvalidArgumentError(absl::StrCat(
+          "max_requests_per_connection must be a positive integer (got ", value, ")"));
+    }
+    // Carried on the dialog's side channel: build_request() writes it (the
+    // connections pattern — the dialog model stays the single builder).
+    dialog.set_max_requests_per_connection(static_cast<uint32_t>(value));
+  }
+  if (const Value* headers = FindField(arguments, "headers"); headers != nullptr) {
+    if (headers->kind_case() != Value::kListValue) {
+      return absl::InvalidArgumentError("headers must be an array of {name, value} objects");
+    }
+    const ListValue& list = headers->list_value();
+    if (list.values_size() > kMaxStartRunHeaders) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "headers carries ", list.values_size(), " entries; the cap is ", kMaxStartRunHeaders));
+    }
+    for (const Value& entry : list.values()) {
+      if (entry.kind_case() != Value::kStructValue) {
+        return absl::InvalidArgumentError(
+            "headers entries must be objects carrying 'name' and 'value'");
+      }
+      const Struct& header = entry.struct_value();
+      const Value* name = FindField(header, "name");
+      const Value* value = FindField(header, "value");
+      if (name == nullptr || value == nullptr ||
+          name->kind_case() != Value::kStringValue ||
+          value->kind_case() != Value::kStringValue) {
+        return absl::InvalidArgumentError(
+            "headers entries must be objects carrying 'name' and 'value' (strings)");
+      }
+      const std::string& header_name = name->string_value();
+      const std::string& header_value = value->string_value();
+      // The security floor: a header name is a non-empty single-line token
+      // (no colon, no space); names and values are request VALUES and never
+      // carry CR/LF/NUL framing.
+      if (header_name.empty() || HeaderFieldHasFraming(header_name) ||
+          header_name.find(':') != std::string::npos ||
+          header_name.find(' ') != std::string::npos) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "header name must be a non-empty token without ':', spaces, or "
+            "CR/LF/NUL (header injection refused): '",
+            absl::CHexEscape(header_name), "'"));
+      }
+      if (HeaderFieldHasFraming(header_value)) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "header value must not carry CR/LF/NUL framing (header injection "
+            "refused): '",
+            absl::CHexEscape(header_value), "'"));
+      }
+      dialog.add_request_headers(header_name, header_value);
+    }
   }
   for (int field : {Tui::StartRunDialogModel::kUri, Tui::StartRunDialogModel::kRps,
                     Tui::StartRunDialogModel::kDuration, Tui::StartRunDialogModel::kPhases}) {

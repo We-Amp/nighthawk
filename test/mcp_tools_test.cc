@@ -639,6 +639,117 @@ TEST(McpToolsTest, ConnectionsFieldRoundTrips) {
   EXPECT_EQ(harness->service->startRequests()[0].options().connections().value(), 64);
 }
 
+// The churn control (drive backlog item 2): max_requests_per_connection
+// travels the wire onto the StartRequest's options, so 1-req-per-connection
+// storm arms are drivable through the tool layer.
+TEST(McpToolsTest, MaxRequestsPerConnectionRoundTrips) {
+  auto harness = MakeHarness(
+      absl::ZeroDuration(), false, {},
+      [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+        return std::vector<std::string>{"127.0.0.1"};
+      });
+  Struct result = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 60,
+                    "max_requests_per_connection": 1})json"));
+  ASSERT_FALSE(IsIsError(result)) << ErrorText(result);
+  WaitForStartRequest(*harness);
+  ASSERT_EQ(harness->service->startRequests().size(), 1);
+  ASSERT_TRUE(
+      harness->service->startRequests()[0].options().has_max_requests_per_connection());
+  EXPECT_EQ(
+      harness->service->startRequests()[0].options().max_requests_per_connection().value(), 1);
+}
+
+// The floor: a non-positive max_requests_per_connection is refused naming the
+// field, before any engine connection (the proto pins gte 1; a wrap-past of
+// the uint32 cast must not drive a huge connection-churn figure).
+TEST(McpToolsTest, MaxRequestsPerConnectionRefusesNonPositive) {
+  auto harness = MakeHarness();
+  for (const std::string& value : {"0", "-4"}) {
+    Struct result = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5,
+                            "max_requests_per_connection": )json",
+                     value, R"json(})json"));
+    EXPECT_TRUE(IsIsError(result)) << value << " must be refused";
+    EXPECT_EQ(ErrorText(result),
+              absl::StrCat("max_requests_per_connection must be a positive integer (got ",
+                           value, ")"))
+        << value << ": " << ErrorText(result);
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// Request headers (drive backlog item 2): the small headers array builds
+// HeaderValueOption entries on the StartRequest — the connection:close
+// fallback for the churn arms is composable again.
+TEST(McpToolsTest, HeadersRoundTrip) {
+  auto harness = MakeHarness(
+      absl::ZeroDuration(), false, {},
+      [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+        return std::vector<std::string>{"127.0.0.1"};
+      });
+  Struct result = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 60,
+                    "headers": [{"name": "connection", "value": "close"},
+                                {"name": "x-edge-probe", "value": "c2"}]})json"));
+  ASSERT_FALSE(IsIsError(result)) << ErrorText(result);
+  WaitForStartRequest(*harness);
+  ASSERT_EQ(harness->service->startRequests().size(), 1);
+  // Held BY VALUE: the reference-binding dance over the temporary that
+  // startRequests() returns is not worth the lifetime subtleties.
+  const nighthawk::client::StartRequest received = harness->service->startRequests()[0];
+  const auto& built_headers = received.options().request_options().request_headers();
+  ASSERT_EQ(built_headers.size(), 2);
+  EXPECT_EQ(built_headers[0].header().key(), "connection");
+  EXPECT_EQ(built_headers[0].header().value(), "close");
+  EXPECT_EQ(built_headers[1].header().key(), "x-edge-probe");
+  EXPECT_EQ(built_headers[1].header().value(), "c2");
+}
+
+// The header security floor: values, not instructions — entries that are not
+// {name, value} string pairs, carry an empty/colon/space-bearing name, or
+// smuggle CR/LF/NUL framing into a name or value are refused naming the rule;
+// the array is capped before any engine connection.
+TEST(McpToolsTest, HeadersRefuseUnsafeEntries) {
+  auto harness = MakeHarness();
+  const std::string base = R"json({"uri": "http://127.0.0.1:80/", "rps": 10,
+      "duration_s": 5, "headers": [)json";
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {R"json("not-an-object")json", "headers entries must be objects"},
+      {R"json({"name": "x-only"})json", "headers entries must be objects"},
+      {R"json({"name": "", "value": "v"})json", "non-empty"},
+      {R"json({"name": "bad name", "value": "v"})json", "name must be a non-empty token"},
+      {R"json({"name": "bad:name", "value": "v"})json", "name must be a non-empty token"},
+      {R"json({"name": "x-a\r\nb", "value": "v"})json", "header injection"},
+      {R"json({"name": "x-ok", "value": "a\r\nb: c"})json", "header injection"},
+  };
+  for (const auto& [entry, needle] : cases) {
+    Struct result = CallToolOrDie(*harness, "start_run",
+                                  absl::StrCat(base, entry, R"json(]})json"));
+    EXPECT_TRUE(IsIsError(result)) << entry << " must be refused";
+    EXPECT_NE(ErrorText(result).find(needle), std::string::npos)
+        << entry << ": " << ErrorText(result);
+  }
+  // The cap: one past kMaxStartRunHeaders entries is refused naming it.
+  std::string many;
+  for (int i = 0; i <= 64; ++i) {
+    if (!many.empty()) {
+      many += ",";
+    }
+    many += absl::StrCat(R"json({"name": "x-h)json", i, R"json(", "value": "v"})json");
+  }
+  Struct capped =
+      CallToolOrDie(*harness, "start_run", absl::StrCat(base, many, R"json(]})json"));
+  EXPECT_TRUE(IsIsError(capped));
+  EXPECT_NE(ErrorText(capped).find("cap"), std::string::npos) << ErrorText(capped);
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
 // Steering without a run surfaces the feed's refusal verbatim.
 TEST(McpToolsTest, SteerWithoutRunSurfacesFeedRefusal) {
   auto harness = MakeHarness();

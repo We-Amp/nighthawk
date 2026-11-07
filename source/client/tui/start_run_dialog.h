@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -32,6 +33,21 @@ public:
   // passthrough, tested).
   void set_connections(uint32_t connections);
   uint32_t connections() const { return connections_; }
+
+  // Drive-backlog item 2 (the steering surface's request-shape passthrough).
+  // The connection-churn control: build_request() writes it when > 0 (0 =
+  // unset, the engine default — the connections pattern); the tool boundary
+  // owns the positive-integer floor.
+  void set_max_requests_per_connection(uint32_t max_requests_per_connection);
+  uint32_t max_requests_per_connection() const { return max_requests_per_connection_; }
+
+  // The request headers to set on every request, as (name, value) pairs.
+  // build_request() appends them verbatim as HeaderValueOptions; the tool
+  // boundary owns entry validation (the model stays a pure builder).
+  void add_request_headers(std::string name, std::string value);
+  const std::vector<std::pair<std::string, std::string>>& request_headers() const {
+    return request_headers_;
+  }
 
   // M2: the phase-vector entry. A non-empty vector turns the request into a
   // phase run: build_request() writes the vector and clears the
@@ -91,6 +107,8 @@ private:
   uint32_t rps_ = 0;
   uint32_t duration_seconds_ = 0;
   uint32_t connections_ = 0;
+  uint32_t max_requests_per_connection_ = 0;
+  std::vector<std::pair<std::string, std::string>> request_headers_;
   std::vector<nighthawk::client::PhaseSpec> phases_;
   std::string phases_field_;
 };
