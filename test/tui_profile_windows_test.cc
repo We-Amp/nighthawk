@@ -709,6 +709,35 @@ TEST(EpochWindowTest, EpochBoundaryPairIsComparableAndLabeled) {
   EXPECT_TRUE(SameStatePair(before, same_epoch));
 }
 
+// Drive backlog item 5: windows carry the profiler's own sample count, and
+// the alignment stamps it from the folded tree (the low-mass gate reads it).
+TEST(WindowAlignmentTest, WindowCarriesProfileSamples) {
+  FoldedTree tree = MakeTree({MakeFrame("main", 0, {MakeFrame("hot", 60)})});
+  ASSERT_EQ(tree.total_samples, 2u); // one sample per frame in MakeFrame
+
+  PhaseInterval phase;
+  phase.phase_id = "main";
+  phase.start_unix_ns = 1'000'000'000;
+  phase.end_unix_ns = 8'000'000'000;
+  phase.drain_complete = true;
+  auto aligned =
+      WindowPhaseAlignment::Align(tree, phase, 1'000'000'000, 3'000'000'000, 4, 100, "cpu", 0);
+  ASSERT_TRUE(aligned.ok()) << aligned.status();
+  EXPECT_EQ(aligned->profile_samples, 2u);
+
+  // The split producer stamps every part with the window's sample count
+  // (the parts are one window's samples). The epoch cut at 4s leaves both
+  // parts above the meaningful minimum.
+  std::vector<EpochMark> marks;
+  marks.push_back({"epoch-1", /*wall=*/4'000'000'000, /*monotonic=*/50});
+  SplitAlignment split = WindowPhaseAlignment::AlignSplit(tree, {phase}, 1'000'000'000,
+                                                          8'000'000'000, "cpu", 0, {}, 0, marks);
+  ASSERT_EQ(split.pure.size(), 2u);
+  for (const ProfileWindow& part : split.pure) {
+    EXPECT_EQ(part.profile_samples, 2u);
+  }
+}
+
 }  // namespace
 }  // namespace Tui
 }  // namespace Client

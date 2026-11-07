@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -1425,16 +1426,21 @@ constexpr char kDiffDescription[] =
     "its differential is the noise floor, not an effect. A worker-count "
     "change computes with comparable:false and the reason; impure or "
     "mixed-type (cpu vs alloc) pairs are refused with the reason verbatim. "
-    "A pair whose windows together carry fewer than 10 completed requests "
-    "gains a 'note' naming the sample count — the differential is correct "
-    "but near-meaningless; fill the SUT (higher rate or cheaper responses) "
-    "before reading it.";
+    "A pair whose poorer window carries fewer than 100 profiler samples "
+    "gains a 'note' naming both windows' sample counts — per-work totals "
+    "below that floor are profiler quantization, not signal; fill the SUT "
+    "(higher rate or cheaper responses, or pull a longer window) before "
+    "reading it. The result carries base_profile_samples and "
+    "cur_profile_samples either way.";
 
-// The near-zero-sample floor for diff_windows' guidance note: below this
-// many completed requests across BOTH windows the per-unit-of-work
-// differential is arithmetic on (near-)zero denominators — correct, but a
-// differential no agent should read as signal.
-constexpr uint64_t kNearZeroSamplesNoteFloor = 10;
+// The low-sample floor for diff_windows' guidance note (drive backlog item
+// 5): below this many PROFILER samples in a window the per-unit-of-work
+// differential is arithmetic on sample quantization — per-work totals swing
+// orders of magnitude between identical runs (the drive measured a 1.9k ->
+// 114k ns/req swing across clean identical runs on a ~48-sample window).
+// The completed-request count was the wrong gate: requests stay plentiful
+// while the profiler catches only a handful of samples on a near-idle SUT.
+constexpr uint64_t kLowSampleWindowFloor = 100;
 
 // The common id validation: server-assigned ints only (positive; the
 // tracker's monotonic ids start at 1).
@@ -1788,17 +1794,22 @@ ProfileController::DiffWindows(const google::protobuf::Struct& arguments) {
   }
   SetDouble(out, "base_total_per_work", diff->base_total_per_work);
   SetDouble(out, "cur_total_per_work", diff->cur_total_per_work);
-  // The empty-diff experience (the dogfooding follow-up): at trivial SUT
-  // load the per-unit-of-work differential is CORRECT but opaque — tiny
-  // denominators, zeros everywhere, often an empty diffs array. The honest
-  // guidance: name the sample count and point at the fix. Never invented
-  // signal — no value in the payload changes with it.
-  const uint64_t window_samples = base->work_units + current->work_units;
-  if (window_samples < kNearZeroSamplesNoteFloor) {
-    SetString(out, "note",
-              absl::StrCat("windows carry ~", window_samples,
-                           " samples; fill the SUT (higher rate or cheaper "
-                           "responses) before reading the differential"));
+  // The low-mass gate (drive backlog item 5): the profiler's own sample
+  // counts ride the result, and the guidance note keys on them — per-work
+  // totals at near-idle SUTs quantize to samples while completed requests
+  // stay plentiful, so the completed-request count was the wrong gate.
+  // Never invented signal — no value in the payload changes with the note.
+  SetInt(out, "base_profile_samples", static_cast<int64_t>(base->profile_samples));
+  SetInt(out, "cur_profile_samples", static_cast<int64_t>(current->profile_samples));
+  if (std::min(base->profile_samples, current->profile_samples) < kLowSampleWindowFloor) {
+    SetString(
+        out, "note",
+        absl::StrCat("windows carry ", base->profile_samples, " / ",
+                     current->profile_samples, " profiler samples (the floor is ",
+                     kLowSampleWindowFloor,
+                     " per window); below the floor per-work totals are profiler "
+                     "quantization, not signal — fill the SUT (higher rate or cheaper "
+                     "responses, or pull a longer window) before reading the differential"));
   }
   Value& diffs = (*out.mutable_fields())["diffs"];
   diffs.mutable_list_value();

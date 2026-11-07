@@ -187,6 +187,9 @@ SplitAlignment WindowPhaseAlignment::AlignSplit(
       ProfileWindow part;
       part.start_unix_ns = sub_start;
       part.end_unix_ns = sub_end;
+      // The parts are one window's samples: each carries the window's
+      // profiler sample count (the tree rides into the first part below).
+      part.profile_samples = tree.total_samples;
       part.phase_id = interval.phase_id;
       // The epoch in effect over this sub-part (empty before the run's
       // first applied change).
@@ -276,6 +279,7 @@ absl::StatusOr<ProfileWindow> WindowPhaseAlignment::Align(
 
   ProfileWindow window;
   window.tree = std::move(tree);
+  window.profile_samples = window.tree.total_samples;
   window.start_unix_ns = start_unix_ns;
   window.end_unix_ns = end_unix_ns;
   // Purity formula (header): overlap / window duration. Contained -> 1.0;

@@ -697,8 +697,11 @@ TEST(McpProfileTest, DiffAcrossEpochLabeled) {
   auto harness = MakeHarness(/*configure_profiling=*/true);
   StartRunAndWaitForSnapshot(*harness);
 
-  // Window 1: under the run's starting epoch (before any steer).
-  StageCannedProfile(*harness, /*sample_multiplier=*/1);
+  // Window 1: under the run's starting epoch (before any steer). The
+  // multipliers clear the low-sample floor (3 samples per multiplier unit;
+  // 120 and 180 profiler samples respectively) so the differential reads
+  // clean.
+  StageCannedProfile(*harness, /*sample_multiplier=*/40);
   Struct first = CallToolOrDie(*harness, "pull_profile_window",
                                R"json({"duration_s": 1})json", absl::Seconds(30));
   ASSERT_FALSE(IsIsError(first)) << ErrorText(first);
@@ -713,7 +716,7 @@ TEST(McpProfileTest, DiffAcrossEpochLabeled) {
   EXPECT_EQ(Text(Field(Structured(steer), "epoch_id")), "epoch-1");
 
   // Window 2: under the applied epoch.
-  StageCannedProfile(*harness, /*sample_multiplier=*/3);
+  StageCannedProfile(*harness, /*sample_multiplier=*/60);
   Struct second = CallToolOrDie(*harness, "pull_profile_window",
                                 R"json({"duration_s": 1})json", absl::Seconds(30));
   ASSERT_FALSE(IsIsError(second)) << ErrorText(second);
@@ -742,8 +745,15 @@ TEST(McpProfileTest, DiffAcrossEpochLabeled) {
     EXPECT_FALSE(Text(Field(StructOf(entry), "function")).empty());
   }
   EXPECT_GT(best_ratio, 0.0) << "the heavier current side must show a positive delta";
-  // The filled case carries NO guidance note: the differential is readable,
-  // and the note is reserved for the (near-)zero-sample windows.
+  // The profiler's own sample counts ride the result (drive backlog item 5):
+  // 3 samples per multiplier unit.
+  EXPECT_EQ(static_cast<uint64_t>(Field(structured, "base_profile_samples").number_value()),
+            120);
+  EXPECT_EQ(static_cast<uint64_t>(Field(structured, "cur_profile_samples").number_value()),
+            180);
+  // The loaded case carries NO guidance note: both windows clear the
+  // profiler-sample floor, and the note is reserved for the low-mass
+  // windows.
   EXPECT_FALSE(structured.fields().contains("note"))
       << "a well-loaded differential must not carry the guidance note";
 }
@@ -779,15 +789,19 @@ TEST(McpProfileTest, DiffSameStateRefusedNoiseFloor) {
   EXPECT_NE(reason.find("same knob epoch"), std::string::npos) << reason;
 }
 
-// DiffNearZeroSamplesCarriesGuidanceNote: at trivial SUT load the
-// differential is honest but opaque — tiny denominators, zeros everywhere,
-// often an empty diffs array. The result stays truthful (no invented
-// signal) and gains a guidance note naming the sample count and the fix
-// (fill the SUT); a well-loaded pair (DiffAcrossEpochLabeled) carries none.
+// DiffNearZeroSamplesCarriesGuidanceNote: windows whose PROFILER sample
+// count sits below the floor produce a differential that is arithmetic on
+// sample quantization — per-work totals swing orders of magnitude between
+// identical runs (the drive's finding: the completed-request count was the
+// wrong gate, because requests stay plentiful while the profiler catches
+// only a handful of samples on a near-idle SUT). The result stays truthful
+// (no invented signal), carries both windows' sample counts, and gains the
+// guidance note naming the fix; a pair clearing the floor
+// (DiffAcrossEpochLabeled) carries none.
 TEST(McpProfileTest, DiffNearZeroSamplesCarriesGuidanceNote) {
-  // The completed-work counter grows 2 units per second, so a 1s window
-  // carries ~2 samples — per-unit-of-work arithmetic on a near-zero
-  // denominator.
+  // The canned profile carries 3 samples per multiplier unit (3 and 9
+  // profiler samples here), far below the floor, at any completed-request
+  // count — the gate keys on the profiler's samples, not on the requests.
   auto harness = MakeHarness(/*configure_profiling=*/true, /*fail_enable=*/false,
                              /*counter_ns_per_unit=*/500'000'000);
   StartRunAndWaitForSnapshot(*harness);
@@ -819,12 +833,12 @@ TEST(McpProfileTest, DiffNearZeroSamplesCarriesGuidanceNote) {
   ASSERT_FALSE(IsIsError(diff)) << ErrorText(diff);
   const Struct& structured = Structured(diff);
   ASSERT_TRUE(structured.fields().contains("note"))
-      << "the near-zero-sample pair must carry the guidance note";
+      << "the low-sample pair must carry the guidance note";
   const std::string note = Text(Field(structured, "note"));
-  EXPECT_NE(note.find("samples"), std::string::npos) << note;
+  EXPECT_NE(note.find("profiler samples"), std::string::npos) << note;
   EXPECT_NE(note.find("fill the SUT"), std::string::npos) << note;
-  // The named count is the honest near-zero one (both windows together).
-  EXPECT_NE(note.find("~"), std::string::npos) << note;
+  // The named counts are the honest per-window ones.
+  EXPECT_NE(note.find("3 / 9 profiler samples"), std::string::npos) << note;
 }
 
 } // namespace

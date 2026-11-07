@@ -239,6 +239,7 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
 
   ProfileWindow window;
   window.tree = *std::move(tree_or);
+  window.profile_samples = window.tree.total_samples;
   window.start_unix_ns = window_start;
   window.end_unix_ns = window_end;
   window.phase_id = phase.phase_id;

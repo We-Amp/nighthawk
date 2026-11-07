@@ -137,6 +137,13 @@ struct ProfileWindow {
   // Completed requests inside the window — the per-unit-of-work denominator
   // (8.4), anchor-mapped by the caller (CompletedWorkInMonotonicRange).
   uint64_t work_units = 0;
+  // The profiler's own sample count in the window (the folded tree's
+  // total_samples; the parts of a split window each carry the window's
+  // count). The low-mass gate's input (drive backlog item 5): completed
+  // requests can stay plentiful while the profiler caught only a handful of
+  // samples, and per-work totals then quantize to samples — the request
+  // count is the wrong near-mass signal.
+  uint64_t profile_samples = 0;
   std::string profile_type;  // "cpu" | "alloc"
   bool symbolized = false;
   // Which clock bounded [start, end] (see enum). Derived by Align from the
