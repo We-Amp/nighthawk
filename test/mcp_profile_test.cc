@@ -789,6 +789,50 @@ TEST(McpProfileTest, DiffSameStateRefusedNoiseFloor) {
   EXPECT_NE(reason.find("same knob epoch"), std::string::npos) << reason;
 }
 
+// DiffCrossRunSameEpochAllowed (drive backlog item 4): matched windows
+// from two runs carry identical epoch-id STRINGS (per-run engine
+// counters), which used to refuse every cross-run config-A/B pair with the
+// noise-floor reason. The epoch identity now includes the run (each
+// start_run gets a fresh session file), so the cross-run pair diffs
+// first-class with the cross-run label, while the same-run same-epoch
+// refusal stays (DiffSameStateRefusedNoiseFloor).
+TEST(McpProfileTest, DiffCrossRunSameEpochAllowed) {
+  auto harness = MakeHarness(/*configure_profiling=*/true);
+  StartRunAndWaitForSnapshot(*harness);
+  StageCannedProfile(*harness, /*sample_multiplier=*/40);
+  Struct first = CallToolOrDie(*harness, "pull_profile_window",
+                               R"json({"duration_s": 1})json", absl::Seconds(30));
+  ASSERT_FALSE(IsIsError(first)) << ErrorText(first);
+  const int64_t base_id = static_cast<int64_t>(Field(Structured(first), "window_id").number_value());
+  WaitForWindow(*harness, base_id, absl::Seconds(30),
+                [](const std::string& status) { return status == "ready"; });
+
+  // End run 1: the explicit cancellation seals its session.
+  Struct cancel = CallToolOrDie(*harness, "cancel_run", "{}", absl::Seconds(30));
+  ASSERT_FALSE(IsIsError(cancel)) << ErrorText(cancel);
+
+  // Run 2: a fresh session (a fresh run key), same choreography, no steer —
+  // both windows carry the empty epoch string.
+  StartRunAndWaitForSnapshot(*harness);
+  StageCannedProfile(*harness, /*sample_multiplier=*/40);
+  Struct second = CallToolOrDie(*harness, "pull_profile_window",
+                                R"json({"duration_s": 1})json", absl::Seconds(30));
+  ASSERT_FALSE(IsIsError(second)) << ErrorText(second);
+  const int64_t cur_id =
+      static_cast<int64_t>(Field(Structured(second), "window_id").number_value());
+  WaitForWindow(*harness, cur_id, absl::Seconds(30),
+                [](const std::string& status) { return status == "ready"; });
+
+  Struct diff = CallToolOrDie(*harness, "diff_windows",
+                              absl::StrCat(R"json({"a": )json", base_id,
+                                           R"json(, "b": )json", cur_id, R"json(})json"));
+  ASSERT_FALSE(IsIsError(diff)) << ErrorText(diff);
+  const Struct& structured = Structured(diff);
+  EXPECT_TRUE(Field(structured, "comparable").bool_value());
+  const std::string label = Text(Field(structured, "label"));
+  EXPECT_NE(label.find("cross-run"), std::string::npos) << label;
+}
+
 // DiffNearZeroSamplesCarriesGuidanceNote: windows whose PROFILER sample
 // count sits below the floor produce a differential that is arithmetic on
 // sample quantization — per-work totals swing orders of magnitude between

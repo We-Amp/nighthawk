@@ -776,6 +776,50 @@ TEST(DifferentialTest, DiffRanksByAbsoluteDelta) {
   EXPECT_DOUBLE_EQ(new_row->cur_per_work - new_row->base_per_work, 1.0);
 }
 
+// Drive backlog item 4: epoch identity is keyed by the owning run, so
+// matched windows from two runs are NOT a same-state pair — cross-run
+// config-A/B windows diff first-class, while within-run same-epoch pairs
+// stay refused exactly as before.
+TEST(EpochWindowTest, CrossRunSameEpochIsNotSameState) {
+  FoldedTree tree = MakeTree({MakeFrame("work", 100)});
+  ProfileWindow run1 = WindowWith(tree, 100, 4);
+  run1.epoch_id = "epoch-1";
+  run1.run_key = "nighthawk-session-111.nhsession";
+  ProfileWindow run2 = WindowWith(tree, 100, 4);
+  run2.epoch_id = "epoch-1";
+  run2.run_key = "nighthawk-session-222.nhsession";
+
+  // Same epoch STRING, different runs: a cross-run pair, not noise floor.
+  EXPECT_FALSE(SameStatePair(run1, run2));
+  const std::string label = DifferentialPairLabel(run1, run2);
+  EXPECT_NE(label.find("cross-run"), std::string::npos) << label;
+  EXPECT_NE(label.find("epoch-1"), std::string::npos) << label;
+
+  // Within one run, same epoch: refused exactly as before.
+  ProfileWindow run1_late = WindowWith(tree, 100, 4);
+  run1_late.epoch_id = "epoch-1";
+  run1_late.run_key = run1.run_key;
+  EXPECT_TRUE(SameStatePair(run1, run1_late));
+  EXPECT_EQ(DifferentialPairLabel(run1, run1_late), "");
+
+  // Different runs AND different epochs: cross-run knob comparison.
+  ProfileWindow run2_steered = WindowWith(tree, 100, 4);
+  run2_steered.epoch_id = "epoch-2";
+  run2_steered.run_key = run2.run_key;
+  EXPECT_FALSE(SameStatePair(run1, run2_steered));
+  const std::string knob_label = DifferentialPairLabel(run1, run2_steered);
+  EXPECT_NE(knob_label.find("knob effect"), std::string::npos) << knob_label;
+  EXPECT_NE(knob_label.find("epoch-1 -> epoch-2"), std::string::npos) << knob_label;
+
+  // Identical epoch and NO run keys (legacy windows): the old behavior —
+  // a same-state pair.
+  ProfileWindow legacy_a = WindowWith(tree, 100, 4);
+  legacy_a.epoch_id = "";
+  ProfileWindow legacy_b = WindowWith(tree, 100, 4);
+  legacy_b.epoch_id = "";
+  EXPECT_TRUE(SameStatePair(legacy_a, legacy_b));
+}
+
 }  // namespace
 }  // namespace Tui
 }  // namespace Client

@@ -437,15 +437,26 @@ absl::StatusOr<DifferentialResult> ComputeNoiseFloor(const ProfileWindow& w1,
 }
 
 std::string DifferentialPairLabel(const ProfileWindow& base, const ProfileWindow& current) {
+  const bool cross_run = base.run_key != current.run_key;
   if (base.epoch_id == current.epoch_id) {
-    return "";
+    if (!cross_run) {
+      return "";
+    }
+    // Matching epochs from different runs: the cross-run config A/B pair
+    // (drive backlog item 4). No knob separates them; the runs do.
+    return absl::StrCat("cross-run pair (epoch '",
+                        base.epoch_id.empty() ? "(none)" : base.epoch_id, "' on both sides)");
   }
   return absl::StrCat("knob effect: ", base.epoch_id.empty() ? "(none)" : base.epoch_id, " -> ",
                       current.epoch_id.empty() ? "(none)" : current.epoch_id);
 }
 
 bool SameStatePair(const ProfileWindow& base, const ProfileWindow& current) {
-  return base.epoch_id == current.epoch_id;
+  // The epoch's identity is (run_key, epoch_id): epoch ids are per-run
+  // engine counters, and only windows under the same epoch WITHIN one run
+  // measure the noise floor. Matching epochs from two runs are the
+  // cross-run config-A/B pair, not noise (drive backlog item 4).
+  return base.epoch_id == current.epoch_id && base.run_key == current.run_key;
 }
 
 void ProfileWindowStore::store(std::vector<ProfileWindow> windows) {

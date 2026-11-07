@@ -133,6 +133,13 @@ struct ProfileWindow {
   // an epoch-boundary PAIR is comparable by default (that is the point) —
   // only worker-count changes stay non-comparable.
   std::string epoch_id;
+  // The owning run's identity (drive backlog item 4): the epoch ids are
+  // per-run engine counters ("epoch-1"), so matching them alone refuses
+  // every cross-run config-A/B pair. The epoch's identity for the
+  // same-state rule is (run_key, epoch_id) — matched windows from two runs
+  // differ and diff first-class as a cross-run pair; within one run the
+  // old behavior holds exactly.
+  std::string run_key;
   uint64_t worker_count = 0;  // non-comparability key (8.4)
   // Completed requests inside the window — the per-unit-of-work denominator
   // (8.4), anchor-mapped by the caller (CompletedWorkInMonotonicRange).
@@ -316,15 +323,20 @@ absl::StatusOr<DifferentialResult> ComputeNoiseFloor(const ProfileWindow& w1,
 
 // The differential pair's claim label (8.4 + M3): an epoch-boundary pair is
 // the knob-effect differential — "knob effect: <epoch_a> -> <epoch_b>".
-// A same-state pair (equal epoch ids, both empty included) returns "" — the
-// caller's existing same-state/noise-floor labeling applies. Worker-count
-// changes are orthogonal (ComputeDifferential's non-comparable verdict
-// wins); profile types/purity are checked before the label is consulted.
+// A same-state pair (equal epoch ids within ONE run, both empty included)
+// returns "" — the caller's existing same-state/noise-floor labeling
+// applies. Windows with matching epochs from DIFFERENT runs label as a
+// cross-run pair. Worker-count changes are orthogonal
+// (ComputeDifferential's non-comparable verdict wins); profile
+// types/purity are checked before the label is consulted.
 std::string DifferentialPairLabel(const ProfileWindow& base, const ProfileWindow& current);
 
 // Whether a same-state (noise-floor) claim is honest for this pair: the
-// noise floor is for windows under the SAME knob epoch (8.4); a pair that
-// spans an epoch boundary is the knob-effect differential, not noise.
+// noise floor is for windows under the SAME knob epoch WITHIN ONE run
+// (8.4); a pair that spans an epoch boundary is the knob-effect
+// differential, not noise. Epoch ids are per-run engine counters, so the
+// epoch's identity is (run_key, epoch_id): matching epochs from different
+// runs are NOT a same-state pair (drive backlog item 4).
 bool SameStatePair(const ProfileWindow& base, const ProfileWindow& current);
 
 // Mutex-guarded immutable swap, same pattern as the M0b SnapshotStore: the

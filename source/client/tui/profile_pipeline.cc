@@ -41,6 +41,14 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
   ProfileJobOutcome outcome;
   outcome.symbolizer_tool = absl::StrJoin(config.pprof_tool_argv, " ");
 
+  // The windows carry the owning run's identity (drive backlog item 4):
+  // stamped on every produced window before each return below.
+  const auto stamp_run_key = [&input, &outcome]() {
+    for (ProfileWindow& window : outcome.windows) {
+      window.run_key = input.run_key;
+    }
+  };
+
   outcome.raw_bytes = ReadWholeFile(fetched.local_path).value_or("");
   if (outcome.raw_bytes.empty()) {
     outcome.note = absl::StrCat("profile fetch failed: staged file unreadable: ",
@@ -207,6 +215,7 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
       absl::StrAppend(&note, " | ", symbolizer_note);
     }
     outcome.note = std::move(note);
+    stamp_run_key();
     return outcome;
   }
 
@@ -262,6 +271,7 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
       if (!symbolizer_note.empty()) {
         absl::StrAppend(&outcome.note, " | ", symbolizer_note);
       }
+      stamp_run_key();
       return outcome;
     }
     // Align can still reject a "contained" pair only on the degenerate
@@ -286,6 +296,7 @@ ProfileJobOutcome RunProfilePipeline(const ProfilePipelineConfig& config,
   if (!symbolizer_note.empty()) {
     absl::StrAppend(&outcome.note, " | ", symbolizer_note);
   }
+  stamp_run_key();
   return outcome;
 }
 

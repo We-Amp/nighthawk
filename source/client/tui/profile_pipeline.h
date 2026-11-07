@@ -94,6 +94,10 @@ struct ProfileJobInput {
   // snapshots' epoch-change markers. A window straddling one of these
   // splits AT it (spec 8.5), even in a legacy single-phase run.
   std::vector<EpochMark> epoch_marks;
+  // The owning run's identity (drive backlog item 4): the session file's
+  // path — unique per start_run. Stamped on every produced window so the
+  // same-state rule keys on (run, epoch), not the epoch string alone.
+  std::string run_key;
 };
 
 // The admin Date header's second resolution (the clock-offset uncertainty

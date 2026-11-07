@@ -1306,6 +1306,7 @@ void SteeringController::GracefulStop() {
 Tui::ProfileJobInput SteeringController::CaptureProfileContext() {
   std::lock_guard<std::mutex> lock(mutex_);
   Tui::ProfileJobInput input;
+  input.run_key = recorder_.path();
   input.anchor = anchor_;
   input.run_start_unix_ns = run_start_unix_ns_;
   input.run_finished = finished_;
@@ -1419,13 +1420,17 @@ constexpr char kDiffDescription[] =
     "work. Args: a, b (integers, required; SERVER-ASSIGNED window ids — "
     "monotonic from 1; a is the base, b the current). The result is the "
     "union-tree differential {label, comparable, base_window, current_window, "
-    "base_total_per_work, cur_total_per_work, diffs:[{function, file, line, "
+    "base_total_per_work, cur_total_per_work, base_profile_samples, "
+    "cur_profile_samples, diffs:[{function, file, line, "
     "base_per_work, cur_per_work, delta_ratio}...]}. An epoch-separated pair "
     "(windows pulled on either side of an applied steer) is labeled 'knob "
-    "effect: <a> -> <b>'; a same-state pair is REFUSED with isError:true — "
-    "its differential is the noise floor, not an effect. A worker-count "
-    "change computes with comparable:false and the reason; impure or "
-    "mixed-type (cpu vs alloc) pairs are refused with the reason verbatim. "
+    "effect: <a> -> <b>'; windows with matching epochs from DIFFERENT runs "
+    "diff as a cross-run pair (each start_run gets a fresh run identity, so "
+    "config A/B pairs are first-class); a same-run same-epoch pair is "
+    "REFUSED with isError:true — its differential is the noise floor, not "
+    "an effect. A worker-count change computes with comparable:false and "
+    "the reason; impure or mixed-type (cpu vs alloc) pairs are refused "
+    "with the reason verbatim. "
     "A pair whose poorer window carries fewer than 100 profiler samples "
     "gains a 'note' naming both windows' sample counts — per-work totals "
     "below that floor are profiler quantization, not signal; fill the SUT "
@@ -1767,16 +1772,19 @@ ProfileController::DiffWindows(const google::protobuf::Struct& arguments) {
     return current.status();
   }
 
-  // The same-state refusal: windows under the SAME knob epoch measure the
-  // noise floor, not a knob effect (8.4) — the tool refuses instead of
-  // dressing noise up as a result.
+  // The same-state refusal: windows under the SAME knob epoch within ONE
+  // run measure the noise floor, not a knob effect (8.4) — the tool refuses
+  // instead of dressing noise up as a result. Matching epochs from two
+  // runs (a fresh session file per start_run keys the epoch identity) are
+  // the cross-run pair, which diffs below.
   if (Tui::SameStatePair(*base, *current)) {
     return absl::FailedPreconditionError(absl::StrCat(
         "windows ", *base_id, " and ", *cur_id, " carry the same knob epoch ('",
-        base->epoch_id.empty() ? "(none)" : base->epoch_id,
-        "'): no applied change separates them, so their differential is the "
+        base->epoch_id.empty() ? "(none)" : base->epoch_id, "') from the same run: no applied "
+        "change separates them, so their differential is the "
         "NOISE FLOOR, not a knob effect — pull windows on either side of a "
-        "steer for the knob effect"));
+        "steer for the knob effect (windows with matching epochs from "
+        "DIFFERENT runs diff as a cross-run pair)"));
   }
 
   auto diff = Tui::ComputeDifferential(*base, *current);
