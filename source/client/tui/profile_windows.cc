@@ -399,6 +399,16 @@ absl::StatusOr<DifferentialResult> ComputeDifferential(const ProfileWindow& base
   std::sort(scored.begin(), scored.end(),
             [](const std::pair<const std::string*, DifferentialNodeDiff>& a,
                const std::pair<const std::string*, DifferentialNodeDiff>& b) {
+              // Rank by ABSOLUTE delta first (drive backlog item 6): a
+              // base=0 row's ~1/epsilon ratio used to dominate the ordering
+              // and bury genuinely massive absolute deltas, which is what
+              // the analysis reads first. Ties: |delta_ratio| descending
+              // (the relative view), then path ascending for determinism.
+              const double delta_a = std::fabs(a.second.cur_per_work - a.second.base_per_work);
+              const double delta_b = std::fabs(b.second.cur_per_work - b.second.base_per_work);
+              if (delta_a != delta_b) {
+                return delta_a > delta_b;
+              }
               const double mag_a = std::fabs(a.second.delta_ratio);
               const double mag_b = std::fabs(b.second.delta_ratio);
               if (mag_a != mag_b) {

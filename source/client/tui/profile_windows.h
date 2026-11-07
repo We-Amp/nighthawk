@@ -271,8 +271,11 @@ struct DifferentialNodeDiff {
 };
 
 struct DifferentialResult {
-  // Union-tree nodes, |delta_ratio| descending (ties: frame path ascending,
-  // for determinism).
+  // Union-tree nodes, |cur_per_work - base_per_work| descending (drive
+  // backlog item 6: a base=0 row's ~1/epsilon delta_ratio used to dominate
+  // the |ratio| ordering and bury the largest absolute deltas). Ties:
+  // |delta_ratio| descending, then frame path ascending, for determinism.
+  // delta_ratio stays reported per row — the ranking changed, not the math.
   std::vector<DifferentialNodeDiff> diffs;
   double base_total_per_work = 0.0;
   double cur_total_per_work = 0.0;

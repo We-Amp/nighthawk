@@ -224,21 +224,28 @@ TEST(DifferentialTest, DiffNormalizesPerUnitOfWork) {
 
   // (3) Localization: one subtree doubles, work unchanged -> that subtree's
   // ratio is +1.0, untouched subtrees are 0, and the union root carries the
-  // blended remainder. Drift vs. knob effect separability (8.4) rests on this.
+  // blended remainder. Drift vs. knob effect separability (8.4) rests on
+  // this. Values are exact in binary (512/1024 units, work 1024) so the
+  // hot/main ABSOLUTE-DELTA tie is exact and the documented tie-break
+  // (|delta_ratio| descending) decides deterministically: hot and main both
+  // gain +0.5 per work, hot's ratio is the larger (+1.0 vs +0.5).
   FoldedTree hot_doubled =
-      MakeTree({MakeFrame("main", 0, {MakeFrame("hot", 120), MakeFrame("cold", 40)})});
-  ProfileWindow localized_base = WindowWith(base_tree, 100);
-  ProfileWindow localized_cur = WindowWith(hot_doubled, 100);
+      MakeTree({MakeFrame("main", 0, {MakeFrame("hot", 1024), MakeFrame("cold", 512)})});
+  FoldedTree localized_base_tree =
+      MakeTree({MakeFrame("main", 0, {MakeFrame("hot", 512), MakeFrame("cold", 512)})});
+  ProfileWindow localized_base = WindowWith(localized_base_tree, 1024);
+  ProfileWindow localized_cur = WindowWith(hot_doubled, 1024);
   auto localized = ComputeDifferential(localized_base, localized_cur);
   ASSERT_TRUE(localized.ok()) << localized.status();
   EXPECT_DOUBLE_EQ(localized->base_total_per_work, 1.0);
-  EXPECT_DOUBLE_EQ(localized->cur_total_per_work, 1.6);
-  // Sorted by |delta_ratio| descending: hot (1.0), main (0.6), cold (0).
+  EXPECT_DOUBLE_EQ(localized->cur_total_per_work, 1.5);
+  // Sorted by absolute delta, ties |delta_ratio| descending:
+  // hot (+0.5, ratio 1.0), main (+0.5, ratio 0.5), cold (0).
   ASSERT_EQ(localized->diffs.size(), 3u);
   EXPECT_EQ(localized->diffs[0].frame->function, "hot");
   EXPECT_DOUBLE_EQ(localized->diffs[0].delta_ratio, 1.0);
-  EXPECT_DOUBLE_EQ(localized->diffs[0].base_per_work, 0.6);
-  EXPECT_DOUBLE_EQ(localized->diffs[0].cur_per_work, 1.2);
+  EXPECT_DOUBLE_EQ(localized->diffs[0].base_per_work, 0.5);
+  EXPECT_DOUBLE_EQ(localized->diffs[0].cur_per_work, 1.0);
   const DifferentialNodeDiff* cold = FindDiff(*localized, "cold");
   ASSERT_NE(cold, nullptr);
   EXPECT_DOUBLE_EQ(cold->delta_ratio, 0.0);
@@ -736,6 +743,37 @@ TEST(WindowAlignmentTest, WindowCarriesProfileSamples) {
   for (const ProfileWindow& part : split.pure) {
     EXPECT_EQ(part.profile_samples, 2u);
   }
+}
+
+// Drive backlog item 6: base=0 rows used to produce ~1/epsilon ratios that
+// dominated the |delta_ratio| ordering, burying genuinely massive ABSOLUTE
+// deltas (the drive's top-frame tables were ranked by them). Ranking is by
+// absolute delta now (ties: |delta_ratio| descending, then path ascending).
+TEST(DifferentialTest, DiffRanksByAbsoluteDelta) {
+  // Base: work 100, one frame "hot" carrying all 1000 units (10 per work).
+  FoldedTree base_tree = MakeTree({MakeFrame("main", 0, {MakeFrame("hot", 1000)})});
+  // Current: work 100, "hot" doubled (per-work 20 -> absolute delta +10,
+  // ratio +1.0) plus a NEW small frame "new" (per-work 1, absolute delta +1,
+  // ratio ~1/epsilon because it has no base side).
+  FoldedTree cur_tree = MakeTree(
+      {MakeFrame("main", 0, {MakeFrame("hot", 2000), MakeFrame("new", 100)})});
+  ProfileWindow base = WindowWith(base_tree, 100);
+  ProfileWindow current = WindowWith(cur_tree, 100);
+  auto diff = ComputeDifferential(base, current);
+  ASSERT_TRUE(diff.ok()) << diff.status();
+  ASSERT_EQ(diff->diffs.size(), 3u);
+  // The ~1e12-ratio row no longer dominates. Ranked by absolute delta: the
+  // union root main (+11 = the root carries the union of both changes),
+  // then hot (+10, a "boring" +1.0 ratio), then new (+1, the huge ratio).
+  EXPECT_EQ(diff->diffs[0].frame->function, "main");
+  EXPECT_DOUBLE_EQ(diff->diffs[0].cur_per_work - diff->diffs[0].base_per_work, 11.0);
+  EXPECT_EQ(diff->diffs[1].frame->function, "hot");
+  EXPECT_DOUBLE_EQ(diff->diffs[1].cur_per_work - diff->diffs[1].base_per_work, 10.0);
+  const DifferentialNodeDiff* new_row = FindDiff(*diff, "new");
+  ASSERT_NE(new_row, nullptr);
+  EXPECT_EQ(diff->diffs[2].frame->function, "new");
+  EXPECT_GT(new_row->delta_ratio, 1e11) << "the ratio is still reported, uninflated rank";
+  EXPECT_DOUBLE_EQ(new_row->cur_per_work - new_row->base_per_work, 1.0);
 }
 
 }  // namespace
