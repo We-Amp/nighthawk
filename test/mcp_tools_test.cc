@@ -902,6 +902,53 @@ TEST(McpToolsTest, CancelBoundedAt35s) {
   EXPECT_LE(elapsed, absl::Seconds(40)) << elapsed;
 }
 
+// Drive backlog item 7's fallback arm: a run that outlives its DECLARED
+// schedule by the TTL grace with no terminal in sight is cancelled by the
+// run-TTL watchdog — the ghost-engine contamination class (a dead MCP client
+// whose disconnect signal never arrives leaves the engine running and the
+// next drive inherits a polluted SUT) is bounded by declared end + grace.
+TEST(McpToolsTest, RunTtlCancelsRunPastDeclaredEnd) {
+  SteeringToolOptions options;
+  options.run_ttl_grace_s = 1;
+  auto harness = MakeHarness(absl::ZeroDuration(), false, options);
+  // Declared 1s + 1s grace: the watchdog must end this ~2s after start —
+  // the fake service never ends it on its own.
+  Struct started = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 1})json"));
+  ASSERT_FALSE(IsIsError(started)) << ErrorText(started);
+  WaitForStatus(*harness, absl::Seconds(10), [](const Struct& status) {
+    return !Field(StructOf(Field(status, "run")), "in_flight").bool_value();
+  });
+  // The cancellation resolved through the explicit arm, so the session is
+  // sealed (the end record landed) and the next start_run is NOT latched
+  // out by the still-open recorder.
+  Struct second = CallToolOrDie(
+      *harness, "start_run",
+      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                    R"json(/", "rps": 10, "duration_s": 60})json"));
+  ASSERT_FALSE(IsIsError(second)) << ErrorText(second);
+}
+
+// The watchdog spares a healthy run: a declared length the run has not yet
+// reached stays in flight — the TTL is a contamination bound, never a run
+// limiter.
+TEST(McpToolsTest, RunTtlSparesHealthyLongRun) {
+  SteeringToolOptions options;
+  options.run_ttl_grace_s = 1;
+  auto harness = MakeHarness(absl::ZeroDuration(), false, options);
+  CallToolOrDie(*harness, "start_run",
+                absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                              R"json(/", "rps": 10, "duration_s": 3600})json"));
+  WaitForStatus(*harness, absl::Seconds(5), [](const Struct& status) {
+    return !Text(Field(StructOf(Field(status, "current")), "phase_id")).empty();
+  });
+  absl::SleepFor(absl::Seconds(2)); // well past a 1s grace, far inside 3600s
+  Struct status = Structured(CallToolOrDie(*harness, "get_status", "{}"));
+  EXPECT_TRUE(Field(StructOf(Field(status, "run")), "in_flight").bool_value());
+}
+
 // The status strip carries the phase id and, after an applied steer, the
 // knob epoch — the CANONICAL shape (the nighthawk://status resource renders
 // the same object).

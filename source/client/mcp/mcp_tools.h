@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -134,6 +135,15 @@ struct SteeringToolOptions {
   // Session file prefix (SessionRecorder names "<prefix>-<unix_ns>.
   // nhsession").
   std::string session_prefix = "nighthawk-session";
+  // The run-TTL grace (drive backlog item 7): a run that outlives its
+  // DECLARED schedule by this many seconds with no terminal in sight is
+  // cancelled by the watchdog — the ghost-engine contamination bound (a
+  // dead MCP client whose disconnect signal never arrives leaves the
+  // engine burning the SUT, and the next drive inherits a polluted
+  // target). The disconnect signals themselves (stdin EOF, SIGTERM, the
+  // service's stream-break watchdog) are the primary arms; this is the
+  // fallback when none of them can arrive.
+  long long run_ttl_grace_s = 120;
 };
 
 // Resolves one host name to ALL its addresses (numeric strings). The default
@@ -295,6 +305,13 @@ private:
   // session is open. Caller holds no lock (the recorder is a leaf).
   void SealSession(bool completed);
 
+  // Arms (and re-arms, joining any previous) the run-TTL watchdog thread
+  // for the just-started run: it sleeps until the run's declared length +
+  // --run-ttl grace and cancels the run if no terminal event arrived by
+  // then (drive backlog item 7's fallback arm). One watchdog at a time; a
+  // generation counter disarms an older one. Not called under the lock.
+  void ArmRunTtl(int64_t declared_duration_s);
+
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   SteeringToolOptions options_;
@@ -374,6 +391,13 @@ private:
   Tui::SessionRecorder recorder_;
   Tui::FoldTracker fold_tracker_;
   Tui::RunFeed feed_;
+  // The run-TTL watchdog (drive backlog item 7): one live thread per
+  // armed run. run_ttl_epoch_ (guarded by mutex_) is its generation —
+  // bumping it disarms the current thread at its next wake; the thread
+  // touches feed_ only after its fire decision, and the destructor /
+  // GracefulStop disarm + join BEFORE feed_ tears down.
+  int64_t run_ttl_epoch_ = 0;
+  std::thread run_ttl_thread_;
 };
 
 // Registers the four steering tools (start_run, steer, cancel_run,

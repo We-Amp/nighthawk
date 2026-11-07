@@ -612,9 +612,58 @@ Tui::RunFeedCallbacks SteeringController::Callbacks() {
 }
 
 SteeringController::~SteeringController() {
-  // feed_ is declared last and destroyed first: its destructor cancels any
+  // The run-TTL watchdog touches feed_: disarm it (a generation flip ends
+  // its wait promptly) and join BEFORE feed_ tears down. feed_ is declared
+  // last and destroyed first after this: its destructor cancels any
   // in-flight run and joins the read thread, whose final callbacks find
   // every other member alive. An open session drains its queued records.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++run_ttl_epoch_;
+  }
+  cv_.notify_all();
+  if (run_ttl_thread_.joinable()) {
+    run_ttl_thread_.join();
+  }
+}
+
+void SteeringController::ArmRunTtl(int64_t declared_duration_s) {
+  // One watchdog at a time: the previous run's thread exits promptly once
+  // its generation flipped or the run finished (StartRun only runs after
+  // the previous run's terminal event), so this join is bounded.
+  if (run_ttl_thread_.joinable()) {
+    run_ttl_thread_.join();
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++run_ttl_epoch_;
+  const int64_t my_epoch = run_ttl_epoch_;
+  const long long grace_s = options_.run_ttl_grace_s;
+  run_ttl_thread_ = std::thread([this, my_epoch, declared_duration_s, grace_s]() {
+    const absl::Time deadline =
+        absl::Now() + absl::Seconds(declared_duration_s + grace_s);
+    bool abandoned = false;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait_until(lock, absl::ToChronoTime(deadline), [&] {
+        return run_ttl_epoch_ != my_epoch || finished_;
+      });
+      abandoned = run_ttl_epoch_ == my_epoch && !finished_;
+    }
+    if (!abandoned) {
+      return;
+    }
+    // The watchdog fire (drive backlog item 7): a run outliving its
+    // DECLARED schedule by the grace with no terminal in sight is the
+    // ghost-engine shape — the engine keeps burning the SUT and the next
+    // drive inherits a polluted target. The explicit cancellation arm is
+    // the clean stop (the final output still lands and resolves the
+    // session lifecycle); when the write fails (the stream itself is the
+    // dead part), the context cancel is the fallback.
+    const absl::Status sent = feed_.SendCancellation();
+    if (!sent.ok()) {
+      feed_.stop();
+    }
+  });
 }
 
 void SteeringController::OnSnapshot(const nighthawk::client::LiveSnapshot& snapshot) {
@@ -939,6 +988,21 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
         (!concurrency.empty() && absl::SimpleAtoi(concurrency, &parsed) && parsed > 0)
             ? parsed
             : 1;
+  }
+  // The run-TTL watchdog (drive backlog item 7's fallback arm): armed with
+  // the run's DECLARED length — the phases' summed durations, or the legacy
+  // duration — plus the grace. A run that is still in flight at declared
+  // end + grace gets cancelled (the ghost-engine contamination bound).
+  int64_t declared_duration_s = 0;
+  if (!request.options().phases().empty()) {
+    for (const nighthawk::client::PhaseSpec& phase : request.options().phases()) {
+      declared_duration_s += phase.duration().seconds();
+    }
+  } else if (request.options().has_duration()) {
+    declared_duration_s = request.options().duration().seconds();
+  }
+  if (declared_duration_s > 0) {
+    ArmRunTtl(declared_duration_s);
   }
   Struct result;
   SetBool(result, "run_started", true);
@@ -1298,7 +1362,15 @@ void SteeringController::GracefulStop() {
       feed_.stop();
       // Bounded: the shutdown path must not hang on a wedged stream.
       cv_.wait_for(lock, std::chrono::seconds(5), [&] { return finished_; });
+      // Disarm the run-TTL watchdog: its fire decision reads the
+      // generation after any wait wake, so a flip ends it promptly (a
+      // bounded join — the shutdown path never waits for a TTL deadline).
+      ++run_ttl_epoch_;
     }
+    cv_.notify_all();
+  }
+  if (run_ttl_thread_.joinable()) {
+    run_ttl_thread_.join();
   }
   SealSession(/*completed=*/completed_);
 }
