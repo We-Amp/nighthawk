@@ -1129,8 +1129,10 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
   // weights, and only into whole per-worker rates (the owner's rule: no
   // fractional or remainder splits). A delta that does not divide is
   // refused before a single post.
+  // NH1 review S2: the weights of the phase this fan-out tracked (the
+  // phase_index read above), not a second read of "the current phase".
   const std::vector<uint32_t> weights = context_.current_phase_worker_weights != nullptr
-                                            ? context_.current_phase_worker_weights()
+                                            ? context_.current_phase_worker_weights(phase_index)
                                             : std::vector<uint32_t>();
   if (!weights.empty()) {
     if (weights.size() != active_workers) {
@@ -1521,11 +1523,10 @@ uint32_t ProcessImpl::activeWorkerCountForUpdate() const {
   return active_worker_count_;
 }
 
-std::vector<uint32_t> ProcessImpl::currentPhaseWorkerWeightsForUpdate() const {
+std::vector<uint32_t> ProcessImpl::phaseWorkerWeightsForUpdate(uint32_t phase_index) const {
   if (!options_.hasPhaseVector()) {
     return {};
   }
-  const uint32_t phase_index = currentPhaseIndexForUpdate();
   if (phase_index >= options_.phases().size()) {
     return {};
   }
@@ -1634,7 +1635,9 @@ std::unique_ptr<LiveUpdateApplier> ProcessImpl::MakeLiveUpdateApplier() {
   };
   context.current_phase_index = [this]() { return currentPhaseIndexForUpdate(); };
   context.active_worker_count = [this]() { return activeWorkerCountForUpdate(); };
-  context.current_phase_worker_weights = [this]() { return currentPhaseWorkerWeightsForUpdate(); };
+  context.current_phase_worker_weights = [this](uint32_t phase_index) {
+    return phaseWorkerWeightsForUpdate(phase_index);
+  };
   context.capability_for_phase = [this](int worker_id, uint32_t phase_index) {
     return live_capability_registry_.CapabilityForPhase(worker_id, phase_index);
   };
@@ -1828,6 +1831,12 @@ void ProcessImpl::runPhases() {
     // per-worker rates); every other phase keeps the even split above.
     const absl::Span<const uint32_t> weights(phase.worker_weights().data(),
                                              phase.worker_weights_size());
+    // NH1 review S1: perWorkerRates falls back to the even split when the
+    // weight count does not match, which would silently undo the weights.
+    // Validation makes that unreachable; never let it happen quietly.
+    RELEASE_ASSERT(weights.empty() || weights.size() == active_workers,
+                   fmt::format("phase {} ('{}') declares {} worker weights for {} active workers",
+                               phase_index, phase.name(), weights.size(), active_workers));
     const std::vector<uint32_t> worker_rps = perWorkerRates(declared_rps, active_workers, weights);
     if (phase_worker_rps_.size() <= phase_index) {
       phase_worker_rps_.resize(phase_index + 1);

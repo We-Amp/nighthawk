@@ -25,6 +25,12 @@ constexpr absl::string_view kFeedGeneratedReasonPrefix = "run-feed: ";
 
 } // namespace
 
+std::shared_ptr<grpc::Channel> MakeServiceChannel(const std::string& address) {
+  grpc::ChannelArguments arguments;
+  arguments.SetMaxReceiveMessageSize(-1); // unlimited
+  return grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), arguments);
+}
+
 RunFeed::RunFeed(const std::shared_ptr<grpc::ChannelInterface>& channel, RunFeedCallbacks callbacks)
     : callbacks_(std::move(callbacks)),
       stub_(nighthawk::client::NighthawkService::NewStub(channel)) {}

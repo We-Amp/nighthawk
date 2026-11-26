@@ -489,6 +489,22 @@ TEST(OptionsPhasesTest, CliWorkerSeriesFlagRoundTrips) {
   std::unique_ptr<OptionsImpl> cadence = TestUtility::createOptionsImpl(std::vector<const char*>{
       "nighthawk_client", "--worker-series", "--stats-flush-interval", "1", "http://127.0.0.1/"});
   EXPECT_EQ(1, cadence->statsFlushInterval());
+  // Review S6: the series cadence is at least 1 s, on the CLI and the proto path.
+  EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(std::vector<const char*>{
+                              "nighthawk_client", "--worker-series",
+                              "--stats-flush-interval-duration", "0.5s", "http://127.0.0.1/"}),
+                          MalformedArgvException,
+                          "--worker-series needs a stats flush interval of at least 1s");
+  std::unique_ptr<OptionsImpl> one_second = TestUtility::createOptionsImpl(
+      std::vector<const char*>{"nighthawk_client", "--worker-series",
+                               "--stats-flush-interval-duration", "1s", "http://127.0.0.1/"});
+  EXPECT_TRUE(one_second->workerSeriesEnabled());
+  nighthawk::client::CommandLineOptions fast;
+  fast.mutable_uri()->set_value("http://127.0.0.1/");
+  fast.mutable_worker_series()->set_value(true);
+  fast.mutable_stats_flush_interval_duration()->set_nanos(200000000);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(fast), MalformedArgvException,
+                          "--worker-series needs a stats flush interval of at least 1s");
 }
 
 } // namespace Client

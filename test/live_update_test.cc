@@ -1558,7 +1558,10 @@ public:
     };
     context.current_phase_index = [this]() { return phase_index_; };
     context.active_worker_count = [this]() { return static_cast<uint32_t>(workers_.size()); };
-    context.current_phase_worker_weights = [this]() { return weights_; };
+    context.current_phase_worker_weights = [this](uint32_t phase_index) {
+      weights_phase_index_ = phase_index;
+      return weights_;
+    };
     context.capability_for_phase = [this](int worker_id, uint32_t) -> absl::StatusOr<LiveCapabilityEntry> {
       if (missing_worker_.has_value() && worker_id == *missing_worker_) {
         return absl::NotFoundError(
@@ -1610,6 +1613,8 @@ public:
   LiveKnobDelta declared_schedule_;
   // NH1: the current phase's worker_weights (empty = the even split).
   std::vector<uint32_t> weights_;
+  // The phase index the fan-out asked the weights for (review S2).
+  std::optional<uint32_t> weights_phase_index_;
   bool updates_enabled_ = true;
   Envoy::MonotonicTime fake_now_;
   int in_flight_fan_outs_ = 0;
@@ -1743,11 +1748,15 @@ TEST_F(LiveCapabilityFanOutTest, WeightedPhaseBendSplitsByWeights) {
     workers_.push_back(std::make_unique<FakeFanOutWorker>());
   }
   weights_ = {2, 1, 1};
+  phase_index_ = 3;
   LiveCapabilityFanOutApplier applier(MakeContext());
   const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
   const UpdateResult result =
       applier.ApplyDeltas(RpsRequest(40), "epoch-1", bend_instant, Deadline());
   ASSERT_TRUE(result.applied()) << result.rejection_reason();
+  // Review S2: the weights are read for the phase index the fan-out tracked.
+  ASSERT_TRUE(weights_phase_index_.has_value());
+  EXPECT_EQ(*weights_phase_index_, 3u);
   EXPECT_EQ(*workers_[0]->applies[0].delta.new_rps, 20u);
   EXPECT_EQ(*workers_[1]->applies[0].delta.new_rps, 10u);
   EXPECT_EQ(*workers_[2]->applies[0].delta.new_rps, 10u);

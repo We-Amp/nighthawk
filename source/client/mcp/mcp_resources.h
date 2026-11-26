@@ -64,10 +64,11 @@ google::protobuf::Struct RenderSeriesPayload(
 // worker id, its points in time order, a point repeated across snapshots
 // (no new partial in between) rendered once. Every point carries the
 // worker's own clock pair, phase and epoch, the cumulative requests, 2xx,
-// connections opened and closed, the request_to_response latency summary
-// of its current phase, and the per-interval rates against the worker's
-// previous point (requests_per_second, http_2xx_per_second; absent on a
-// worker's first point).
+// connections opened and closed, the pool and pending overflow (requests the
+// worker's pool refused), the request_to_response latency summary of its
+// current phase, and the per-interval rates against the worker's previous
+// point (requests, 2xx, pool overflow and pending overflow per second;
+// absent on a worker's first point).
 google::protobuf::Struct
 RenderWorkersPayload(const std::string& session_path,
                      const std::vector<nighthawk::client::MetricSeriesRecord>& records);

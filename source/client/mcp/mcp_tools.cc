@@ -331,10 +331,10 @@ constexpr char kStartRunSchema[] = R"json(
        "request_body_size": {"type": "integer",
                              "description": "The request body size in bytes, sent on every request (0 = no body). At most 4194304. A body needs a method that carries one: a non-zero size with method GET or HEAD (GET is the default) is refused."},
        "method": {"type": "string",
-                  "enum": ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"],
-                  "description": "The request method (default GET)."},
+                  "enum": ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+                  "description": "The request method (default GET). CONNECT and TRACE are not offered: against an origin they read as SUT errors, never as a priced row."},
        "request_mix": {"type": "array",
-                       "description": "A request mix: 1 to 256 entry objects {method?, path?, headers?, body_size?}, cycled round-robin per worker (repeat an entry to weight it). method defaults to GET; path ('/...') sets :path; headers is a {name, value} array as above; body_size is bytes (0 to 4194304, refused with GET or HEAD). Mutually exclusive with headers, method and request_body_size (set them per entry), so not usable with h3 (which needs a top-level Host header)."},
+                       "description": "A request mix: 1 to 256 entry objects {method?, path?, headers?, body_size?}, cycled round-robin per worker (repeat an entry to weight it). method defaults to GET; path ('/...') sets :path; headers is a {name, value} array as above; body_size is bytes (0 to 4194304, refused with GET or HEAD). Mutually exclusive with headers, method and request_body_size (set them per entry), so not usable with h3 (which needs a top-level Host header). On an https uri the TLS server name is then the rewritten IP: an entry's Host header does not set it."},
        "burst_size": {"type": "integer",
                       "description": "Release requests in bursts of this size (1 to 1000000) at the same average rate."},
        "open_loop": {"type": "boolean",
@@ -345,7 +345,7 @@ constexpr char kStartRunSchema[] = R"json(
        "max_concurrent_streams": {"type": "integer",
                                   "description": "The stream limit per connection (1 to 2147483647); h2 and h3 only."},
        "tls": {"type": "object",
-               "description": "TLS parameters for an https uri: {min_version?, max_version? ('1.0', '1.1', '1.2' or '1.3'), cipher_suites? (array of strings), ecdh_curves? (array of strings), session_resumption? (boolean; false disables session resumption)}. The engine still sets the ALPN and the SNI for the protocol."},
+               "description": "TLS parameters for an https uri: {min_version?, max_version? ('1.0', '1.1', '1.2' or '1.3'), cipher_suites? (array of strings), ecdh_curves? (array of strings), session_resumption? (boolean; false disables session resumption)}. The engine still sets the ALPN and the SNI for the protocol. With h3, max_version must be 1.3 or unset (QUIC is TLS 1.3 only). cipher_suites shape TLS 1.2 and below only: BoringSSL ignores them for TLS 1.3, so a 1.3 row is not changed by them."},
        "worker_series": {"type": "boolean",
                          "description": "Record the per-worker series: every snapshot then carries each worker's own counters and latency statistics, readable as nighthawk://workers and in the final output (default false)."}},
      "required": ["uri"],
@@ -451,8 +451,11 @@ StartRunProtocolOf(absl::string_view value) {
 // N3b: the request method argument onto the engine's RequestMethod (the
 // CLI's --request-method list). Unknown values map to nullopt.
 std::optional<envoy::config::core::v3::RequestMethod> StartRunMethodOf(absl::string_view value) {
-  static constexpr std::array<absl::string_view, 9> kMethods = {
-      "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"};
+  // NH1 review S5: no CONNECT (a tunnel request, which Envoy's codec turns
+  // into a local reset or a protocol error against an origin) and no TRACE.
+  // The CLI keeps both.
+  static constexpr std::array<absl::string_view, 7> kMethods = {"GET",    "HEAD",    "POST", "PUT",
+                                                                "DELETE", "OPTIONS", "PATCH"};
   if (std::find(kMethods.begin(), kMethods.end(), value) == kMethods.end()) {
     return std::nullopt;
   }
@@ -592,10 +595,10 @@ absl::StatusOr<nighthawk::client::RequestOptions> ParseStartRunMixEntry(const Va
     const std::optional<envoy::config::core::v3::RequestMethod> mapped =
         StartRunMethodOf(raw_method->string_value());
     if (!mapped.has_value()) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH "
-          "(got '",
-          absl::CHexEscape(raw_method->string_value()), "')"));
+      return absl::InvalidArgumentError(
+          absl::StrCat("method must be one of GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH "
+                       "(got '",
+                       absl::CHexEscape(raw_method->string_value()), "')"));
     }
     method = *mapped;
   }
@@ -656,10 +659,10 @@ absl::Status ApplyStartRunShape(const Struct& arguments, const std::string& uri,
     const std::optional<envoy::config::core::v3::RequestMethod> mapped =
         StartRunMethodOf(method_arg->string_value());
     if (!mapped.has_value()) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH "
-          "(got '",
-          absl::CHexEscape(method_arg->string_value()), "')"));
+      return absl::InvalidArgumentError(
+          absl::StrCat("method must be one of GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH "
+                       "(got '",
+                       absl::CHexEscape(method_arg->string_value()), "')"));
     }
     method = *mapped;
     dialog.set_request_method(method);
@@ -800,6 +803,15 @@ absl::Status ApplyStartRunShape(const Struct& arguments, const std::string& uri,
         params->tls_maximum_protocol_version() != 0 &&
         params->tls_minimum_protocol_version() > params->tls_maximum_protocol_version()) {
       return absl::InvalidArgumentError("tls.min_version must not be above tls.max_version");
+    }
+    // NH1 review S3: QUIC runs over TLS 1.3 only.
+    if (dialog.protocol().has_value() && *dialog.protocol() == Protocol::HTTP3 &&
+        params->tls_maximum_protocol_version() != 0 &&
+        params->tls_maximum_protocol_version() <
+            envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3) {
+      return absl::InvalidArgumentError(
+          "protocol h3 needs TLS 1.3 (QUIC runs over TLS 1.3 only): tls.max_version must be 1.3 "
+          "or unset");
     }
     dialog.set_tls_context(std::move(context));
   }

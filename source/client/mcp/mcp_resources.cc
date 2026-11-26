@@ -57,8 +57,14 @@ constexpr char kWorkersResourceDescription[] =
     "The per-worker series (start_run worker_series: true; empty "
     "otherwise): one entry per client worker, each point "
     "{monotonic_ns, wall_time_unix_ns, phase_id, epoch_id, requests, "
-    "http_2xx, connections_opened, connections_closed, latency {count, "
-    "p50_ns, p90_ns, p99_ns}, requests_per_second, http_2xx_per_second}. "
+    "http_2xx, connections_opened, connections_closed, pool_overflow, "
+    "pending_overflow, latency {count, p50_ns, p90_ns, p99_ns}, "
+    "requests_per_second, http_2xx_per_second, pool_overflow_per_second, "
+    "pending_overflow_per_second}. pool_overflow (benchmark.pool_overflow) "
+    "and pending_overflow (upstream_rq_pending_overflow) are requests the "
+    "worker's pool refused: dropped, not sent. A worker that falls short of "
+    "its share with non-zero overflow lost requests at its pool, not at its "
+    "pacer; a priced row requires zero on every worker. "
     "Counters are the worker's own and cumulative from run start; the "
     "per-second rates are against the worker's previous point (absent on "
     "its first); the latency summary is request_to_response over the "
@@ -305,6 +311,10 @@ RenderWorkersPayload(const std::string& session_path,
       SetString(rendered, "epoch_id", point->epoch_id());
       const uint64_t requests = counter(*point, "upstream_rq_total");
       const uint64_t http_2xx = counter(*point, "benchmark.http_2xx");
+      const uint64_t pool_overflow = counter(*point, "benchmark.pool_overflow");
+      const uint64_t pending_overflow = counter(*point, "upstream_rq_pending_overflow");
+      SetInt(rendered, "pool_overflow", static_cast<int64_t>(pool_overflow));
+      SetInt(rendered, "pending_overflow", static_cast<int64_t>(pending_overflow));
       SetInt(rendered, "requests", static_cast<int64_t>(requests));
       SetInt(rendered, "http_2xx", static_cast<int64_t>(http_2xx));
       SetInt(rendered, "connections_opened",
@@ -325,15 +335,19 @@ RenderWorkersPayload(const std::string& session_path,
       if (previous != nullptr && point->monotonic_ns() > previous->monotonic_ns()) {
         const double seconds =
             static_cast<double>(point->monotonic_ns() - previous->monotonic_ns()) / 1e9;
-        const uint64_t prior_requests = counter(*previous, "upstream_rq_total");
-        const uint64_t prior_2xx = counter(*previous, "benchmark.http_2xx");
+        // Counters are cumulative and never decrease; a lower value is
+        // rendered as a zero rate rather than wrapped.
+        const auto rate = [seconds](uint64_t now, uint64_t before) {
+          return now >= before ? static_cast<double>(now - before) / seconds : 0.0;
+        };
         SetDouble(rendered, "requests_per_second",
-                  requests >= prior_requests
-                      ? static_cast<double>(requests - prior_requests) / seconds
-                      : 0.0);
+                  rate(requests, counter(*previous, "upstream_rq_total")));
         SetDouble(rendered, "http_2xx_per_second",
-                  http_2xx >= prior_2xx ? static_cast<double>(http_2xx - prior_2xx) / seconds
-                                        : 0.0);
+                  rate(http_2xx, counter(*previous, "benchmark.http_2xx")));
+        SetDouble(rendered, "pool_overflow_per_second",
+                  rate(pool_overflow, counter(*previous, "benchmark.pool_overflow")));
+        SetDouble(rendered, "pending_overflow_per_second",
+                  rate(pending_overflow, counter(*previous, "upstream_rq_pending_overflow")));
       }
       *point_list.mutable_list_value()->add_values() = ToValue(rendered);
       previous = point;

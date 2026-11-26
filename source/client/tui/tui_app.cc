@@ -1498,7 +1498,8 @@ namespace {
 // — this binding is exercised manually (Task 8).
 int runInteractive(const std::string& address, const std::string& session_prefix,
                    const std::optional<ProfilePipelineConfig>& profiling) {
-  auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+  // NH1 review M1: no 4 MB receive cap on the final Output.
+  auto channel = MakeServiceChannel(address);
   RunController controller(channel, session_prefix);
   if (profiling.has_value()) {
     controller.ConfigureProfiling(*profiling);

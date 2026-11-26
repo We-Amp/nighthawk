@@ -131,11 +131,13 @@ struct LiveFanOutContext {
   std::function<absl::Status(Envoy::MonotonicTime)> bend_instant_admissible;
   std::function<uint32_t()> current_phase_index;
   std::function<uint32_t()> active_worker_count;
-  // FORK-ONLY (We-Amp) NH1: the current phase's worker_weights; empty (or an
-  // unset function) means the even split. A weighted phase splits every
-  // live rps and ramp target by these weights, and refuses a value that
-  // does not split into whole per-worker rates.
-  std::function<std::vector<uint32_t>()> current_phase_worker_weights;
+  // FORK-ONLY (We-Amp) NH1: the worker_weights of the given phase (the
+  // fan-out passes the phase index it already read, so the weights and the
+  // tracked phase cannot come from two different phases); empty (or an unset
+  // function) means the even split. A weighted phase splits every live rps
+  // and ramp target by these weights, and refuses a value that does not
+  // split into whole per-worker rates.
+  std::function<std::vector<uint32_t>(uint32_t phase_index)> current_phase_worker_weights;
   std::function<absl::StatusOr<LiveCapabilityEntry>(int worker_id, uint32_t phase_index)>
       capability_for_phase;
   // The current phase's declared schedule (the per-phase rps inheritance
@@ -450,9 +452,9 @@ private:
   absl::Status bendInstantAdmissibleForUpdate(Envoy::MonotonicTime t_bend) const;
   uint32_t currentPhaseIndexForUpdate() const;
   uint32_t activeWorkerCountForUpdate() const;
-  // FORK-ONLY (We-Amp) NH1: the current phase's worker_weights (empty for an
-  // evenly split phase and for legacy runs).
-  std::vector<uint32_t> currentPhaseWorkerWeightsForUpdate() const;
+  // FORK-ONLY (We-Amp) NH1: phase `phase_index`'s worker_weights (empty for an
+  // evenly split phase, an out-of-range index and legacy runs).
+  std::vector<uint32_t> phaseWorkerWeightsForUpdate(uint32_t phase_index) const;
   LiveKnobDelta currentPhaseScheduleDelta() const;
   bool fanOutBegin();
   void fanOutEnd();

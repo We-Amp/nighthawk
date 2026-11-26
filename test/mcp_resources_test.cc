@@ -828,11 +828,14 @@ nighthawk::client::KnobEpochRecord AppliedEpochOf(const std::string& epoch_id,
 // the per-second rates come from the worker's previous point (none on its
 // first); the latency summary is the request_to_response statistic.
 TEST(McpResourcesTest, WorkersPayloadRendersPerWorkerRates) {
-  const auto point = [](uint32_t worker, int64_t monotonic_ns, uint64_t requests,
-                        uint64_t http_2xx) {
+  const auto point = [](uint32_t worker, int64_t monotonic_ns, uint64_t requests, uint64_t http_2xx,
+                        uint64_t pool_overflow = 0, const char* phase_id = "skew") {
     nighthawk::client::WorkerLiveSnapshot p;
     p.set_worker_id(worker);
-    p.set_phase_id("skew");
+    p.set_phase_id(phase_id);
+    if (pool_overflow > 0) {
+      (*p.mutable_counters())["benchmark.pool_overflow"] = pool_overflow;
+    }
     p.set_monotonic_ns(monotonic_ns);
     p.set_wall_time_unix_ns(monotonic_ns + 5);
     (*p.mutable_counters())["upstream_rq_total"] = requests;
@@ -846,13 +849,16 @@ TEST(McpResourcesTest, WorkersPayloadRendersPerWorkerRates) {
     stat->set_p99_ns(3000);
     return p;
   };
-  std::vector<nighthawk::client::MetricSeriesRecord> records(3);
+  std::vector<nighthawk::client::MetricSeriesRecord> records(4);
   *records[0].add_workers() = point(1, 1'000'000'000, 20, 20);
   *records[0].add_workers() = point(0, 1'000'000'000, 60, 60);
-  *records[1].add_workers() = point(0, 2'000'000'000, 120, 119);
+  *records[1].add_workers() = point(0, 2'000'000'000, 120, 119, /*pool_overflow=*/10);
   *records[1].add_workers() = point(1, 1'000'000'000, 20, 20); // repeated: no new partial
-  *records[2].add_workers() = point(0, 2'500'000'000, 150, 150);
+  *records[2].add_workers() = point(0, 2'500'000'000, 150, 150, /*pool_overflow=*/15);
   *records[2].add_workers() = point(1, 3'000'000'000, 60, 60);
+  // A phase boundary inside the series: worker 0's next point is stamped with
+  // the next phase; its counters stay cumulative across the boundary.
+  *records[3].add_workers() = point(0, 3'500'000'000, 210, 210, /*pool_overflow=*/15, "measure");
   const Struct payload = RenderWorkersPayload("session.nhsession", records);
   const Value& workers = Field(payload, "workers");
   ASSERT_EQ(workers.list_value().values_size(), 2);
@@ -861,21 +867,35 @@ TEST(McpResourcesTest, WorkersPayloadRendersPerWorkerRates) {
   EXPECT_EQ(Field(w0, "worker_id").number_value(), 0);
   EXPECT_EQ(Field(w1, "worker_id").number_value(), 1);
   const Value& p0 = Field(w0, "points");
-  ASSERT_EQ(p0.list_value().values_size(), 3);
+  ASSERT_EQ(p0.list_value().values_size(), 4);
   const Struct& first = StructOf(p0.list_value().values(0));
   EXPECT_EQ(Field(first, "requests").number_value(), 60);
   EXPECT_EQ(first.fields().count("requests_per_second"), 0u) << "no rate on the first point";
   EXPECT_EQ(Text(Field(first, "phase_id")), "skew");
   EXPECT_EQ(Field(first, "connections_opened").number_value(), 2);
   EXPECT_EQ(Field(first, "connections_closed").number_value(), 0);
+  EXPECT_EQ(Field(first, "pool_overflow").number_value(), 0);
+  EXPECT_EQ(Field(first, "pending_overflow").number_value(), 0);
+  EXPECT_EQ(first.fields().count("pool_overflow_per_second"), 0u);
   const Struct& second = StructOf(p0.list_value().values(1));
   EXPECT_EQ(Field(second, "requests_per_second").number_value(), 60);
   EXPECT_EQ(Field(second, "http_2xx_per_second").number_value(), 59);
+  // Overflow per worker: cumulative, and as a rate against the previous point.
+  EXPECT_EQ(Field(second, "pool_overflow").number_value(), 10);
+  EXPECT_EQ(Field(second, "pool_overflow_per_second").number_value(), 10);
+  EXPECT_EQ(Field(second, "pending_overflow_per_second").number_value(), 0);
   const Struct& latency = StructOf(Field(second, "latency"));
   EXPECT_EQ(Field(latency, "count").number_value(), 119);
   EXPECT_EQ(Field(latency, "p99_ns").number_value(), 3000);
   const Struct& third = StructOf(p0.list_value().values(2));
   EXPECT_EQ(Field(third, "requests_per_second").number_value(), 60); // 30 over 0.5 s
+  EXPECT_EQ(Field(third, "pool_overflow_per_second").number_value(), 10); // 5 over 0.5 s
+  // Across the phase boundary: the new phase id, and the rate is still against
+  // the previous point (60 requests over 1 s), not reset.
+  const Struct& fourth = StructOf(p0.list_value().values(3));
+  EXPECT_EQ(Text(Field(fourth, "phase_id")), "measure");
+  EXPECT_EQ(Field(fourth, "requests_per_second").number_value(), 60);
+  EXPECT_EQ(Field(fourth, "pool_overflow_per_second").number_value(), 0);
   // Worker 1's repeated point renders once; its rate spans 2 s.
   const Value& p1 = Field(w1, "points");
   ASSERT_EQ(p1.list_value().values_size(), 2);

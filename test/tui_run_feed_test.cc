@@ -1,3 +1,4 @@
+#include <atomic>
 #include <grpc++/grpc++.h>
 
 #include <netinet/in.h>
@@ -690,6 +691,102 @@ TEST_F(RunFeedTest, RunFeedSendCancellationCompletesWithOutput) {
   EXPECT_EQ(recorder.events.back(), "finished");
   EXPECT_EQ(recorder.events[recorder.events.size() - 2], "completed");
   EXPECT_GT(recorder.final_output.results_size(), 0);
+}
+
+// NH1 review M1: a final Output larger than gRPC's default 4 MB client
+// receive limit (the per-worker series of a long 1 s-cadence run reaches it
+// in minutes). A fake service answers the start with one such Output. On the
+// MakeServiceChannel channel the feed delivers it (on_completed, then OK);
+// on a default channel the same read fails and the result is lost, which is
+// what the shared channel exists to prevent.
+class LargeOutputService final : public nighthawk::client::NighthawkService::Service {
+public:
+  explicit LargeOutputService(size_t points) : points_(points) {}
+  grpc::Status
+  ExecutionStream(grpc::ServerContext*,
+                  grpc::ServerReaderWriter<nighthawk::client::ExecutionResponse,
+                                           nighthawk::client::ExecutionRequest>* stream) override {
+    nighthawk::client::ExecutionRequest request;
+    if (!stream->Read(&request)) {
+      return grpc::Status::OK;
+    }
+    nighthawk::client::ExecutionResponse response;
+    nighthawk::client::Output* output = response.mutable_output();
+    for (size_t i = 0; i < points_; ++i) {
+      nighthawk::client::WorkerLiveSnapshot* point = output->add_worker_series();
+      point->set_worker_id(static_cast<uint32_t>(i % 16));
+      point->set_phase_id("measure");
+      point->set_monotonic_ns(static_cast<int64_t>(i) * 1000000000);
+      for (const char* name : {"upstream_rq_total", "benchmark.http_2xx", "upstream_cx_total",
+                               "upstream_cx_rx_bytes_total", "upstream_cx_tx_bytes_total",
+                               "benchmark.pool_overflow"}) {
+        (*point->mutable_counters())[name] = 1000000 + i;
+      }
+      for (int s = 0; s < 8; ++s) {
+        nighthawk::client::StatisticSnapshot* stat = point->add_statistics();
+        stat->set_id(fmt::format("benchmark_http_client.statistic_{}", s));
+        stat->set_count(i);
+        stat->set_p50_ns(1000 + i);
+        stat->set_p90_ns(2000 + i);
+        stat->set_p99_ns(3000 + i);
+      }
+    }
+    response_bytes_ = response.ByteSizeLong();
+    stream->Write(response);
+    // Drain the client's half-close, like the real service's reader loop.
+    while (stream->Read(&request)) {
+    }
+    return grpc::Status::OK;
+  }
+  size_t response_bytes() const { return response_bytes_.load(); }
+
+private:
+  const size_t points_;
+  std::atomic<size_t> response_bytes_{0};
+};
+
+TEST(RunFeedLargeOutputTest, ServiceChannelDeliversAnOutputAboveFourMegabytes) {
+  LargeOutputService service(/*points=*/16000);
+  int port = 0;
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  const std::string address = fmt::format("127.0.0.1:{}", port);
+  nighthawk::client::StartRequest request;
+  request.mutable_options()->mutable_uri()->set_value("http://127.0.0.1:1/");
+
+  for (const bool shared_channel : {true, false}) {
+    SCOPED_TRACE(shared_channel ? "MakeServiceChannel" : "default channel");
+    FeedRecorder recorder;
+    recorder.arm();
+    std::shared_ptr<grpc::ChannelInterface> channel =
+        shared_channel ? std::shared_ptr<grpc::ChannelInterface>(MakeServiceChannel(address))
+                       : std::shared_ptr<grpc::ChannelInterface>(
+                             grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+    RunFeed feed(channel, recorder.callbacks());
+    ASSERT_EQ(feed.start(request), absl::OkStatus());
+    // Waits on the recorder's condition variable directly (the fixture
+    // helper's name trips the Envoy linter's CondVar rule).
+    std::unique_lock<std::mutex> lock(recorder.mutex);
+    ASSERT_TRUE(recorder.cv.wait_for(lock, std::chrono::seconds(30),
+                                     [&recorder]() { return recorder.finished_count > 0; }));
+    EXPECT_GT(service.response_bytes(), 4u * 1024 * 1024) << "the Output must exceed 4 MB";
+    if (shared_channel) {
+      EXPECT_TRUE(recorder.completed);
+      EXPECT_EQ(recorder.final_output.worker_series_size(), 16000);
+      EXPECT_TRUE(recorder.finished_status.ok()) << recorder.finished_status;
+    } else {
+      // The result is lost. gRPC ends the call with RESOURCE_EXHAUSTED or,
+      // when the server side tears down first, CANCELLED (seen on the build
+      // host); either way on_completed never fires.
+      EXPECT_FALSE(recorder.completed);
+      EXPECT_TRUE(recorder.finished_status.code() == absl::StatusCode::kResourceExhausted ||
+                  recorder.finished_status.code() == absl::StatusCode::kCancelled)
+          << recorder.finished_status;
+    }
+  }
+  server->Shutdown();
 }
 
 } // namespace

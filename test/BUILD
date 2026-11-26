@@ -668,6 +668,7 @@ envoy_cc_test(
     name = "phase_run_test",
     srcs = ["phase_run_test.cc"],
     deps = [
+        "//api/request_source:request_source_plugin_cc_proto",
         "//source/client:nighthawk_client_lib",
         "//source/client:phase_orchestrator_lib",
         "//test/test_common:environment_lib",

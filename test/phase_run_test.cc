@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <limits>
@@ -29,6 +30,7 @@
 #include "absl/strings/str_cat.h"
 
 #include "api/client/options.pb.h"
+#include "api/request_source/request_source_plugin.pb.h"
 
 #include "source/client/client_worker_impl.h"
 #include "source/client/options_impl.h"
@@ -118,6 +120,12 @@ public:
     return accepts_;
   }
 
+  // FORK-ONLY (We-Amp) NH1: SUT-side request counts per request target.
+  std::map<std::string, int> pathHits() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return path_hits_;
+  }
+
   // SUT-side request spans (start, end wall ns), for per-phase concurrency
   // and completion-count observations.
   std::vector<RequestSpan> requestSpans() const {
@@ -147,6 +155,16 @@ private:
     while (true) {
       size_t request_end;
       while ((request_end = buffer.find("\r\n\r\n")) != std::string::npos) {
+        // FORK-ONLY (We-Amp) NH1: record the request target (the request
+        // line's second token) for the per-path request mix test.
+        const size_t first_space = buffer.find(' ');
+        const size_t second_space = first_space == std::string::npos
+                                        ? std::string::npos
+                                        : buffer.find(' ', first_space + 1);
+        if (second_space != std::string::npos && second_space < request_end) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          path_hits_[buffer.substr(first_space + 1, second_space - first_space - 1)]++;
+        }
         buffer.erase(0, request_end + 4);
         const int64_t start_ns = wallNowNs();
         const int64_t delay_ns = request_delay_ns_.load();
@@ -195,6 +213,7 @@ private:
   mutable std::mutex mutex_;
   std::vector<int64_t> accepts_;
   std::vector<RequestSpan> spans_;
+  std::map<std::string, int> path_hits_;
 };
 
 // Two 2s phases on one worker: a warm phase at rps 50, then a phase at rps
@@ -2062,6 +2081,44 @@ TEST_F(PhaseRunTest, CancelBeforeWorkersExistEndsCleanly) {
     }
     process->shutdown();
   }
+}
+
+// NH1 review S7: a request mix (the shape MCP start_run's request_mix
+// builds: the in-line options-list source, num_requests 0) reaches the SUT
+// with each entry's :path, cycled round-robin per worker. Entries /a, /a, /b
+// on one worker give a 2:1 split of the requests by path, and the URI's own
+// path is never sent.
+TEST_F(PhaseRunTest, RequestMixSendsEachEntryPath) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(listener().uri() + "not-sent");
+  cmd.mutable_connections()->set_value(2);
+  cmd.mutable_timeout()->set_seconds(5);
+  nighthawk::request_source::InLineOptionsListRequestSourceConfig config;
+  for (const char* path : {"/a", "/a", "/b"}) {
+    nighthawk::client::RequestOptions* entry = config.mutable_options_list()->add_options();
+    entry->set_request_method(envoy::config::core::v3::GET);
+    auto* header = entry->add_request_headers()->mutable_header();
+    header->set_key(":path");
+    header->set_value(path);
+  }
+  auto* plugin = cmd.mutable_request_source_plugin_config();
+  plugin->set_name("nighthawk.in-line-options-list-request-source-plugin");
+  ASSERT_TRUE(plugin->mutable_typed_config()->PackFrom(config));
+  nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+  phase->set_name("mix");
+  phase->mutable_duration()->set_seconds(2);
+  phase->set_requests_per_second(60);
+  phase->mutable_concurrency()->set_value("1");
+  RunOutcome outcome = runPhases(cmd);
+  ASSERT_TRUE(outcome.success);
+  const std::map<std::string, int> hits = listener().pathHits();
+  const int a = hits.count("/a") ? hits.at("/a") : 0;
+  const int b = hits.count("/b") ? hits.at("/b") : 0;
+  EXPECT_GT(a + b, 60) << "the mix run served too few requests";
+  EXPECT_EQ(hits.size(), 2u) << "only the mix paths may reach the SUT";
+  EXPECT_EQ(hits.count("/not-sent"), 0u);
+  // Round-robin over /a, /a, /b: |a - 2b| <= 2 whatever the total.
+  EXPECT_LE(std::abs(a - 2 * b), 2) << "a=" << a << " b=" << b;
 }
 
 } // namespace

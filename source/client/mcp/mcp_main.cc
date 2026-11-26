@@ -21,6 +21,7 @@
 #include "source/client/mcp/mcp_resources.h"
 #include "source/client/mcp/mcp_server.h"
 #include "source/client/mcp/mcp_tools.h"
+#include "source/client/tui/run_feed.h"
 
 namespace Nighthawk {
 namespace Client {
@@ -170,7 +171,8 @@ absl::Status ValidateStartupFlags(const McpServerFlags& flags) {
 
 int RunMcpServer(const McpServerFlags& flags, std::istream& in, std::ostream& out,
                  std::ostream& err) {
-  const auto channel = grpc::CreateChannel(flags.service_address, grpc::InsecureChannelCredentials());
+  // NH1 review M1: no 4 MB receive cap on the final Output.
+  const auto channel = Tui::MakeServiceChannel(flags.service_address);
   SteeringToolOptions steering;
   steering.max_rps = flags.max_rps;
   steering.timeout_s = flags.timeout_s;

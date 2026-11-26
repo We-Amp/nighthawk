@@ -1028,13 +1028,13 @@ TEST(McpToolsTest, MethodRoundTripsAndRefusesUnknownValues) {
     EXPECT_EQ(received.options().request_options().request_method(), expected) << argument;
   }
   auto harness = MakeHarness();
-  for (const std::string& value : {"post", "FETCH", ""}) {
+  // Review S5: CONNECT and TRACE are not offered on this surface.
+  for (const std::string& value : {"post", "FETCH", "", "CONNECT", "TRACE"}) {
     EXPECT_EQ(
         StartRunRefusal(*harness, absl::StrCat(R"json({"uri": "http://127.0.0.1:80/", "rps": 10,
                                                   "duration_s": 5, "method": ")json",
                                                value, R"json("})json")),
-        absl::StrCat("method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, "
-                     "TRACE, PATCH (got '",
+        absl::StrCat("method must be one of GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH (got '",
                      value, "')"));
   }
 }
@@ -1152,8 +1152,11 @@ TEST(McpToolsTest, RequestMixRefusals) {
        "request_mix[0]: path must be a string starting with '/', without spaces or CR/LF/NUL "
        "(got 'x y')"},
       {R"json("request_mix": [{"method": "FETCH"}]})json",
-       "request_mix[0]: method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, "
-       "TRACE, PATCH (got 'FETCH')"},
+       "request_mix[0]: method must be one of GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH (got "
+       "'FETCH')"},
+      {R"json("request_mix": [{"method": "CONNECT"}]})json",
+       "request_mix[0]: method must be one of GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH (got "
+       "'CONNECT')"},
       {R"json("request_mix": [{"headers": [{"name": "a:b", "value": "c"}]}]})json",
        "request_mix[0]: header name must be a non-empty token without ':', spaces, or CR/LF/NUL "
        "(header injection refused): 'a:b'"},
@@ -1230,7 +1233,25 @@ TEST(McpToolsTest, TlsRefusals) {
   for (const auto& [arguments, message] : cases) {
     EXPECT_EQ(StartRunRefusal(*harness, https + arguments), message) << arguments;
   }
+  // Review S3: QUIC is TLS 1.3 only, so h3 refuses a lower max_version.
+  const std::string h3 = https + R"json("protocol": "h3",
+      "headers": [{"name": "Host", "value": "www.lyft.com"}], )json";
+  EXPECT_EQ(StartRunRefusal(*harness, h3 + R"json("tls": {"max_version": "1.2"}})json"),
+            "protocol h3 needs TLS 1.3 (QUIC runs over TLS 1.3 only): tls.max_version must be 1.3 "
+            "or unset");
   EXPECT_TRUE(harness->service->startRequests().empty());
+  // h3 with max_version 1.3 (or only a min_version) is accepted.
+  auto accepting = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received = StartAndCapture(
+      *accepting, "https",
+      R"json(, "protocol": "h3", "headers": [{"name": "Host", "value": "www.lyft.com"}],
+             "tls": {"min_version": "1.3", "max_version": "1.3"})json");
+  EXPECT_EQ(received.options()
+                .tls_context()
+                .common_tls_context()
+                .tls_params()
+                .tls_maximum_protocol_version(),
+            envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3);
 }
 
 // NH1: the phases string carries per-worker weights as a sixth part, with

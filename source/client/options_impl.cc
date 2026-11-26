@@ -1151,6 +1151,20 @@ std::vector<nighthawk::client::PhaseSpec> OptionsImpl::parsePhasesJson(const std
 }
 
 void OptionsImpl::validate() const {
+  // FORK-ONLY (We-Amp) NH1 review S6: the per-worker series costs one
+  // percentile extraction per worker per point, so its cadence (the stats
+  // flush interval) is bounded at 1 s or more, like the live stream's.
+  if (worker_series_) {
+    const bool duration_set =
+        stats_flush_interval_duration_.seconds() > 0 || stats_flush_interval_duration_.nanos() > 0;
+    const bool below_one_second =
+        duration_set ? stats_flush_interval_duration_.seconds() < 1 : stats_flush_interval_ < 1;
+    if (below_one_second) {
+      throw MalformedArgvException(
+          "--worker-series needs a stats flush interval of at least 1s (each point costs a "
+          "percentile extraction per worker)");
+    }
+  }
   if (!request_body_.empty() && request_body_size_ > 0) {
     throw MalformedArgvException(
         "--request-body-file and --request-body-size are mutually exclusive");

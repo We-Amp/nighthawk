@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "absl/status/status.h"
@@ -20,6 +21,16 @@ namespace Tui {
 // display arrives here first: live snapshots while the run is in flight, the
 // final output on natural completion, and a single terminal status. It is a
 // library surface, not a process: the TUI and any future consumer sit on it.
+
+// FORK-ONLY (We-Amp) NH1 review M1: the channel every service consumer (the
+// TUI, the MCP server) talks to nighthawk_service over. The final
+// ExecutionResponse carries the whole Output: per-phase histograms and, with
+// worker_series, every per-worker point. That passes gRPC's default 4 MB
+// client receive limit within minutes at 1 s points, and past it the final
+// read fails with RESOURCE_EXHAUSTED and the run's result is lost. The
+// channel therefore lifts the receive limit (the service is local and
+// trusted; the send side has no default limit).
+std::shared_ptr<grpc::Channel> MakeServiceChannel(const std::string& address);
 
 // Callbacks fired by RunFeed. All fire ONLY on the feed's single dedicated
 // read thread, in delivery order; consumers that hand work to other threads
