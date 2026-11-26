@@ -953,6 +953,68 @@ TEST_F(PhaseRunTest, ConnectionsCarryOverWarmToMeasureBoundary) {
   EXPECT_GT(served_in_measure, 60) << "expected about 2 s x 60 rps in the measure phase";
 }
 
+// Review S5: a worker retired at one boundary and re-activated at the next
+// keeps its pool (goIdle performs no connection operations): with
+// concurrency [2, 1, 2], worker 1 sits out the middle phase and rejoins on the
+// connections it opened in phase 0. The SUT accepts exactly 2 x 4
+// connections, all in phase 0, and the client records no close.
+TEST_F(PhaseRunTest, ConnectionsSurviveRetireAndRejoin) {
+  constexpr uint32_t kConnections = 4;
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(listener().uri());
+  cmd.mutable_connections()->set_value(kConnections);
+  cmd.mutable_timeout()->set_seconds(5);
+  cmd.mutable_prefetch_connections()->set_value(true);
+  const std::vector<uint32_t> concurrencies{2, 1, 2};
+  for (uint32_t i = 0; i < concurrencies.size(); ++i) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(fmt::format("phase{}", i));
+    phase->mutable_duration()->set_seconds(2);
+    phase->set_requests_per_second(60);
+    phase->mutable_concurrency()->set_value(fmt::format("{}", concurrencies[i]));
+  }
+  RunOutcome outcome = runPhases(cmd);
+  ASSERT_TRUE(outcome.success);
+  // Events: (start, drain-complete) per phase; events[2] is phase 1's start.
+  ASSERT_GE(outcome.events.size(), 5u);
+  ASSERT_EQ(2u, outcome.boundary_timings.size());
+  EXPECT_FALSE(outcome.boundary_timings[0].drain_censored);
+  EXPECT_FALSE(outcome.boundary_timings[1].drain_censored);
+  const int64_t phase1_start_ns = outcome.events[2].wall_time_unix_ns;
+  const int64_t phase2_start_ns = outcome.events[4].wall_time_unix_ns;
+
+  int accepts_in_phase0 = 0;
+  int accepts_later = 0;
+  for (const int64_t accept_ns : listener().acceptTimestamps()) {
+    if (accept_ns < phase1_start_ns) {
+      accepts_in_phase0++;
+    } else {
+      accepts_later++;
+    }
+  }
+  EXPECT_EQ(static_cast<int>(2 * kConnections), accepts_in_phase0)
+      << "prefetch opens connections x 2 workers in phase 0";
+  EXPECT_EQ(0, accepts_later) << "a retired-and-rejoined worker reopened connections";
+
+  // The rejoin is a worker-count change but not a cold start.
+  ASSERT_EQ(3u, outcome.phase_worker_subsets.size());
+  EXPECT_FALSE(outcome.phase_worker_subsets[2].new_workers_cold_started);
+
+  const nighthawk::client::Result* global = findResult(outcome.output, "global");
+  ASSERT_NE(global, nullptr);
+  EXPECT_EQ(2 * kConnections, counterValue(*global, "upstream_cx_total"));
+  EXPECT_EQ(0u, counterValue(*global, "upstream_cx_destroy"))
+      << "a connection closed during the run";
+
+  // Both workers served the last phase (the rejoined one included).
+  const std::vector<RequestSpan> spans = listener().requestSpans();
+  const int64_t served_in_phase2 =
+      std::count_if(spans.begin(), spans.end(), [phase2_start_ns](const RequestSpan& span) {
+        return span.start_ns >= phase2_start_ns;
+      });
+  EXPECT_GT(served_in_phase2, 60) << "expected about 2 s x 60 rps in the last phase";
+}
+
 // Three phases declaring concurrency [2, 4, 2]: four workers are bootstrapped
 // (the max over phases), phase traffic comes from exactly the declared subset
 // per phase, and the workers that sit out the last phase keep their
