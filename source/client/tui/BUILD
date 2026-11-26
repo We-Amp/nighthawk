@@ -58,7 +58,11 @@ envoy_cc_library(
         # The pure phase-vector validation the dialog reuses (proto+absl deps
         # only — quarantine-clean; the cquery guard proves it).
         "//source/client:options_validation_phases_lib",
+        # N3b: the in-line options-list config the request mix is packed in
+        # (a proto library only).
+        "//api/request_source:request_source_plugin_cc_proto",
         "@com_google_absl//absl/strings",
+        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
     ],
 )
 

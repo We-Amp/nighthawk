@@ -260,6 +260,8 @@ public:
   // sealed prefix with the torn-tail honesty. Payloads are rendered by
   // mcp_resources' pure renderers (RenderSeriesPayload et al.).
   google::protobuf::Struct BuildSeries();
+  // FORK-ONLY (We-Amp) NH1: the nighthawk://workers payload.
+  google::protobuf::Struct BuildWorkers();
   google::protobuf::Struct BuildTimeline();
   google::protobuf::Struct BuildSession();
 

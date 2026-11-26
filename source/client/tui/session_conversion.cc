@@ -13,6 +13,9 @@ ToMetricSeries(const nighthawk::client::LiveSnapshot& snapshot) {
   record.set_epoch_id(snapshot.epoch_id());
   (*record.mutable_counters()) = snapshot.counters();
   *record.mutable_statistics() = snapshot.statistics();
+  // FORK-ONLY (We-Amp) NH1: the per-worker points (empty unless the run
+  // opted in to worker_series).
+  *record.mutable_workers() = snapshot.workers();
   return record;
 }
 

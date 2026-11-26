@@ -2,6 +2,8 @@
 
 #include "gtest/gtest.h"
 
+#include "api/request_source/request_source_plugin.pb.h"
+
 #include "source/client/tui/input_mode.h"
 #include "source/client/tui/start_run_dialog.h"
 
@@ -196,6 +198,89 @@ TEST(StartRunDialogTest, PhasesFieldMalformedEntrySurfacesInline) {
   const std::string error = StartRunDialogModel::FieldError(dialog, StartRunDialogModel::kPhases);
   EXPECT_NE(error.find("oops"), std::string::npos) << error;
   EXPECT_NE(error.find("name:rps:duration"), std::string::npos) << error;
+}
+
+// NH1: the phases field's sixth part carries per-worker weights, with the
+// connections part optionally empty before it; the reused validation then
+// checks the count and the whole-number split.
+TEST(StartRunDialogTest, PhasesFieldParsesWorkerWeights) {
+  auto parsed = StartRunDialogModel::ParsePhasesField("hot:800:20:4::5/1/1/1,cx:60:5:2:8:1/2");
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  ASSERT_EQ(parsed->size(), 2u);
+  EXPECT_FALSE((*parsed)[0].has_connections());
+  ASSERT_EQ((*parsed)[0].worker_weights_size(), 4);
+  EXPECT_EQ((*parsed)[0].worker_weights(0), 5u);
+  EXPECT_EQ((*parsed)[1].connections().value(), 8u);
+  ASSERT_EQ((*parsed)[1].worker_weights_size(), 2);
+  EXPECT_EQ((*parsed)[1].worker_weights(1), 2u);
+
+  for (const char* bad : {"hot:800:20:4::5/0/1/1", "hot:800:20:4::", "hot:800:20:4::a",
+                          "hot:800:20:4:x:1/1/1/1", "hot:800:20:4::1:1"}) {
+    EXPECT_FALSE(StartRunDialogModel::ParsePhasesField(bad).ok()) << bad;
+  }
+
+  StartRunDialogModel dialog = validDialog();
+  dialog.set_phases_field("hot:801:20:4::5/1/1/1");
+  EXPECT_FALSE(dialog.valid());
+  EXPECT_NE(StartRunDialogModel::FieldError(dialog, StartRunDialogModel::kPhases)
+                .find("does not split into whole per-worker rates"),
+            std::string::npos);
+  dialog.set_phases_field("hot:800:20:4::5/1/1/1");
+  EXPECT_TRUE(dialog.valid());
+}
+
+// N3b / NH1: the remaining request-shape setters land on their option
+// fields; unset, nothing is written.
+TEST(StartRunDialogTest, ShapeSettersBuildOptions) {
+  StartRunDialogModel dialog = validDialog();
+  dialog.set_burst_size(16);
+  dialog.set_open_loop(true);
+  dialog.set_sequencer_idle_strategy(nighthawk::client::SequencerIdleStrategy::POLL);
+  dialog.set_max_concurrent_streams(8);
+  dialog.set_request_method(envoy::config::core::v3::POST);
+  dialog.set_request_body_size(64);
+  envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls;
+  tls.mutable_max_session_keys()->set_value(0);
+  dialog.set_tls_context(tls);
+  dialog.set_worker_series(true);
+  const nighthawk::client::CommandLineOptions options = dialog.build_request().options();
+  EXPECT_EQ(options.burst_size().value(), 16u);
+  EXPECT_TRUE(options.open_loop().value());
+  EXPECT_EQ(options.sequencer_idle_strategy().value(),
+            nighthawk::client::SequencerIdleStrategy::POLL);
+  EXPECT_EQ(options.max_concurrent_streams().value(), 8u);
+  EXPECT_EQ(options.request_options().request_method(), envoy::config::core::v3::POST);
+  EXPECT_EQ(options.request_options().request_body_size().value(), 64u);
+  EXPECT_TRUE(options.tls_context().has_max_session_keys());
+  EXPECT_TRUE(options.worker_series().value());
+
+  const nighthawk::client::CommandLineOptions plain = validDialog().build_request().options();
+  EXPECT_FALSE(plain.has_burst_size());
+  EXPECT_FALSE(plain.has_open_loop());
+  EXPECT_FALSE(plain.has_sequencer_idle_strategy());
+  EXPECT_FALSE(plain.has_max_concurrent_streams());
+  EXPECT_FALSE(plain.has_tls_context());
+  EXPECT_FALSE(plain.has_worker_series());
+  EXPECT_FALSE(plain.has_request_options());
+}
+
+// N3b: a request mix replaces the static RequestOptions (a oneof): the built
+// request carries the in-line options-list plugin and no static headers.
+TEST(StartRunDialogTest, RequestMixReplacesStaticRequestOptions) {
+  StartRunDialogModel dialog = validDialog();
+  dialog.add_request_headers("x-static", "1");
+  nighthawk::client::RequestOptions entry;
+  entry.set_request_method(envoy::config::core::v3::PUT);
+  dialog.set_request_mix({entry, entry});
+  const nighthawk::client::CommandLineOptions options = dialog.build_request().options();
+  EXPECT_FALSE(options.has_request_options());
+  ASSERT_TRUE(options.has_request_source_plugin_config());
+  EXPECT_EQ(options.request_source_plugin_config().name(),
+            "nighthawk.in-line-options-list-request-source-plugin");
+  nighthawk::request_source::InLineOptionsListRequestSourceConfig config;
+  ASSERT_TRUE(options.request_source_plugin_config().typed_config().UnpackTo(&config));
+  ASSERT_EQ(config.options_list().options_size(), 2);
+  EXPECT_EQ(config.options_list().options(1).request_method(), envoy::config::core::v3::PUT);
 }
 
 } // namespace

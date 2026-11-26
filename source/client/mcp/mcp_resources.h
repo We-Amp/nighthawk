@@ -26,7 +26,7 @@
 namespace Nighthawk {
 namespace Client {
 
-// Registers the four telemetry resources on `registry`, bound to
+// Registers the five telemetry resources on `registry`, bound to
 // `controller`:
 //   - nighthawk://status   — the canonical status strip (the ONE builder is
 //     SteeringController::BuildStatus; get_status renders the same object).
@@ -40,6 +40,9 @@ namespace Client {
 //     post-run).
 //   - nighthawk://session  — the session file's sealed-prefix records with
 //     the torn-tail honesty (tail_skipped + the reader's reason).
+//   - nighthawk://workers  — NH1: the per-worker series (each worker's own
+//     counters, rates and latency summary per point), when the run opted
+//     in with worker_series.
 // Resource descriptions are specified copy, like the tools'.
 void RegisterTelemetryResources(ResourceRegistry& registry, SteeringController& controller);
 
@@ -53,6 +56,21 @@ void RegisterTelemetryResources(ResourceRegistry& registry, SteeringController& 
 google::protobuf::Struct RenderSeriesPayload(
     const std::string& session_path,
     const std::vector<nighthawk::client::MetricSeriesRecord>& records);
+
+// FORK-ONLY (We-Amp) NH1: the nighthawk://workers payload, the per-worker
+// series. `records` are the run's metric-series records in snapshot order;
+// each record's `workers` carries every reporting worker's latest point
+// (present only when the run opted in with worker_series). One entry per
+// worker id, its points in time order, a point repeated across snapshots
+// (no new partial in between) rendered once. Every point carries the
+// worker's own clock pair, phase and epoch, the cumulative requests, 2xx,
+// connections opened and closed, the request_to_response latency summary
+// of its current phase, and the per-interval rates against the worker's
+// previous point (requests_per_second, http_2xx_per_second; absent on a
+// worker's first point).
+google::protobuf::Struct
+RenderWorkersPayload(const std::string& session_path,
+                     const std::vector<nighthawk::client::MetricSeriesRecord>& records);
 
 // The nighthawk://timeline payload. The segment source selection is the
 // TUI's (BuildPhaseTimeline): post-run metadata when present, else the

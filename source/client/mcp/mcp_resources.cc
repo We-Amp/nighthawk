@@ -1,6 +1,8 @@
 // FORK-ONLY (We-Amp): see mcp_resources.h.
 #include "source/client/mcp/mcp_resources.h"
 
+#include <map>
+
 #include "source/client/headless/series_view.h"
 #include "source/client/headless/timeline_segments.h"
 #include "source/client/mcp/json_util.h"
@@ -50,6 +52,19 @@ constexpr char kSeriesResourceDescription[] =
     "as values. Reads the live series the server holds; nighthawk://session "
     "reads the persisted file, whose sealed prefix may lag by the writer's "
     "buffered frames.";
+
+constexpr char kWorkersResourceDescription[] =
+    "The per-worker series (start_run worker_series: true; empty "
+    "otherwise): one entry per client worker, each point "
+    "{monotonic_ns, wall_time_unix_ns, phase_id, epoch_id, requests, "
+    "http_2xx, connections_opened, connections_closed, latency {count, "
+    "p50_ns, p90_ns, p99_ns}, requests_per_second, http_2xx_per_second}. "
+    "Counters are the worker's own and cumulative from run start; the "
+    "per-second rates are against the worker's previous point (absent on "
+    "its first); the latency summary is request_to_response over the "
+    "worker's current phase so far, not the last interval. Stamps are the "
+    "worker's own (the engine clock). Reads the live records the server "
+    "holds.";
 
 constexpr char kTimelineResourceDescription[] =
     "The phase timeline: one segment per phase with its duration, the "
@@ -248,6 +263,86 @@ google::protobuf::Struct RenderSeriesPayload(
   return out;
 }
 
+google::protobuf::Struct
+RenderWorkersPayload(const std::string& session_path,
+                     const std::vector<nighthawk::client::MetricSeriesRecord>& records) {
+  Struct out;
+  Struct provenance;
+  SetString(provenance, "session", session_path);
+  SetString(provenance, "source",
+            "the per-worker points the run's live snapshots carried (worker_series)");
+  (*out.mutable_fields())["provenance"] = ToValue(provenance);
+
+  // Per worker, the distinct points in time order.
+  std::map<uint32_t, std::vector<const nighthawk::client::WorkerLiveSnapshot*>> by_worker;
+  for (const nighthawk::client::MetricSeriesRecord& record : records) {
+    for (const nighthawk::client::WorkerLiveSnapshot& point : record.workers()) {
+      auto& points = by_worker[point.worker_id()];
+      if (!points.empty() && points.back()->monotonic_ns() >= point.monotonic_ns()) {
+        continue; // the same point again (no new partial since the last snapshot)
+      }
+      points.push_back(&point);
+    }
+  }
+  const auto counter = [](const nighthawk::client::WorkerLiveSnapshot& point,
+                          const char* name) -> uint64_t {
+    const auto it = point.counters().find(name);
+    return it == point.counters().end() ? 0 : it->second;
+  };
+  Value& worker_list = (*out.mutable_fields())["workers"];
+  worker_list.mutable_list_value(); // the empty-list discipline: [], never null
+  for (const auto& [worker_id, points] : by_worker) {
+    Struct worker;
+    SetInt(worker, "worker_id", worker_id);
+    Value& point_list = (*worker.mutable_fields())["points"];
+    point_list.mutable_list_value();
+    const nighthawk::client::WorkerLiveSnapshot* previous = nullptr;
+    for (const nighthawk::client::WorkerLiveSnapshot* point : points) {
+      Struct rendered;
+      SetInt(rendered, "monotonic_ns", point->monotonic_ns());
+      SetInt(rendered, "wall_time_unix_ns", point->wall_time_unix_ns());
+      SetString(rendered, "phase_id", point->phase_id());
+      SetString(rendered, "epoch_id", point->epoch_id());
+      const uint64_t requests = counter(*point, "upstream_rq_total");
+      const uint64_t http_2xx = counter(*point, "benchmark.http_2xx");
+      SetInt(rendered, "requests", static_cast<int64_t>(requests));
+      SetInt(rendered, "http_2xx", static_cast<int64_t>(http_2xx));
+      SetInt(rendered, "connections_opened",
+             static_cast<int64_t>(counter(*point, "upstream_cx_total")));
+      SetInt(rendered, "connections_closed",
+             static_cast<int64_t>(counter(*point, "upstream_cx_destroy")));
+      Struct latency;
+      SetInt(latency, "count", 0);
+      for (const nighthawk::client::StatisticSnapshot& stat : point->statistics()) {
+        if (stat.id() == "benchmark_http_client.request_to_response") {
+          SetInt(latency, "count", static_cast<int64_t>(stat.count()));
+          SetInt(latency, "p50_ns", static_cast<int64_t>(stat.p50_ns()));
+          SetInt(latency, "p90_ns", static_cast<int64_t>(stat.p90_ns()));
+          SetInt(latency, "p99_ns", static_cast<int64_t>(stat.p99_ns()));
+        }
+      }
+      (*rendered.mutable_fields())["latency"] = ToValue(latency);
+      if (previous != nullptr && point->monotonic_ns() > previous->monotonic_ns()) {
+        const double seconds =
+            static_cast<double>(point->monotonic_ns() - previous->monotonic_ns()) / 1e9;
+        const uint64_t prior_requests = counter(*previous, "upstream_rq_total");
+        const uint64_t prior_2xx = counter(*previous, "benchmark.http_2xx");
+        SetDouble(rendered, "requests_per_second",
+                  requests >= prior_requests
+                      ? static_cast<double>(requests - prior_requests) / seconds
+                      : 0.0);
+        SetDouble(rendered, "http_2xx_per_second",
+                  http_2xx >= prior_2xx ? static_cast<double>(http_2xx - prior_2xx) / seconds
+                                        : 0.0);
+      }
+      *point_list.mutable_list_value()->add_values() = ToValue(rendered);
+      previous = point;
+    }
+    *worker_list.mutable_list_value()->add_values() = ToValue(worker);
+  }
+  return out;
+}
+
 google::protobuf::Struct RenderTimelinePayload(
     const std::string& session_path, const nighthawk::client::CommandLineOptions& options,
     const std::vector<nighthawk::client::PhaseBoundaryEvent>& events,
@@ -356,6 +451,13 @@ void RegisterTelemetryResources(ResourceRegistry& registry, SteeringController& 
   timeline.reader = [&controller]() { return controller.BuildTimeline(); };
   registry.Register(std::move(timeline));
 
+  ResourceSpec workers;
+  workers.uri = "nighthawk://workers";
+  workers.name = "workers";
+  workers.description = kWorkersResourceDescription;
+  workers.mime_type = "application/json";
+  workers.reader = [&controller]() { return controller.BuildWorkers(); };
+
   ResourceSpec session;
   session.uri = "nighthawk://session";
   session.name = "session";
@@ -363,6 +465,8 @@ void RegisterTelemetryResources(ResourceRegistry& registry, SteeringController& 
   session.mime_type = "application/json";
   session.reader = [&controller]() { return controller.BuildSession(); };
   registry.Register(std::move(session));
+  // NH1: registered last, so the four earlier URIs keep their order.
+  registry.Register(std::move(workers));
 }
 
 } // namespace Client

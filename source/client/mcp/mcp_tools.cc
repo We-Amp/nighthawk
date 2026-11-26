@@ -25,6 +25,9 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
+#include "envoy/config/core/v3/base.pb.h"
+#include "envoy/extensions/transport_sockets/tls/v3/tls.pb.h"
+
 #include "api/client/service.pb.h"
 
 #include "source/client/headless/fold_tracker.h"
@@ -313,7 +316,7 @@ constexpr char kStartRunSchema[] = R"json(
        "rps": {"type": "integer",
                "description": "The declared global total requests per second. Checked against the load ceiling (--max-rps)."},
        "phases": {"type": "string",
-                  "description": "Phase run: comma-separated name:rps:duration[:concurrency[:connections]] entries (e.g. 'warm:100:5:2,spike:400:5:4:64'), replacing duration_s. Each phase rps is a declared global total under the ceiling."},
+                  "description": "Phase run: comma-separated name:rps:duration[:concurrency[:connections[:weights]]] entries (e.g. 'warm:100:5:2,spike:400:5:4:64'), replacing duration_s. Each phase rps is a declared global total under the ceiling. weights are '/'-separated per-worker rate weights, one per worker of the phase, with connections optionally empty before them ('hot:800:20:4::5/1/1/1'): worker i paces rps x w_i / sum(w), and every share must be a whole number or the run is refused."},
        "connections": {"type": "integer",
                        "description": "The connection count (HTTP/1)."},
        "max_requests_per_connection": {"type": "integer",
@@ -326,14 +329,32 @@ constexpr char kStartRunSchema[] = R"json(
                     "enum": ["h1", "h2", "h3"],
                     "description": "The protocol requests are encapsulated in: h1 (HTTP/1.1, the default), h2 (HTTP/2) or h3 (HTTP/3 over QUIC). h3 needs an https uri and a Host header (a headers entry naming the certificate hostname): the target is rewritten to its IP and QUIC cannot skip certificate verification."},
        "request_body_size": {"type": "integer",
-                             "description": "The request body size in bytes, sent on every request (0 = no body). At most 4194304."}},
+                             "description": "The request body size in bytes, sent on every request (0 = no body). At most 4194304. A body needs a method that carries one: a non-zero size with method GET or HEAD (GET is the default) is refused."},
+       "method": {"type": "string",
+                  "enum": ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"],
+                  "description": "The request method (default GET)."},
+       "request_mix": {"type": "array",
+                       "description": "A request mix: 1 to 256 entry objects {method?, path?, headers?, body_size?}, cycled round-robin per worker (repeat an entry to weight it). method defaults to GET; path ('/...') sets :path; headers is a {name, value} array as above; body_size is bytes (0 to 4194304, refused with GET or HEAD). Mutually exclusive with headers, method and request_body_size (set them per entry), so not usable with h3 (which needs a top-level Host header)."},
+       "burst_size": {"type": "integer",
+                      "description": "Release requests in bursts of this size (1 to 1000000) at the same average rate."},
+       "open_loop": {"type": "boolean",
+                     "description": "Open loop: no backpressure when the client-side limits are hit (default false)."},
+       "idle_strategy": {"type": "string",
+                         "enum": ["spin", "poll", "sleep"],
+                         "description": "How a client worker waits for the next scheduled request (default spin)."},
+       "max_concurrent_streams": {"type": "integer",
+                                  "description": "The stream limit per connection (1 to 2147483647); h2 and h3 only."},
+       "tls": {"type": "object",
+               "description": "TLS parameters for an https uri: {min_version?, max_version? ('1.0', '1.1', '1.2' or '1.3'), cipher_suites? (array of strings), ecdh_curves? (array of strings), session_resumption? (boolean; false disables session resumption)}. The engine still sets the ALPN and the SNI for the protocol."},
+       "worker_series": {"type": "boolean",
+                         "description": "Record the per-worker series: every snapshot then carries each worker's own counters and latency statistics, readable as nighthawk://workers and in the final output (default false)."}},
      "required": ["uri"],
      "additionalProperties": false})json";
 
 constexpr char kStartRunDescription[] =
     "Starts a benchmark run. Args: uri (string, required), rps (integer, "
     "optional; the DECLARED GLOBAL total per second), phases (string, "
-    "optional; 'name:rps:duration[:concurrency[:connections]]' entries "
+    "optional; 'name:rps:duration[:concurrency[:connections[:weights]]]' entries "
     "replacing duration_s), connections (integer, optional), "
     "max_requests_per_connection (integer, optional; close the connection "
     "after this many requests — 1 composes the connection-churn storm "
@@ -341,7 +362,17 @@ constexpr char kStartRunDescription[] =
     "pairs set on every request), duration_s (integer, optional), "
     "protocol (string, optional; h1, h2 or h3; h3 needs an https uri "
     "and a Host header), request_body_size "
-    "(integer, optional; bytes, 0 to 4194304). "
+    "(integer, optional; bytes, 0 to 4194304; a body is refused with GET "
+    "or HEAD), method (string, optional; default GET), request_mix (array, "
+    "optional; 1 to 256 {method, path, headers, body_size} entries cycled "
+    "per worker, exclusive with headers/method/request_body_size, so not "
+    "with h3), burst_size (integer, optional), open_loop (boolean, optional), "
+    "idle_strategy (string, optional; spin, poll or sleep), "
+    "max_concurrent_streams (integer, optional; h2/h3 only), tls (object, "
+    "optional; https only: min_version, max_version, cipher_suites, "
+    "ecdh_curves, session_resumption), worker_series (boolean, optional; "
+    "the per-worker series, read as nighthawk://workers). Weighted phases "
+    "('...:weights' in phases) refuse a split that is not whole. "
     "Non-positive rps, connections, max_requests_per_connection, or "
     "duration_s is refused naming the field ('must be a positive "
     "integer'); a protocol other than h1/h2/h3 and a request_body_size "
@@ -417,12 +448,368 @@ StartRunProtocolOf(absl::string_view value) {
   return std::nullopt;
 }
 
+// N3b: the request method argument onto the engine's RequestMethod (the
+// CLI's --request-method list). Unknown values map to nullopt.
+std::optional<envoy::config::core::v3::RequestMethod> StartRunMethodOf(absl::string_view value) {
+  static constexpr std::array<absl::string_view, 9> kMethods = {
+      "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"};
+  if (std::find(kMethods.begin(), kMethods.end(), value) == kMethods.end()) {
+    return std::nullopt;
+  }
+  envoy::config::core::v3::RequestMethod method = envoy::config::core::v3::METHOD_UNSPECIFIED;
+  if (!envoy::config::core::v3::RequestMethod_Parse(std::string(value), &method)) {
+    return std::nullopt;
+  }
+  return method;
+}
+
+// N3b: whether a method may carry a request body (a body on GET or HEAD is
+// refused: rows measured that way are not comparable with a POST workload).
+bool StartRunMethodCarriesBody(envoy::config::core::v3::RequestMethod method) {
+  return method != envoy::config::core::v3::GET && method != envoy::config::core::v3::HEAD;
+}
+
+// N3b: the TLS version argument ('1.0' ... '1.3') onto TlsParameters.
+std::optional<envoy::extensions::transport_sockets::tls::v3::TlsParameters::TlsProtocol>
+StartRunTlsVersionOf(absl::string_view value) {
+  using TlsParameters = envoy::extensions::transport_sockets::tls::v3::TlsParameters;
+  if (value == "1.0") {
+    return TlsParameters::TLSv1_0;
+  }
+  if (value == "1.1") {
+    return TlsParameters::TLSv1_1;
+  }
+  if (value == "1.2") {
+    return TlsParameters::TLSv1_2;
+  }
+  if (value == "1.3") {
+    return TlsParameters::TLSv1_3;
+  }
+  return std::nullopt;
+}
+
+// N3b: a JSON number argument as a whole number in [lo, hi], checked on the
+// double before any conversion (the N3a S2 rule: 1e30 is not cast, 1.5 is
+// not truncated). The refusal names the field and the range.
+absl::StatusOr<int64_t> StartRunWholeNumber(const Value& value, absl::string_view field, int64_t lo,
+                                            int64_t hi) {
+  const double raw = value.number_value();
+  if (value.kind_case() != Value::kNumberValue ||
+      !(raw >= static_cast<double>(lo) && raw <= static_cast<double>(hi)) ||
+      raw != std::floor(raw)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(field, " must be an integer from ", lo, " to ", hi, " (got ",
+                     value.kind_case() == Value::kNumberValue ? JsonNumberText(raw)
+                                                              : std::string("a non-number"),
+                     ")"));
+  }
+  return static_cast<int64_t>(raw);
+}
+
 // Whether a header name/value carries CR/LF/NUL framing (the header-
 // injection floor: names and values are single-line request values, never
 // framing).
 bool HeaderFieldHasFraming(const std::string& text) {
   return text.find('\r') != std::string::npos || text.find('\n') != std::string::npos ||
          text.find('\0') != std::string::npos;
+}
+
+// The request-header entries of one {name, value} array (the top-level
+// headers argument, or one request_mix entry's), validated against the
+// security floor and appended to `out`. `field` names the array in the
+// refusal ("headers", "request_mix[2].headers").
+absl::Status ParseStartRunHeaders(const Value& headers, absl::string_view field,
+                                  std::vector<std::pair<std::string, std::string>>& out) {
+  if (headers.kind_case() != Value::kListValue) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(field, " must be an array of {name, value} objects"));
+  }
+  const google::protobuf::ListValue& list = headers.list_value();
+  if (list.values_size() > kMaxStartRunHeaders) {
+    return absl::InvalidArgumentError(absl::StrCat(field, " carries ", list.values_size(),
+                                                   " entries; the cap is ", kMaxStartRunHeaders));
+  }
+  for (const Value& entry : list.values()) {
+    if (entry.kind_case() != Value::kStructValue) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(field, " entries must be objects carrying 'name' and 'value'"));
+    }
+    const Struct& header = entry.struct_value();
+    const Value* name = FindField(header, "name");
+    const Value* value = FindField(header, "value");
+    if (name == nullptr || value == nullptr || name->kind_case() != Value::kStringValue ||
+        value->kind_case() != Value::kStringValue) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(field, " entries must be objects carrying 'name' and 'value' (strings)"));
+    }
+    const std::string& header_name = name->string_value();
+    const std::string& header_value = value->string_value();
+    // The security floor: a header name is a non-empty single-line token
+    // (no colon, no space); names and values are request VALUES and never
+    // carry CR/LF/NUL framing.
+    if (header_name.empty() || HeaderFieldHasFraming(header_name) ||
+        header_name.find(':') != std::string::npos || header_name.find(' ') != std::string::npos) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("header name must be a non-empty token without ':', spaces, or "
+                       "CR/LF/NUL (header injection refused): '",
+                       absl::CHexEscape(header_name), "'"));
+    }
+    if (HeaderFieldHasFraming(header_value)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("header value must not carry CR/LF/NUL framing (header injection "
+                       "refused): '",
+                       absl::CHexEscape(header_value), "'"));
+    }
+    out.emplace_back(header_name, header_value);
+  }
+  return absl::OkStatus();
+}
+
+// N3b: the request mix's entry cap (repeat an entry to weight it).
+constexpr int kMaxStartRunRequestMixEntries = 256;
+
+// N3b: one request_mix entry onto a RequestOptions. Keys: method (default
+// GET), path ('/...', written as :path), headers ({name, value} array) and
+// body_size (bytes; refused with GET or HEAD). Unknown keys are refused.
+absl::StatusOr<nighthawk::client::RequestOptions> ParseStartRunMixEntry(const Value& entry) {
+  if (entry.kind_case() != Value::kStructValue) {
+    return absl::InvalidArgumentError(
+        "entries must be objects carrying method, path, headers or body_size");
+  }
+  const Struct& fields = entry.struct_value();
+  for (const auto& [key, unused] : fields.fields()) {
+    if (key != "method" && key != "path" && key != "headers" && key != "body_size") {
+      return absl::InvalidArgumentError(
+          absl::StrCat("unknown key '", absl::CHexEscape(key),
+                       "' (an entry carries method, path, headers or body_size)"));
+    }
+  }
+  nighthawk::client::RequestOptions options;
+  // The options-list source writes the entry's method onto every request, and
+  // an unset one would go out as METHOD_UNSPECIFIED: default it to GET.
+  envoy::config::core::v3::RequestMethod method = envoy::config::core::v3::GET;
+  if (const Value* raw_method = FindField(fields, "method"); raw_method != nullptr) {
+    const std::optional<envoy::config::core::v3::RequestMethod> mapped =
+        StartRunMethodOf(raw_method->string_value());
+    if (!mapped.has_value()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH "
+          "(got '",
+          absl::CHexEscape(raw_method->string_value()), "')"));
+    }
+    method = *mapped;
+  }
+  options.set_request_method(method);
+  if (const Value* path = FindField(fields, "path"); path != nullptr) {
+    const std::string& text = path->string_value();
+    if (path->kind_case() != Value::kStringValue || text.empty() || text[0] != '/' ||
+        HeaderFieldHasFraming(text) || text.find(' ') != std::string::npos) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("path must be a string starting with '/', without spaces or CR/LF/NUL "
+                       "(got '",
+                       absl::CHexEscape(text), "')"));
+    }
+    auto* header = options.add_request_headers()->mutable_header();
+    header->set_key(":path");
+    header->set_value(text);
+  }
+  if (const Value* headers = FindField(fields, "headers"); headers != nullptr) {
+    std::vector<std::pair<std::string, std::string>> parsed;
+    if (absl::Status status = ParseStartRunHeaders(*headers, "headers", parsed); !status.ok()) {
+      return status;
+    }
+    for (const auto& [name, value] : parsed) {
+      auto* header = options.add_request_headers()->mutable_header();
+      header->set_key(name);
+      header->set_value(value);
+    }
+  }
+  if (const Value* body_size = FindField(fields, "body_size"); body_size != nullptr) {
+    auto size = StartRunWholeNumber(*body_size, "body_size", 0, kMaxStartRunRequestBodySize);
+    if (!size.ok()) {
+      return size.status();
+    }
+    if (*size > 0 && !StartRunMethodCarriesBody(method)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("body_size ", *size,
+                       " needs a method that carries a body (for example "
+                       "POST); a body on ",
+                       envoy::config::core::v3::RequestMethod_Name(method), " is refused"));
+    }
+    options.mutable_request_body_size()->set_value(static_cast<uint32_t>(*size));
+  }
+  return options;
+}
+
+// N3b / NH1: the start_run arguments beyond N3a, validated at the tool
+// boundary and written onto the dialog model (still the single builder).
+// Runs after protocol, request_body_size and headers are on the model, so
+// the cross-field rules can read them.
+absl::Status ApplyStartRunShape(const Struct& arguments, const std::string& uri,
+                                Tui::StartRunDialogModel& dialog) {
+  using Protocol = nighthawk::client::Protocol;
+  const Value* method_arg = FindField(arguments, "method");
+  const Value* mix_arg = FindField(arguments, "request_mix");
+  // The method of the static RequestOptions.
+  envoy::config::core::v3::RequestMethod method = envoy::config::core::v3::GET;
+  if (method_arg != nullptr) {
+    const std::optional<envoy::config::core::v3::RequestMethod> mapped =
+        StartRunMethodOf(method_arg->string_value());
+    if (!mapped.has_value()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH "
+          "(got '",
+          absl::CHexEscape(method_arg->string_value()), "')"));
+    }
+    method = *mapped;
+    dialog.set_request_method(method);
+  }
+  // A body on GET or HEAD is refused (the N3a review's open question 1).
+  if (dialog.request_body_size().has_value() && *dialog.request_body_size() > 0 &&
+      !StartRunMethodCarriesBody(method)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("request_body_size ", *dialog.request_body_size(),
+                     " needs a method that carries a body (for example POST); a body on ",
+                     envoy::config::core::v3::RequestMethod_Name(method),
+                     method_arg == nullptr ? " (the default method)" : "", " is refused"));
+  }
+  // The request mix replaces the static RequestOptions.
+  if (mix_arg != nullptr) {
+    for (absl::string_view exclusive : {"headers", "method", "request_body_size"}) {
+      if (FindField(arguments, exclusive) != nullptr) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("request_mix and ", exclusive,
+                         " are mutually exclusive; set it on each request_mix entry instead"));
+      }
+    }
+    if (mix_arg->kind_case() != Value::kListValue || mix_arg->list_value().values_size() < 1 ||
+        mix_arg->list_value().values_size() > kMaxStartRunRequestMixEntries) {
+      return absl::InvalidArgumentError(absl::StrCat("request_mix must be an array of 1 to ",
+                                                     kMaxStartRunRequestMixEntries, " entries"));
+    }
+    std::vector<nighthawk::client::RequestOptions> mix;
+    int index = 0;
+    for (const Value& entry : mix_arg->list_value().values()) {
+      auto parsed = ParseStartRunMixEntry(entry);
+      if (!parsed.ok()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("request_mix[", index, "]: ", parsed.status().message()));
+      }
+      mix.push_back(*std::move(parsed));
+      ++index;
+    }
+    dialog.set_request_mix(std::move(mix));
+  }
+  if (const Value* burst = FindField(arguments, "burst_size"); burst != nullptr) {
+    auto value = StartRunWholeNumber(*burst, "burst_size", 1, 1000000);
+    if (!value.ok()) {
+      return value.status();
+    }
+    dialog.set_burst_size(static_cast<uint32_t>(*value));
+  }
+  if (const Value* open_loop = FindField(arguments, "open_loop"); open_loop != nullptr) {
+    if (open_loop->kind_case() != Value::kBoolValue) {
+      return absl::InvalidArgumentError("open_loop must be a boolean");
+    }
+    dialog.set_open_loop(open_loop->bool_value());
+  }
+  if (const Value* idle = FindField(arguments, "idle_strategy"); idle != nullptr) {
+    const std::string& text = idle->string_value();
+    using Strategy = nighthawk::client::SequencerIdleStrategy;
+    if (text == "spin") {
+      dialog.set_sequencer_idle_strategy(Strategy::SPIN);
+    } else if (text == "poll") {
+      dialog.set_sequencer_idle_strategy(Strategy::POLL);
+    } else if (text == "sleep") {
+      dialog.set_sequencer_idle_strategy(Strategy::SLEEP);
+    } else {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "idle_strategy must be one of spin, poll, sleep (got '", absl::CHexEscape(text), "')"));
+    }
+  }
+  if (const Value* streams = FindField(arguments, "max_concurrent_streams"); streams != nullptr) {
+    auto value = StartRunWholeNumber(*streams, "max_concurrent_streams", 1, 2147483647);
+    if (!value.ok()) {
+      return value.status();
+    }
+    if (!dialog.protocol().has_value() || *dialog.protocol() == Protocol::HTTP1) {
+      return absl::InvalidArgumentError(
+          "max_concurrent_streams applies to h2 and h3 only; set protocol to h2 or h3");
+    }
+    dialog.set_max_concurrent_streams(static_cast<uint32_t>(*value));
+  }
+  if (const Value* tls = FindField(arguments, "tls"); tls != nullptr) {
+    auto parsed_target = ParseTargetUri(uri);
+    if (!parsed_target.ok() || absl::AsciiStrToLower(parsed_target->scheme) != "https") {
+      return absl::InvalidArgumentError("tls applies to an https uri only");
+    }
+    if (tls->kind_case() != Value::kStructValue) {
+      return absl::InvalidArgumentError("tls must be an object");
+    }
+    const Struct& fields = tls->struct_value();
+    envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext context;
+    auto* params = context.mutable_common_tls_context()->mutable_tls_params();
+    for (const auto& [key, value] : fields.fields()) {
+      if (key == "min_version" || key == "max_version") {
+        const auto version = StartRunTlsVersionOf(value.string_value());
+        if (!version.has_value()) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("tls.", key, " must be one of 1.0, 1.1, 1.2, 1.3 (got '",
+                           absl::CHexEscape(value.string_value()), "')"));
+        }
+        if (key == "min_version") {
+          params->set_tls_minimum_protocol_version(*version);
+        } else {
+          params->set_tls_maximum_protocol_version(*version);
+        }
+      } else if (key == "cipher_suites" || key == "ecdh_curves") {
+        if (value.kind_case() != Value::kListValue || value.list_value().values_size() < 1 ||
+            value.list_value().values_size() > 64) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("tls.", key, " must be an array of 1 to 64 strings"));
+        }
+        for (const Value& item : value.list_value().values()) {
+          const std::string& text = item.string_value();
+          if (item.kind_case() != Value::kStringValue || text.empty() ||
+              HeaderFieldHasFraming(text)) {
+            return absl::InvalidArgumentError(
+                absl::StrCat("tls.", key, " entries must be non-empty strings without CR/LF/NUL"));
+          }
+          if (key == "cipher_suites") {
+            params->add_cipher_suites(text);
+          } else {
+            params->add_ecdh_curves(text);
+          }
+        }
+      } else if (key == "session_resumption") {
+        if (value.kind_case() != Value::kBoolValue) {
+          return absl::InvalidArgumentError("tls.session_resumption must be a boolean");
+        }
+        if (!value.bool_value()) {
+          // No cached sessions: every handshake is a full one.
+          context.mutable_max_session_keys()->set_value(0);
+        }
+      } else {
+        return absl::InvalidArgumentError(
+            absl::StrCat("tls carries an unknown key '", absl::CHexEscape(key),
+                         "' (known: min_version, max_version, cipher_suites, ecdh_curves, "
+                         "session_resumption)"));
+      }
+    }
+    if (params->tls_minimum_protocol_version() != 0 &&
+        params->tls_maximum_protocol_version() != 0 &&
+        params->tls_minimum_protocol_version() > params->tls_maximum_protocol_version()) {
+      return absl::InvalidArgumentError("tls.min_version must not be above tls.max_version");
+    }
+    dialog.set_tls_context(std::move(context));
+  }
+  if (const Value* series = FindField(arguments, "worker_series"); series != nullptr) {
+    if (series->kind_case() != Value::kBoolValue) {
+      return absl::InvalidArgumentError("worker_series must be a boolean");
+    }
+    dialog.set_worker_series(series->bool_value());
+  }
+  return absl::OkStatus();
 }
 
 constexpr char kSteerSchema[] = R"json(
@@ -439,7 +826,9 @@ constexpr char kSteerDescription[] =
     "total per second), ramp_time_s (integer, optional; ramp-plugin runs). "
     "At least one is required; a non-positive value is refused naming the "
     "field. The declared total is checked against the --max-rps ceiling "
-    "first. One steer in flight at a time: a second steer while one is "
+    "first. On a weighted phase (worker weights in phases) the total splits "
+    "by the weights and must divide into whole per-worker rates, or the "
+    "engine refuses it. One steer in flight at a time: a second steer while one is "
     "pending reaches the engine and is rejected by its one-in-flight guard "
     "(surfaced verbatim, never queued). Waits up to 2x the stats flush "
     "interval + 2s (default 4s) for the engine's apply ack; the ack is the "
@@ -986,49 +1375,19 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
     dialog.set_request_body_size(static_cast<uint32_t>(raw));
   }
   if (const Value* headers = FindField(arguments, "headers"); headers != nullptr) {
-    if (headers->kind_case() != Value::kListValue) {
-      return absl::InvalidArgumentError("headers must be an array of {name, value} objects");
+    std::vector<std::pair<std::string, std::string>> parsed_headers;
+    if (absl::Status parsed = ParseStartRunHeaders(*headers, "headers", parsed_headers);
+        !parsed.ok()) {
+      return parsed;
     }
-    const ListValue& list = headers->list_value();
-    if (list.values_size() > kMaxStartRunHeaders) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "headers carries ", list.values_size(), " entries; the cap is ", kMaxStartRunHeaders));
+    for (auto& [name, value] : parsed_headers) {
+      dialog.add_request_headers(std::move(name), std::move(value));
     }
-    for (const Value& entry : list.values()) {
-      if (entry.kind_case() != Value::kStructValue) {
-        return absl::InvalidArgumentError(
-            "headers entries must be objects carrying 'name' and 'value'");
-      }
-      const Struct& header = entry.struct_value();
-      const Value* name = FindField(header, "name");
-      const Value* value = FindField(header, "value");
-      if (name == nullptr || value == nullptr ||
-          name->kind_case() != Value::kStringValue ||
-          value->kind_case() != Value::kStringValue) {
-        return absl::InvalidArgumentError(
-            "headers entries must be objects carrying 'name' and 'value' (strings)");
-      }
-      const std::string& header_name = name->string_value();
-      const std::string& header_value = value->string_value();
-      // The security floor: a header name is a non-empty single-line token
-      // (no colon, no space); names and values are request VALUES and never
-      // carry CR/LF/NUL framing.
-      if (header_name.empty() || HeaderFieldHasFraming(header_name) ||
-          header_name.find(':') != std::string::npos ||
-          header_name.find(' ') != std::string::npos) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "header name must be a non-empty token without ':', spaces, or "
-            "CR/LF/NUL (header injection refused): '",
-            absl::CHexEscape(header_name), "'"));
-      }
-      if (HeaderFieldHasFraming(header_value)) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "header value must not carry CR/LF/NUL framing (header injection "
-            "refused): '",
-            absl::CHexEscape(header_value), "'"));
-      }
-      dialog.add_request_headers(header_name, header_value);
-    }
+  }
+  // N3b / NH1: the rest of the request shape (see ApplyStartRunShape).
+  if (absl::Status shape = ApplyStartRunShape(arguments, uri->string_value(), dialog);
+      !shape.ok()) {
+    return shape;
   }
   for (int field : {Tui::StartRunDialogModel::kUri, Tui::StartRunDialogModel::kRps,
                     Tui::StartRunDialogModel::kDuration, Tui::StartRunDialogModel::kPhases}) {
@@ -1408,6 +1767,17 @@ google::protobuf::Struct SteeringController::BuildSeries() {
     records = series_records_;
   }
   return RenderSeriesPayload(session_path, records);
+}
+
+google::protobuf::Struct SteeringController::BuildWorkers() {
+  std::string session_path;
+  std::vector<nighthawk::client::MetricSeriesRecord> records;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    session_path = recorder_.path();
+    records = series_records_;
+  }
+  return RenderWorkersPayload(session_path, records);
 }
 
 google::protobuf::Struct SteeringController::BuildTimeline() {

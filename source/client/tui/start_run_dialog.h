@@ -9,6 +9,8 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 
+#include "envoy/extensions/transport_sockets/tls/v3/tls.pb.h"
+
 #include "api/client/options.pb.h"
 #include "api/client/service.pb.h"
 
@@ -66,6 +68,48 @@ public:
     return request_headers_;
   }
 
+  // N3b / NH1: the rest of the steering surface's request-shape
+  // passthrough. Each is written by build_request() only when set; unset
+  // leaves the engine default. The tool boundary owns every range check and
+  // every refusal (the model stays a pure builder).
+  // - burst size (requests released together per burst);
+  void set_burst_size(uint32_t burst_size);
+  const std::optional<uint32_t>& burst_size() const { return burst_size_; }
+  // - open loop (no backpressure when the client-side limits are hit);
+  void set_open_loop(bool open_loop);
+  const std::optional<bool>& open_loop() const { return open_loop_; }
+  // - the sequencer idle strategy (spin, poll or sleep);
+  void set_sequencer_idle_strategy(
+      nighthawk::client::SequencerIdleStrategy::SequencerIdleStrategyOptions strategy);
+  const std::optional<nighthawk::client::SequencerIdleStrategy::SequencerIdleStrategyOptions>&
+  sequencer_idle_strategy() const {
+    return sequencer_idle_strategy_;
+  }
+  // - the per-connection stream limit (HTTP/2 and HTTP/3);
+  void set_max_concurrent_streams(uint32_t max_concurrent_streams);
+  const std::optional<uint32_t>& max_concurrent_streams() const { return max_concurrent_streams_; }
+  // - the request method of the static RequestOptions;
+  void set_request_method(envoy::config::core::v3::RequestMethod method);
+  const std::optional<envoy::config::core::v3::RequestMethod>& request_method() const {
+    return request_method_;
+  }
+  // - a request mix: the entries are cycled round-robin per worker through
+  //   the in-line options-list request source. Non-empty replaces the static
+  //   RequestOptions (headers, method and body size): the two are a oneof on
+  //   the wire, so build_request() writes the mix and nothing static;
+  void set_request_mix(std::vector<nighthawk::client::RequestOptions> request_mix);
+  const std::vector<nighthawk::client::RequestOptions>& request_mix() const { return request_mix_; }
+  // - TLS parameters for an https target (the engine still adds the ALPN
+  //   and the SNI for the protocol);
+  void set_tls_context(envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls);
+  const std::optional<envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext>&
+  tls_context() const {
+    return tls_context_;
+  }
+  // - the per-worker series opt-in (NH1).
+  void set_worker_series(bool worker_series);
+  bool worker_series() const { return worker_series_; }
+
   // M2: the phase-vector entry. A non-empty vector turns the request into a
   // phase run: build_request() writes the vector and clears the
   // mutually-exclusive top-level duration (Task 2's rules, enforced here by
@@ -77,8 +121,10 @@ public:
 
   // The dialog's phase entry field (m-fix: the production affordance): one
   // line of comma-separated phase entries, each
-  //   name:rps:duration_seconds[:concurrency[:connections]]
-  // e.g. `warm:100:5:2,spike:400:5:4:64`. Non-empty means the built request
+  //   name:rps:duration_seconds[:concurrency[:connections[:weights]]]
+  // e.g. `warm:100:5:2,spike:400:5:4:64`. NH1: weights are '/'-separated
+  // per-worker rate weights, one per worker of the phase, and connections may
+  // be left empty before them (`hot:800:20:4::5/1/1/1`). Non-empty means the built request
   // is a phase run carrying the parsed vector; valid() reuses the pure
   // phase-vector validation on the parsed result.
   void set_phases_field(std::string text);
@@ -128,6 +174,15 @@ private:
   std::vector<std::pair<std::string, std::string>> request_headers_;
   std::optional<nighthawk::client::Protocol::ProtocolOptions> protocol_;
   std::optional<uint32_t> request_body_size_;
+  std::optional<uint32_t> burst_size_;
+  std::optional<bool> open_loop_;
+  std::optional<nighthawk::client::SequencerIdleStrategy::SequencerIdleStrategyOptions>
+      sequencer_idle_strategy_;
+  std::optional<uint32_t> max_concurrent_streams_;
+  std::optional<envoy::config::core::v3::RequestMethod> request_method_;
+  std::vector<nighthawk::client::RequestOptions> request_mix_;
+  std::optional<envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext> tls_context_;
+  bool worker_series_ = false;
   std::vector<nighthawk::client::PhaseSpec> phases_;
   std::string phases_field_;
 };

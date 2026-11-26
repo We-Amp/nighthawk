@@ -1,11 +1,14 @@
 #include "source/client/tui/start_run_dialog.h"
 
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+
+#include "api/request_source/request_source_plugin.pb.h"
 
 #include "source/client/options_validation_phases.h"
 
@@ -38,6 +41,35 @@ void StartRunDialogModel::set_request_body_size(uint32_t request_body_size) {
   request_body_size_ = request_body_size;
 }
 
+void StartRunDialogModel::set_burst_size(uint32_t burst_size) { burst_size_ = burst_size; }
+
+void StartRunDialogModel::set_open_loop(bool open_loop) { open_loop_ = open_loop; }
+
+void StartRunDialogModel::set_sequencer_idle_strategy(
+    nighthawk::client::SequencerIdleStrategy::SequencerIdleStrategyOptions strategy) {
+  sequencer_idle_strategy_ = strategy;
+}
+
+void StartRunDialogModel::set_max_concurrent_streams(uint32_t max_concurrent_streams) {
+  max_concurrent_streams_ = max_concurrent_streams;
+}
+
+void StartRunDialogModel::set_request_method(envoy::config::core::v3::RequestMethod method) {
+  request_method_ = method;
+}
+
+void StartRunDialogModel::set_request_mix(
+    std::vector<nighthawk::client::RequestOptions> request_mix) {
+  request_mix_ = std::move(request_mix);
+}
+
+void StartRunDialogModel::set_tls_context(
+    envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls) {
+  tls_context_ = std::move(tls);
+}
+
+void StartRunDialogModel::set_worker_series(bool worker_series) { worker_series_ = worker_series; }
+
 void StartRunDialogModel::add_request_headers(std::string name, std::string value) {
   request_headers_.emplace_back(std::move(name), std::move(value));
 }
@@ -60,10 +92,10 @@ StartRunDialogModel::ParsePhasesField(absl::string_view text) {
       continue;
     }
     const std::vector<std::string> parts = absl::StrSplit(entry, ':');
-    if (parts.size() < 3 || parts.size() > 5) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "phase entry \"", entry,
-          "\": expected name:rps:duration[:concurrency[:connections]]"));
+    if (parts.size() < 3 || parts.size() > 6) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("phase entry \"", entry,
+                       "\": expected name:rps:duration[:concurrency[:connections[:weights]]]"));
     }
     nighthawk::client::PhaseSpec phase;
     phase.set_name(parts[0]);
@@ -87,13 +119,29 @@ StartRunDialogModel::ParsePhasesField(absl::string_view text) {
       }
       phase.mutable_concurrency()->set_value(std::to_string(workers));
     }
-    if (parts.size() >= 5) {
+    // NH1: with a weights part, connections may be left empty
+    // ("hot:800:20:4::5/1/1/1"): the run-level value is inherited.
+    if (parts.size() >= 5 && !(parts.size() == 6 && parts[4].empty())) {
       uint32_t connections = 0;
       if (!absl::SimpleAtoi(parts[4], &connections) || connections < 1) {
         return absl::InvalidArgumentError(
             absl::StrCat("phase entry \"", entry, "\": connections must be a positive integer"));
       }
       phase.mutable_connections()->set_value(connections);
+    }
+    // NH1: per-worker rate weights, '/'-separated, one per worker of the
+    // phase. The reused phase-vector validation checks the count and the
+    // whole-number split.
+    if (parts.size() == 6) {
+      for (const absl::string_view raw_weight : absl::StrSplit(parts[5], '/')) {
+        uint32_t weight = 0;
+        if (!absl::SimpleAtoi(raw_weight, &weight) || weight < 1) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "phase entry \"", entry,
+              "\": weights must be '/'-separated positive integers (for example 3/1)"));
+        }
+        phase.add_worker_weights(weight);
+      }
     }
     phases.push_back(std::move(phase));
   }
@@ -158,21 +206,63 @@ nighthawk::client::StartRequest StartRunDialogModel::build_request() const {
   if (protocol_.has_value()) {
     options->mutable_protocol()->set_value(*protocol_);
   }
-  // N3a: the steering surface's request body size, on the static
-  // RequestOptions (the CLI's --request-body-size surface).
-  if (request_body_size_.has_value()) {
-    options->mutable_request_options()->mutable_request_body_size()->set_value(*request_body_size_);
-  }
-  // The steering surface's request headers, verbatim (the tool boundary
-  // validates the entries; the model is the single builder). They live under
-  // the static RequestOptions (the same surface the CLI's --request-header
-  // fills).
-  if (!request_headers_.empty()) {
-    for (const auto& [name, value] : request_headers_) {
-      auto* option = options->mutable_request_options()->add_request_headers();
-      option->mutable_header()->set_key(name);
-      option->mutable_header()->set_value(value);
+  if (request_mix_.empty()) {
+    // N3a: the steering surface's request body size, on the static
+    // RequestOptions (the CLI's --request-body-size surface).
+    if (request_body_size_.has_value()) {
+      options->mutable_request_options()->mutable_request_body_size()->set_value(
+          *request_body_size_);
     }
+    // N3b: the method of the static RequestOptions; unset stays unset (the
+    // engine default, GET).
+    if (request_method_.has_value()) {
+      options->mutable_request_options()->set_request_method(*request_method_);
+    }
+    // The steering surface's request headers, verbatim (the tool boundary
+    // validates the entries; the model is the single builder). They live
+    // under the static RequestOptions (the same surface the CLI's
+    // --request-header fills).
+    if (!request_headers_.empty()) {
+      for (const auto& [name, value] : request_headers_) {
+        auto* option = options->mutable_request_options()->add_request_headers();
+        option->mutable_header()->set_key(name);
+        option->mutable_header()->set_value(value);
+      }
+    }
+  } else {
+    // N3b: the request mix replaces the static RequestOptions (a oneof on the
+    // wire): the in-line options-list source cycles the entries round-robin
+    // per worker, with no request cap (num_requests 0).
+    nighthawk::request_source::InLineOptionsListRequestSourceConfig config;
+    for (const nighthawk::client::RequestOptions& entry : request_mix_) {
+      *config.mutable_options_list()->add_options() = entry;
+    }
+    auto* plugin = options->mutable_request_source_plugin_config();
+    plugin->set_name("nighthawk.in-line-options-list-request-source-plugin");
+    std::ignore = plugin->mutable_typed_config()->PackFrom(config);
+  }
+  // N3b: the rest of the request-shape passthrough; unset stays unset.
+  if (burst_size_.has_value()) {
+    options->mutable_burst_size()->set_value(*burst_size_);
+  }
+  if (open_loop_.has_value()) {
+    options->mutable_open_loop()->set_value(*open_loop_);
+  }
+  if (sequencer_idle_strategy_.has_value()) {
+    options->mutable_sequencer_idle_strategy()->set_value(*sequencer_idle_strategy_);
+  }
+  if (max_concurrent_streams_.has_value()) {
+    options->mutable_max_concurrent_streams()->set_value(*max_concurrent_streams_);
+  }
+  if (tls_context_.has_value()) {
+    // The (deprecated, still honoured) tls_context field rather than a
+    // transport socket: the engine keeps adding the protocol's ALPN, the SNI
+    // and the QUIC wrapper for h3 around it.
+    *options->mutable_tls_context() = *tls_context_;
+  }
+  // NH1: the per-worker series opt-in; false stays unset.
+  if (worker_series_) {
+    options->mutable_worker_series()->set_value(true);
   }
   // Presence of live_streaming is the opt-in marker; stats_flush_interval
   // defaults to 1s (the proto bounds it to [1s, 300s]).

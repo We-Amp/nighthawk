@@ -52,6 +52,11 @@ message MetricSeriesRecord {
   string epoch_id = 4;
   map<string, uint64> counters = 5;
   repeated nighthawk.client.StatisticSnapshot statistics = 6;
+  // FORK-ONLY (We-Amp) NH1: the snapshot's per-worker points
+  // (LiveSnapshot.workers), present when the run opted in to the per-worker
+  // series. A new field, not a new record case: readers that predate it skip
+  // it.
+  repeated nighthawk.client.WorkerLiveSnapshot workers = 7;
 }
 
 // Last record of a session file.

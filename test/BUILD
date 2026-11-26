@@ -68,7 +68,10 @@ cc_test(
     srcs = ["mcp_tools_test.cc"],
     deps = [
         "//api/client:grpc_service_lib",
+        "//api/request_source:request_source_plugin_cc_proto",
         "//source/client/mcp:mcp_lib",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -384,6 +387,7 @@ cc_test(
     srcs = ["tui_start_run_dialog_test.cc"],
     deps = [
         "//api/client:base_cc_proto",
+        "//api/request_source:request_source_plugin_cc_proto",
         "//source/client/tui:tui_lib",
         "@googletest//:gtest_main",
         # tui_lib carries grpc++ code (run_feed); plain cc_test consumers must

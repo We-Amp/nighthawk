@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 #include "absl/status/status.h"
@@ -42,6 +43,9 @@
 
 #include "api/client/service.grpc.pb.h"
 #include "api/client/service.pb.h"
+#include "api/request_source/request_source_plugin.pb.h"
+#include "envoy/config/core/v3/base.pb.h"
+#include "envoy/extensions/transport_sockets/tls/v3/tls.pb.h"
 
 #include "source/client/mcp/json_util.h"
 #include "source/client/mcp/mcp_main.h"
@@ -864,18 +868,20 @@ TEST(McpToolsTest, ProtocolRefusesUnknownValues) {
 }
 
 // N3a: request_body_size lands on the static RequestOptions (the CLI's
-// --request-body-size surface); an explicit 0 is written as 0.
+// --request-body-size surface); an explicit 0 is written as 0. (N3b: a body
+// needs a method that carries one, so the run says POST.)
 TEST(McpToolsTest, RequestBodySizeRoundTrips) {
   for (const uint32_t size : {0u, 1024u, 4194304u}) {
     auto harness = MakeHarness(absl::ZeroDuration(), false, {},
                                [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
                                  return std::vector<std::string>{"127.0.0.1"};
                                });
-    Struct result = CallToolOrDie(
-        *harness, "start_run",
-        absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
-                     R"json(/", "rps": 10, "duration_s": 60, "request_body_size": )json", size,
-                     R"json(})json"));
+    Struct result =
+        CallToolOrDie(*harness, "start_run",
+                      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                                   R"json(/", "rps": 10, "duration_s": 60, "method": "POST",
+                            "request_body_size": )json",
+                                   size, R"json(})json"));
     ASSERT_FALSE(IsIsError(result)) << size << ": " << ErrorText(result);
     WaitForStartRequest(*harness);
     ASSERT_EQ(harness->service->startRequests().size(), 1) << size;
@@ -939,7 +945,7 @@ TEST(McpToolsTest, ProtocolAndBodySizeComposeWithPhases) {
       CallToolOrDie(*harness, "start_run",
                     absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
                                  R"json(/", "rps": 10, "phases": "warm:100:5:2,measure:100:20:2",
-                   "protocol": "h2", "request_body_size": 512})json"));
+                   "protocol": "h2", "method": "POST", "request_body_size": 512})json"));
   ASSERT_FALSE(IsIsError(result)) << ErrorText(result);
   WaitForStartRequest(*harness);
   ASSERT_EQ(harness->service->startRequests().size(), 1);
@@ -948,6 +954,310 @@ TEST(McpToolsTest, ProtocolAndBodySizeComposeWithPhases) {
   EXPECT_EQ(received.options().request_options().request_body_size().value(), 512);
   ASSERT_EQ(received.options().phases_size(), 2);
   EXPECT_EQ(received.options().phases(1).name(), "measure");
+}
+
+// --- N3b / NH1: the rest of the start_run request shape ---------------------
+
+// Starts a run against the harness's fake service with `extra` appended to
+// the arguments (a leading comma included) and returns the StartRequest the
+// engine received.
+nighthawk::client::StartRequest StartAndCapture(Harness& harness, const std::string& scheme,
+                                                const std::string& extra) {
+  Struct result =
+      CallToolOrDie(harness, "start_run",
+                    absl::StrCat(R"json({"uri": ")json", scheme, "://127.0.0.1:", harness.grpc_port,
+                                 R"json(/", "rps": 10, "duration_s": 60)json", extra, "}"));
+  EXPECT_FALSE(IsIsError(result)) << extra << ": " << ErrorText(result);
+  WaitForStartRequest(harness);
+  EXPECT_EQ(harness.service->startRequests().size(), 1) << extra;
+  return harness.service->startRequests().empty() ? nighthawk::client::StartRequest()
+                                                  : harness.service->startRequests()[0];
+}
+
+std::unique_ptr<Harness> MakeLoopbackHarness() {
+  return MakeHarness(absl::ZeroDuration(), false, {},
+                     [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+                       return std::vector<std::string>{"127.0.0.1"};
+                     });
+}
+
+// Calls start_run's handler directly (past the server's schema check, so the
+// boundary's own refusals are what is pinned) and returns the refusal text.
+std::string StartRunRefusal(Harness& harness, const std::string& arguments_json) {
+  auto arguments = ParseJsonObject(arguments_json);
+  EXPECT_TRUE(arguments.ok()) << arguments_json;
+  if (!arguments.ok()) {
+    return "";
+  }
+  auto started = harness.controller->StartRun(*arguments);
+  EXPECT_FALSE(started.ok()) << arguments_json << " must be refused";
+  return started.ok() ? "" : std::string(started.status().message());
+}
+
+// N3b: a body is refused on GET (explicit or the default) and on HEAD, so no
+// row can carry "GET + N-byte body"; size 0 stays fine on GET.
+TEST(McpToolsTest, RequestBodyOnGetOrHeadIsRefused) {
+  auto harness = MakeHarness();
+  EXPECT_EQ(StartRunRefusal(*harness, R"json({"uri": "http://127.0.0.1:80/", "rps": 10,
+                                             "duration_s": 5, "request_body_size": 1024})json"),
+            "request_body_size 1024 needs a method that carries a body (for example POST); a "
+            "body on GET (the default method) is refused");
+  EXPECT_EQ(StartRunRefusal(*harness, R"json({"uri": "http://127.0.0.1:80/", "rps": 10,
+                                             "duration_s": 5, "method": "HEAD",
+                                             "request_body_size": 1})json"),
+            "request_body_size 1 needs a method that carries a body (for example POST); a body "
+            "on HEAD is refused");
+  EXPECT_TRUE(harness->service->startRequests().empty());
+  auto accepting = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received =
+      StartAndCapture(*accepting, "http", R"json(, "request_body_size": 0)json");
+  EXPECT_EQ(received.options().request_options().request_body_size().value(), 0);
+}
+
+// N3b: the method lands on the static RequestOptions; unknown values are
+// refused naming the field.
+TEST(McpToolsTest, MethodRoundTripsAndRefusesUnknownValues) {
+  for (const auto& [argument, expected] :
+       std::vector<std::pair<std::string, envoy::config::core::v3::RequestMethod>>{
+           {"POST", envoy::config::core::v3::POST},
+           {"PUT", envoy::config::core::v3::PUT},
+           {"GET", envoy::config::core::v3::GET}}) {
+    auto harness = MakeLoopbackHarness();
+    const nighthawk::client::StartRequest received = StartAndCapture(
+        *harness, "http", absl::StrCat(R"json(, "method": ")json", argument, R"json(")json"));
+    EXPECT_EQ(received.options().request_options().request_method(), expected) << argument;
+  }
+  auto harness = MakeHarness();
+  for (const std::string& value : {"post", "FETCH", ""}) {
+    EXPECT_EQ(
+        StartRunRefusal(*harness, absl::StrCat(R"json({"uri": "http://127.0.0.1:80/", "rps": 10,
+                                                  "duration_s": 5, "method": ")json",
+                                               value, R"json("})json")),
+        absl::StrCat("method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, "
+                     "TRACE, PATCH (got '",
+                     value, "')"));
+  }
+}
+
+// N3b / NH1: burst size, loop mode, idle strategy, stream limit and the
+// per-worker series opt-in map onto their CommandLineOptions fields; absent,
+// none is written.
+TEST(McpToolsTest, ShapeFieldsRoundTrip) {
+  auto harness = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received = StartAndCapture(
+      *harness, "http",
+      R"json(, "protocol": "h2", "burst_size": 8, "open_loop": true, "idle_strategy": "sleep",
+             "max_concurrent_streams": 4, "worker_series": true)json");
+  const nighthawk::client::CommandLineOptions& options = received.options();
+  EXPECT_EQ(options.burst_size().value(), 8);
+  EXPECT_TRUE(options.open_loop().value());
+  EXPECT_EQ(options.sequencer_idle_strategy().value(),
+            nighthawk::client::SequencerIdleStrategy::SLEEP);
+  EXPECT_EQ(options.max_concurrent_streams().value(), 4);
+  EXPECT_TRUE(options.worker_series().value());
+
+  auto plain = MakeLoopbackHarness();
+  const nighthawk::client::CommandLineOptions absent =
+      StartAndCapture(*plain, "http", "").options();
+  EXPECT_FALSE(absent.has_burst_size());
+  EXPECT_FALSE(absent.has_open_loop());
+  EXPECT_FALSE(absent.has_sequencer_idle_strategy());
+  EXPECT_FALSE(absent.has_max_concurrent_streams());
+  EXPECT_FALSE(absent.has_worker_series());
+  EXPECT_FALSE(absent.has_tls_context());
+  EXPECT_FALSE(absent.has_request_source_plugin_config());
+}
+
+TEST(McpToolsTest, ShapeFieldsRefuseBadValues) {
+  auto harness = MakeHarness();
+  const std::string base =
+      R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5, )json";
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {R"json("burst_size": 0})json", "burst_size must be an integer from 1 to 1000000 (got 0)"},
+      {R"json("burst_size": 1000001})json",
+       "burst_size must be an integer from 1 to 1000000 (got 1000001)"},
+      {R"json("burst_size": 2.5})json",
+       "burst_size must be an integer from 1 to 1000000 (got 2.5)"},
+      {R"json("open_loop": "yes"})json", "open_loop must be a boolean"},
+      {R"json("idle_strategy": "busy"})json",
+       "idle_strategy must be one of spin, poll, sleep (got 'busy')"},
+      {R"json("max_concurrent_streams": 4})json",
+       "max_concurrent_streams applies to h2 and h3 only; set protocol to h2 or h3"},
+      {R"json("protocol": "h1", "max_concurrent_streams": 4})json",
+       "max_concurrent_streams applies to h2 and h3 only; set protocol to h2 or h3"},
+      {R"json("protocol": "h2", "max_concurrent_streams": 0})json",
+       "max_concurrent_streams must be an integer from 1 to 2147483647 (got 0)"},
+      {R"json("worker_series": 1})json", "worker_series must be a boolean"},
+  };
+  for (const auto& [arguments, message] : cases) {
+    EXPECT_EQ(StartRunRefusal(*harness, base + arguments), message) << arguments;
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// N3b: a request mix packs into the in-line options-list request source; the
+// static RequestOptions stay unset (a oneof on the wire). Entry defaults:
+// method GET; path becomes :path.
+TEST(McpToolsTest, RequestMixPacksInlineOptionsList) {
+  auto harness = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received =
+      StartAndCapture(*harness, "http",
+                      R"json(, "request_mix": [{"path": "/a"},
+                               {"method": "POST", "path": "/b", "body_size": 128,
+                                "headers": [{"name": "x-mix", "value": "1"}]}])json");
+  const nighthawk::client::CommandLineOptions& options = received.options();
+  EXPECT_FALSE(options.has_request_options());
+  ASSERT_TRUE(options.has_request_source_plugin_config());
+  EXPECT_EQ(options.request_source_plugin_config().name(),
+            "nighthawk.in-line-options-list-request-source-plugin");
+  nighthawk::request_source::InLineOptionsListRequestSourceConfig config;
+  ASSERT_TRUE(options.request_source_plugin_config().typed_config().UnpackTo(&config));
+  ASSERT_EQ(config.options_list().options_size(), 2);
+  const nighthawk::client::RequestOptions& first = config.options_list().options(0);
+  EXPECT_EQ(first.request_method(), envoy::config::core::v3::GET);
+  ASSERT_EQ(first.request_headers_size(), 1);
+  EXPECT_EQ(first.request_headers(0).header().key(), ":path");
+  EXPECT_EQ(first.request_headers(0).header().value(), "/a");
+  const nighthawk::client::RequestOptions& second = config.options_list().options(1);
+  EXPECT_EQ(second.request_method(), envoy::config::core::v3::POST);
+  EXPECT_EQ(second.request_body_size().value(), 128);
+  ASSERT_EQ(second.request_headers_size(), 2);
+  EXPECT_EQ(second.request_headers(1).header().key(), "x-mix");
+  EXPECT_EQ(config.num_requests(), 0u);
+}
+
+TEST(McpToolsTest, RequestMixRefusals) {
+  auto harness = MakeHarness();
+  const std::string base =
+      R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5, )json";
+  std::string too_many = R"json("request_mix": [)json";
+  for (int i = 0; i < 257; ++i) {
+    absl::StrAppend(&too_many, i == 0 ? "" : ",", R"json({"path": "/"})json");
+  }
+  absl::StrAppend(&too_many, "]}");
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {R"json("request_mix": [{"path": "/"}], "headers": [{"name": "a", "value": "b"}]})json",
+       "request_mix and headers are mutually exclusive; set it on each request_mix entry instead"},
+      {R"json("request_mix": [{"path": "/"}], "method": "POST"})json",
+       "request_mix and method are mutually exclusive; set it on each request_mix entry instead"},
+      {R"json("request_mix": []})json", "request_mix must be an array of 1 to 256 entries"},
+      {too_many, "request_mix must be an array of 1 to 256 entries"},
+      {R"json("request_mix": [{"path": "/"}, {"url": "/x"}]})json",
+       "request_mix[1]: unknown key 'url' (an entry carries method, path, headers or "
+       "body_size)"},
+      {R"json("request_mix": [{"body_size": 10}]})json",
+       "request_mix[0]: body_size 10 needs a method that carries a body (for example POST); a "
+       "body on GET is refused"},
+      {R"json("request_mix": [{"path": "x y"}]})json",
+       "request_mix[0]: path must be a string starting with '/', without spaces or CR/LF/NUL "
+       "(got 'x y')"},
+      {R"json("request_mix": [{"method": "FETCH"}]})json",
+       "request_mix[0]: method must be one of GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, "
+       "TRACE, PATCH (got 'FETCH')"},
+      {R"json("request_mix": [{"headers": [{"name": "a:b", "value": "c"}]}]})json",
+       "request_mix[0]: header name must be a non-empty token without ':', spaces, or CR/LF/NUL "
+       "(header injection refused): 'a:b'"},
+  };
+  for (const auto& [arguments, message] : cases) {
+    EXPECT_EQ(StartRunRefusal(*harness, base + arguments), message) << arguments.substr(0, 80);
+  }
+  // h3 needs a top-level Host header, which a mix excludes: either way the
+  // run is refused before any engine connection.
+  EXPECT_EQ(StartRunRefusal(*harness, R"json({"uri": "https://127.0.0.1:443/", "rps": 10,
+                                             "duration_s": 5, "protocol": "h3",
+                                             "headers": [{"name": "Host", "value": "x"}],
+                                             "request_mix": [{"path": "/"}]})json"),
+            "request_mix and headers are mutually exclusive; set it on each request_mix entry "
+            "instead");
+  EXPECT_EQ(StartRunRefusal(*harness, R"json({"uri": "https://127.0.0.1:443/", "rps": 10,
+                                             "duration_s": 5, "protocol": "h3",
+                                             "request_mix": [{"path": "/"}]})json"),
+            "protocol h3 needs a headers entry {\"name\": \"Host\", \"value\": <certificate "
+            "hostname>}: the target is rewritten to its IP and QUIC cannot skip certificate "
+            "verification");
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// N3b: tls maps onto the UpstreamTlsContext the engine wraps for the
+// protocol (versions, cipher suites, curves; session_resumption false sets
+// max_session_keys to 0).
+TEST(McpToolsTest, TlsMapsOntoTlsContext) {
+  auto harness = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received =
+      StartAndCapture(*harness, "https",
+                      R"json(, "tls": {"min_version": "1.2", "max_version": "1.3",
+                       "cipher_suites": ["ECDHE-RSA-AES128-GCM-SHA256"],
+                       "ecdh_curves": ["X25519"], "session_resumption": false})json");
+  ASSERT_TRUE(received.options().has_tls_context());
+  const auto& context = received.options().tls_context();
+  const auto& params = context.common_tls_context().tls_params();
+  using TlsParameters = envoy::extensions::transport_sockets::tls::v3::TlsParameters;
+  EXPECT_EQ(params.tls_minimum_protocol_version(), TlsParameters::TLSv1_2);
+  EXPECT_EQ(params.tls_maximum_protocol_version(), TlsParameters::TLSv1_3);
+  EXPECT_THAT(params.cipher_suites(), testing::ElementsAre("ECDHE-RSA-AES128-GCM-SHA256"));
+  EXPECT_THAT(params.ecdh_curves(), testing::ElementsAre("X25519"));
+  ASSERT_TRUE(context.has_max_session_keys());
+  EXPECT_EQ(context.max_session_keys().value(), 0);
+
+  auto resumed = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest with_resumption =
+      StartAndCapture(*resumed, "https", R"json(, "tls": {"session_resumption": true})json");
+  EXPECT_FALSE(with_resumption.options().tls_context().has_max_session_keys());
+}
+
+TEST(McpToolsTest, TlsRefusals) {
+  auto harness = MakeHarness();
+  const std::string https =
+      R"json({"uri": "https://127.0.0.1:443/", "rps": 10, "duration_s": 5, )json";
+  EXPECT_EQ(StartRunRefusal(*harness, R"json({"uri": "http://127.0.0.1:80/", "rps": 10,
+                                             "duration_s": 5, "tls": {}})json"),
+            "tls applies to an https uri only");
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {R"json("tls": {"min_version": "1.4"}})json",
+       "tls.min_version must be one of 1.0, 1.1, 1.2, 1.3 (got '1.4')"},
+      {R"json("tls": {"min_version": "1.3", "max_version": "1.2"}})json",
+       "tls.min_version must not be above tls.max_version"},
+      {R"json("tls": {"cipher_suites": []}})json",
+       "tls.cipher_suites must be an array of 1 to 64 strings"},
+      {R"json("tls": {"ecdh_curves": [""]}})json",
+       "tls.ecdh_curves entries must be non-empty strings without CR/LF/NUL"},
+      {R"json("tls": {"session_resumption": "no"}})json",
+       "tls.session_resumption must be a boolean"},
+      {R"json("tls": {"sni": "x"}})json",
+       "tls carries an unknown key 'sni' (known: min_version, max_version, cipher_suites, "
+       "ecdh_curves, session_resumption)"},
+  };
+  for (const auto& [arguments, message] : cases) {
+    EXPECT_EQ(StartRunRefusal(*harness, https + arguments), message) << arguments;
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// NH1: the phases string carries per-worker weights as a sixth part, with
+// connections optionally empty before it; a split that is not whole, or a
+// weight count that does not match the phase's workers, is refused with the
+// shared validation's text.
+TEST(McpToolsTest, PhasesStringCarriesWorkerWeights) {
+  auto harness = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received = StartAndCapture(
+      *harness, "http", R"json(, "phases": "even:80:5:2,hot:80:5:2::3/1,cx:60:5:2:8:1/2")json");
+  ASSERT_EQ(received.options().phases_size(), 3);
+  EXPECT_TRUE(received.options().phases(0).worker_weights().empty());
+  EXPECT_THAT(received.options().phases(1).worker_weights(), testing::ElementsAre(3, 1));
+  EXPECT_FALSE(received.options().phases(1).has_connections());
+  EXPECT_THAT(received.options().phases(2).worker_weights(), testing::ElementsAre(1, 2));
+  EXPECT_EQ(received.options().phases(2).connections().value(), 8);
+
+  auto refusing = MakeHarness();
+  const std::string base = R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "phases": ")json";
+  EXPECT_THAT(StartRunRefusal(*refusing, base + R"json(hot:81:5:2::3/1"})json"),
+              testing::HasSubstr("phase[0]: requests_per_second 81 does not split into whole "
+                                 "per-worker rates"));
+  EXPECT_THAT(StartRunRefusal(*refusing, base + R"json(hot:80:5:2::3/1/1"})json"),
+              testing::HasSubstr("phase[0]: worker_weights has 3 entries"));
+  EXPECT_THAT(StartRunRefusal(*refusing, base + R"json(hot:80:5:2::3/x"})json"),
+              testing::HasSubstr("weights must be '/'-separated positive integers"));
+  EXPECT_TRUE(refusing->service->startRequests().empty());
 }
 
 // Steering without a run surfaces the feed's refusal verbatim.

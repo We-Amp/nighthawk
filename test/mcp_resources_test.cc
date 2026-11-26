@@ -511,7 +511,7 @@ void WaitForStatus(Harness& harness, absl::Duration budget,
 
 // --- resources/list + dispatcher URI validation (Review Focus 3) ------------
 
-TEST(McpResourcesTest, ResourcesListExactlyTheFourTelemetryUris) {
+TEST(McpResourcesTest, ResourcesListExactlyTheFiveTelemetryUris) {
   auto harness = MakeHarness();
   Struct request;
   (*request.mutable_fields())["jsonrpc"].set_string_value("2.0");
@@ -524,7 +524,7 @@ TEST(McpResourcesTest, ResourcesListExactlyTheFourTelemetryUris) {
     listing = harness->responses[harness->next_id];
   }
   const Value& resources = Field(listing, "resources");
-  ASSERT_EQ(resources.list_value().values_size(), 4);
+  ASSERT_EQ(resources.list_value().values_size(), 5);
   std::vector<std::string> uris;
   for (const Value& entry : resources.list_value().values()) {
     const Struct& resource = StructOf(entry);
@@ -532,7 +532,8 @@ TEST(McpResourcesTest, ResourcesListExactlyTheFourTelemetryUris) {
     uris.push_back(Text(Field(resource, "uri")));
   }
   EXPECT_EQ(uris, (std::vector<std::string>{"nighthawk://status", "nighthawk://series",
-                                            "nighthawk://timeline", "nighthawk://session"}));
+                                            "nighthawk://timeline", "nighthawk://session",
+                                            "nighthawk://workers"}));
 }
 
 // Resource URIs are validated at the dispatcher exactly like tool arguments:
@@ -555,9 +556,8 @@ TEST(McpResourcesTest, ResourceUriValidatedAtDispatcher) {
   }
   // The registered URIs still read (no run yet: honest empty shapes, not
   // protocol faults).
-  for (const std::string& uri :
-       {"nighthawk://status", "nighthawk://series", "nighthawk://timeline",
-        "nighthawk://session"}) {
+  for (const std::string& uri : {"nighthawk://status", "nighthawk://series", "nighthawk://timeline",
+                                 "nighthawk://session", "nighthawk://workers"}) {
     EXPECT_TRUE(ReadPayload(*harness, uri).ok()) << uri;
   }
 }
@@ -823,6 +823,68 @@ nighthawk::client::KnobEpochRecord AppliedEpochOf(const std::string& epoch_id,
 // cold marks ride the same fields the strip renders, and the post-run source
 // is the Output's phase metadata (the metadata censor survives the rebuild —
 // the M2-close panel major).
+// NH1: the per-worker series payload. One entry per worker in id order; a
+// point repeated across snapshots (no new partial in between) renders once;
+// the per-second rates come from the worker's previous point (none on its
+// first); the latency summary is the request_to_response statistic.
+TEST(McpResourcesTest, WorkersPayloadRendersPerWorkerRates) {
+  const auto point = [](uint32_t worker, int64_t monotonic_ns, uint64_t requests,
+                        uint64_t http_2xx) {
+    nighthawk::client::WorkerLiveSnapshot p;
+    p.set_worker_id(worker);
+    p.set_phase_id("skew");
+    p.set_monotonic_ns(monotonic_ns);
+    p.set_wall_time_unix_ns(monotonic_ns + 5);
+    (*p.mutable_counters())["upstream_rq_total"] = requests;
+    (*p.mutable_counters())["benchmark.http_2xx"] = http_2xx;
+    (*p.mutable_counters())["upstream_cx_total"] = 2;
+    nighthawk::client::StatisticSnapshot* stat = p.add_statistics();
+    stat->set_id("benchmark_http_client.request_to_response");
+    stat->set_count(http_2xx);
+    stat->set_p50_ns(1000);
+    stat->set_p90_ns(2000);
+    stat->set_p99_ns(3000);
+    return p;
+  };
+  std::vector<nighthawk::client::MetricSeriesRecord> records(3);
+  *records[0].add_workers() = point(1, 1'000'000'000, 20, 20);
+  *records[0].add_workers() = point(0, 1'000'000'000, 60, 60);
+  *records[1].add_workers() = point(0, 2'000'000'000, 120, 119);
+  *records[1].add_workers() = point(1, 1'000'000'000, 20, 20); // repeated: no new partial
+  *records[2].add_workers() = point(0, 2'500'000'000, 150, 150);
+  *records[2].add_workers() = point(1, 3'000'000'000, 60, 60);
+  const Struct payload = RenderWorkersPayload("session.nhsession", records);
+  const Value& workers = Field(payload, "workers");
+  ASSERT_EQ(workers.list_value().values_size(), 2);
+  const Struct& w0 = StructOf(workers.list_value().values(0));
+  const Struct& w1 = StructOf(workers.list_value().values(1));
+  EXPECT_EQ(Field(w0, "worker_id").number_value(), 0);
+  EXPECT_EQ(Field(w1, "worker_id").number_value(), 1);
+  const Value& p0 = Field(w0, "points");
+  ASSERT_EQ(p0.list_value().values_size(), 3);
+  const Struct& first = StructOf(p0.list_value().values(0));
+  EXPECT_EQ(Field(first, "requests").number_value(), 60);
+  EXPECT_EQ(first.fields().count("requests_per_second"), 0u) << "no rate on the first point";
+  EXPECT_EQ(Text(Field(first, "phase_id")), "skew");
+  EXPECT_EQ(Field(first, "connections_opened").number_value(), 2);
+  EXPECT_EQ(Field(first, "connections_closed").number_value(), 0);
+  const Struct& second = StructOf(p0.list_value().values(1));
+  EXPECT_EQ(Field(second, "requests_per_second").number_value(), 60);
+  EXPECT_EQ(Field(second, "http_2xx_per_second").number_value(), 59);
+  const Struct& latency = StructOf(Field(second, "latency"));
+  EXPECT_EQ(Field(latency, "count").number_value(), 119);
+  EXPECT_EQ(Field(latency, "p99_ns").number_value(), 3000);
+  const Struct& third = StructOf(p0.list_value().values(2));
+  EXPECT_EQ(Field(third, "requests_per_second").number_value(), 60); // 30 over 0.5 s
+  // Worker 1's repeated point renders once; its rate spans 2 s.
+  const Value& p1 = Field(w1, "points");
+  ASSERT_EQ(p1.list_value().values_size(), 2);
+  EXPECT_EQ(Field(StructOf(p1.list_value().values(1)), "requests_per_second").number_value(), 20);
+  // No opt-in: an honest empty list.
+  const Struct empty = RenderWorkersPayload("s", {nighthawk::client::MetricSeriesRecord()});
+  EXPECT_EQ(Field(empty, "workers").list_value().values_size(), 0);
+}
+
 TEST(McpResourcesTest, TimelineMatchesStripSemantics) {
   nighthawk::client::CommandLineOptions options;
   *options.add_phases() = PhaseSpecOf("warm", 2, "2");
