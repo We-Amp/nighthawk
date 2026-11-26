@@ -2205,6 +2205,9 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
     {
       auto guard = std::make_unique<Envoy::Thread::LockGuard>(workers_lock_);
       if (cancelled_) {
+        // FORK-ONLY (We-Amp): no workers exist; recorded so the rest of the
+        // run does not touch them (see below).
+        cancelled_before_start_ = true;
         return;
       }
       shutdown_ = false;
@@ -2345,6 +2348,18 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
   if (!status.ok()) {
     ENVOY_LOG(error, status);
     return false;
+  }
+
+  if (cancelled_before_start_) {
+    // FORK-ONLY (We-Amp): the run was cancelled before its workers were
+    // created. Nothing ran, so there is nothing to join, orchestrate or
+    // report. A phase run used to continue into runPhases() here and index
+    // the empty worker vectors (a SIGSEGV in nighthawk_service when a client
+    // dropped its stream during a phase-run start). Upstream's contract for
+    // an immediate cancellation is kept: success with an empty output.
+    ENVOY_LOG(info, "Execution was cancelled before the workers were created; no requests were "
+                    "sent.");
+    return true;
   }
 
   if (options_.hasPhaseVector()) {

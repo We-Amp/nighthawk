@@ -299,6 +299,14 @@ void ServiceImpl::handleExecutionRequest(
   if (live_collector_thread.joinable()) {
     live_collector_thread.join();
   }
+  if (ok && process->cancelledBeforeStart()) {
+    // FORK-ONLY (We-Amp): say plainly that nothing ran, instead of a
+    // success-shaped empty output.
+    response.mutable_error_detail()->set_code(grpc::StatusCode::CANCELLED);
+    response.mutable_error_detail()->set_message(
+        "The run was cancelled before it started: no workers were created and no requests were "
+        "sent.");
+  }
   if (!ok) {
     response.mutable_error_detail()->set_code(grpc::StatusCode::INTERNAL);
     // TODO(https://github.com/envoyproxy/nighthawk/issues/181): wire through error descriptions, so

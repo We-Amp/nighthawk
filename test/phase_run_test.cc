@@ -2015,6 +2015,55 @@ TEST_F(PhaseRunTest, LiveSnapshotCarriesWorkerPointsOnlyWhenOptedIn) {
   }
 }
 
+// Regression (NH1 follow-up): a phase run cancelled before its workers exist.
+// nighthawk_service hit this when a client dropped its stream during a
+// phase-run start: run() found the cancellation, created no workers, and then
+// still entered runPhases(), which indexed the empty worker vectors (SIGSEGV).
+// The run must now end cleanly with the upstream contract for an immediate
+// cancellation (success, empty output) and report that nothing ran.
+TEST_F(PhaseRunTest, CancelBeforeWorkersExistEndsCleanly) {
+  nighthawk::client::CommandLineOptions cmd =
+      makeWeightedOptions(listener().uri(), /*worker_series=*/true);
+  nighthawk::client::PhaseSpec* second = cmd.add_phases();
+  second->set_name("even");
+  second->mutable_duration()->set_seconds(2);
+  second->set_requests_per_second(40);
+  second->mutable_concurrency()->set_value("2");
+  for (const bool cancel_first : {true, false}) {
+    SCOPED_TRACE(cancel_first ? "cancelled before run()" : "control: not cancelled");
+    nighthawk::client::CommandLineOptions run_cmd = cmd;
+    if (!cancel_first) {
+      run_cmd.mutable_phases(0)->mutable_duration()->set_seconds(1);
+      run_cmd.mutable_phases(1)->mutable_duration()->set_seconds(1);
+    }
+    auto options = std::make_unique<OptionsImpl>(run_cmd);
+    TypedExtensionConfig typed_dns_resolver_config;
+    Envoy::Network::DnsResolverFactory& dns_resolver_factory =
+        Envoy::Network::createDefaultDnsResolverFactory(typed_dns_resolver_config);
+    absl::StatusOr<ProcessPtr> process_or_status = ProcessImpl::CreateProcessImpl(
+        *options, dns_resolver_factory, typed_dns_resolver_config, time_system_);
+    ASSERT_TRUE(process_or_status.ok()) << process_or_status.status();
+    ProcessPtr process = std::move(process_or_status.value());
+    if (cancel_first) {
+      // The cancellation lands before run() creates any worker.
+      EXPECT_TRUE(process->requestExecutionCancellation());
+    }
+    OutputCollectorImpl collector(time_system_, *options);
+    EXPECT_TRUE(process->run(collector));
+    const nighthawk::client::Output output = collector.toProto();
+    if (cancel_first) {
+      EXPECT_TRUE(process->cancelledBeforeStart());
+      EXPECT_EQ(0, output.results_size());
+      EXPECT_EQ(0, output.phase_metadata_size());
+      EXPECT_EQ(0, output.worker_series_size());
+    } else {
+      EXPECT_FALSE(process->cancelledBeforeStart());
+      EXPECT_EQ(2, output.phase_metadata_size());
+    }
+    process->shutdown();
+  }
+}
+
 } // namespace
 
 } // namespace Client

@@ -32,6 +32,14 @@ public:
   virtual bool requestExecutionCancellation() PURE;
 
   /**
+   * FORK-ONLY (We-Amp): true iff the last run() was cancelled before it created
+   * its workers, so nothing ran and no request was sent. run() still returns
+   * true for such a run (an immediate cancellation is not a failure; its
+   * output is empty); callers that report the outcome use this to say so.
+   */
+  virtual bool cancelledBeforeStart() const { return false; }
+
+  /**
    * FORK-ONLY (We-Amp): drains the immutable per-worker live snapshot partials
    * accumulated so far and aggregates them into a LiveSnapshot. Intended to be
    * called periodically from the service's collector thread while a run is in

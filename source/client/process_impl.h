@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -313,6 +314,7 @@ public:
   void shutdown() override;
 
   bool requestExecutionCancellation() override;
+  bool cancelledBeforeStart() const override { return cancelled_before_start_.load(); }
 
   /**
    * FORK-ONLY (We-Amp): the in-flight run's current phase id (empty for
@@ -618,6 +620,9 @@ private:
   bool shutdown_{true};
   Envoy::Thread::MutexBasicLockable workers_lock_;
   bool cancelled_{false};
+  // FORK-ONLY (We-Amp): set when run() found the cancellation before creating
+  // its workers (see cancelledBeforeStart()).
+  std::atomic<bool> cancelled_before_start_{false};
   std::unique_ptr<FlushWorkerImpl> flush_worker_;
   Envoy::Router::ContextImpl router_context_;
   Envoy::OptionsImpl envoy_options_;
