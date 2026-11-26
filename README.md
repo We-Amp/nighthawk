@@ -166,8 +166,9 @@ bazel-bin/nighthawk_client  [--user-defined-plugin-config <string>] ...
 [--latency-response-header-name <string>]
 [--stats-flush-interval-duration <duration>]
 [--stats-flush-interval <uint32_t>]
-[--stats-sinks <string>] ... [--phases
-<string>] [--no-duration] [--simple-warmup]
+[--stats-sinks <string>] ...
+[--worker-series] [--phases <string>]
+[--no-duration] [--simple-warmup]
 [--rate-limiter-plugin-config <string>]
 [--request-source-plugin-config <string>]
 [--request-source <uri format>] [--label
@@ -246,26 +247,38 @@ argument is intended to be specified multiple times. Example (json):
 atsdSink",address:{socket_address:{address:"127.0.0.1"
 ,port_value:8125}}}}
 
+--worker-series
+Record a per-worker series: every worker computes a point at the stats
+flush cadence (--stats-flush-interval, default 5 s; it may be set
+without --stats-sinks here) with its own cumulative counters (requests
+, 2xx, connections opened and closed) and its current phase's latency
+statistics. The points are in the json/yaml output as worker_series.
+Costs one percentile extraction per worker per point. Default is
+false.
+
 --phases <string>
 Run several phases in one process, as a JSON array of PhaseSpec
 objects in proto JSON form. Each phase declares name (unique),
 duration (>= 1s), requests_per_second (the phase's total, divided
 across the phase's workers; the remainder goes one request per second
 each to the lowest worker indexes) and optionally concurrency (a
-positive integer, as a string), connections, max_pending_requests and
-max_active_requests. A phase without concurrency uses all workers (the
-maximum declared over the phases); if no phase declares concurrency,
-the run uses one worker. Connections are kept across phase boundaries;
-a phase whose concurrency exceeds every earlier phase's starts the
-extra workers cold (new connections). For HTTP/1, use
---prefetch-connections so the first phase opens the full connection
-set. The output gains one result per phase (its own histograms) and
-per-phase metadata (requests initiated and completed, boundary drain
-times) in the json/yaml formats. Mutually exclusive with --duration,
---no-duration, --concurrency and --rps. Example: [{"name":"warm"
-,"duration":"5s","requests_per_second":1000,"concurrency":"4"}
-,{"name":"measure","duration":"20s","requests_per_second":1000
-,"concurrency":"4"}]
+positive integer, as a string), connections, max_pending_requests,
+max_active_requests and worker_weights (one positive integer per
+worker of the phase: the phase's rate is split in proportion, worker i
+pacing requests_per_second x w_i / sum(w); every worker's share must
+be a whole number, or the vector is refused). A phase without
+concurrency uses all workers (the maximum declared over the phases);
+if no phase declares concurrency, the run uses one worker. Connections
+are kept across phase boundaries; a phase whose concurrency exceeds
+every earlier phase's starts the extra workers cold (new connections).
+For HTTP/1, use --prefetch-connections so the first phase opens the
+full connection set. The output gains one result per phase (its own
+histograms) and per-phase metadata (requests initiated and completed,
+boundary drain times) in the json/yaml formats. Mutually exclusive
+with --duration, --no-duration, --concurrency and --rps. Example:
+[{"name":"warm","duration":"5s","requests_per_second":1000
+,"concurrency":"4"},{"name":"measure","duration":"20s"
+,"requests_per_second":1000,"concurrency":"4"}]
 
 --no-duration
 Request infinite execution. Note that the default failure predicates
