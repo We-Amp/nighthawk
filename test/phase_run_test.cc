@@ -1006,7 +1006,24 @@ TEST_F(PhaseRunTest, ConnectionsSurviveRetireAndRejoin) {
   EXPECT_EQ(0u, counterValue(*global, "upstream_cx_destroy"))
       << "a connection closed during the run";
 
-  // Both workers served the last phase (the rejoined one included).
+  // Per worker: phase 2's pool health shows each active worker still on the
+  // 4 connections it created in phase 0 (cumulative creation count).
+  ASSERT_EQ(3, outcome.output.phase_metadata_size());
+  const nighthawk::client::PhaseMetadata& last_phase = outcome.output.phase_metadata(2);
+  ASSERT_EQ(2, last_phase.pool_health_size());
+  for (const auto& health : last_phase.pool_health()) {
+    EXPECT_EQ(kConnections, health.connections_created()) << "worker " << health.worker_id();
+  }
+  // Re-review N1: the rejoined worker itself served requests in phase 2.
+  // There is no per-worker per-phase request count in the output, so use its
+  // run total: phase 0 alone gives it about 60 (30 rps x 2 s), it sits out
+  // phase 1, and phase 2 adds about 60 more.
+  const nighthawk::client::Result* worker1 = findResult(outcome.output, "worker_1");
+  ASSERT_NE(worker1, nullptr);
+  EXPECT_GT(counterValue(*worker1, "upstream_rq_total"), 90u)
+      << "the rejoined worker served no traffic in the last phase";
+
+  // The last phase as a whole served its traffic.
   const std::vector<RequestSpan> spans = listener().requestSpans();
   const int64_t served_in_phase2 =
       std::count_if(spans.begin(), spans.end(), [phase2_start_ns](const RequestSpan& span) {

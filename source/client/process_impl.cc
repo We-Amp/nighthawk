@@ -1759,7 +1759,14 @@ void ProcessImpl::runPhases() {
     const uint32_t declared_rps = phase.requests_per_second();
     const uint32_t rps_base = declared_rps / active_workers;
     const uint32_t rps_remainder = declared_rps % active_workers;
-    if (rps_base > 0 && rps_remainder != 0) {
+    if (rps_base == 0) {
+      // FORK-ONLY (We-Amp): the 1-rps floor below offers more than declared;
+      // say so once per phase.
+      ENVOY_LOG(info,
+                "phase {} ('{}'): {} rps over {} workers: floored to 1 rps per worker = {} rps "
+                "offered",
+                phase_index, phase.name(), declared_rps, active_workers, active_workers);
+    } else if (rps_remainder != 0) {
       // FORK-ONLY (We-Amp): an uneven split is exact but not uniform; say so
       // once per phase (the shares differ by one request per second).
       ENVOY_LOG(info, "phase {} ('{}'): {} rps over {} workers = {} x {} + {} x {}", phase_index,

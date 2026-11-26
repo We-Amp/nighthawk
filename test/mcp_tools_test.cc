@@ -789,7 +789,7 @@ TEST(McpToolsTest, ProtocolRoundTrips) {
 // (no TLS, so no QUIC transport), and an https uri without a Host header
 // (the target is rewritten to its IP, so the SNI would be the IP and QUIC
 // cannot skip certificate verification). The Host name match is
-// case-insensitive.
+// case-insensitive, and an empty Host value does not count (re-review N2).
 TEST(McpToolsTest, ProtocolH3RefusesHttpUriAndMissingHost) {
   auto harness = MakeHarness();
   Struct http_uri = CallToolOrDie(
@@ -800,7 +800,8 @@ TEST(McpToolsTest, ProtocolH3RefusesHttpUriAndMissingHost) {
   EXPECT_EQ(ErrorText(http_uri), "protocol h3 needs an https uri (HTTP/3 runs over QUIC with TLS)");
 
   for (const std::string& headers :
-       {std::string(""), std::string(R"json(, "headers": [{"name": "x-a", "value": "b"}])json")}) {
+       {std::string(""), std::string(R"json(, "headers": [{"name": "x-a", "value": "b"}])json"),
+        std::string(R"json(, "headers": [{"name": "Host", "value": ""}])json")}) {
     Struct no_host = CallToolOrDie(
         *harness, "start_run",
         absl::StrCat(R"json({"uri": "https://127.0.0.1:443/", "rps": 10, "duration_s": 5,

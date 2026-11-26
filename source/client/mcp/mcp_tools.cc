@@ -376,9 +376,10 @@ std::string JsonNumberText(double value) {
   return absl::StrCat(value);
 }
 
-// N3a: whether the start_run headers argument carries a Host entry (name
-// compared case-insensitively). Malformed entries are skipped here; the
-// headers validation below refuses them with its own text.
+// N3a: whether the start_run headers argument carries a Host entry with a
+// non-empty value (name compared case-insensitively; an empty value would
+// let the SNI fall back to the rewritten IP). Malformed entries are skipped
+// here; the headers validation below refuses them with its own text.
 bool StartRunHasHostHeader(const Struct& arguments) {
   const Value* headers = FindField(arguments, "headers");
   if (headers == nullptr || headers->kind_case() != Value::kListValue) {
@@ -389,8 +390,11 @@ bool StartRunHasHostHeader(const Struct& arguments) {
       continue;
     }
     const Value* name = FindField(entry.struct_value(), "name");
+    const Value* value = FindField(entry.struct_value(), "value");
     if (name != nullptr && name->kind_case() == Value::kStringValue &&
-        absl::AsciiStrToLower(name->string_value()) == "host") {
+        absl::AsciiStrToLower(name->string_value()) == "host" && value != nullptr &&
+        value->kind_case() == Value::kStringValue &&
+        !absl::StripAsciiWhitespace(value->string_value()).empty()) {
       return true;
     }
   }
