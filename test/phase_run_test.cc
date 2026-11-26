@@ -878,6 +878,81 @@ uint64_t sequencerCallbackCount(const nighthawk::client::Output& output,
   return 0;
 }
 
+// --- N2 / O-F1: connections carry over a warm -> measure boundary. ---
+
+// The warm-then-measure shape the harness wants: two phases at the same
+// concurrency, connections and rate, with prefetch so each worker opens its
+// whole connection set on its first request (deterministic: no on-demand
+// growth later in the run).
+nighthawk::client::CommandLineOptions
+makeWarmMeasureOptions(const std::string& uri, uint32_t concurrency, uint32_t connections) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(uri);
+  cmd.mutable_connections()->set_value(connections);
+  cmd.mutable_timeout()->set_seconds(5);
+  cmd.mutable_prefetch_connections()->set_value(true);
+  for (const absl::string_view name : {"warm", "measure"}) {
+    nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+    phase->set_name(std::string(name));
+    phase->mutable_duration()->set_seconds(2);
+    phase->set_requests_per_second(60);
+    phase->mutable_concurrency()->set_value(fmt::format("{}", concurrency));
+  }
+  return cmd;
+}
+
+// O-F1, counted end to end: across a whole two-phase run the SUT accepts
+// exactly the warm phase's connection set (concurrency x connections, opened
+// by prefetch in the warm phase) and NOTHING after the measure phase began;
+// the client records no connection close before teardown; and the measure
+// phase still served its traffic over the carried-over connections. The
+// existing boundary tests look at a 250 ms window around the boundary; this
+// one covers the whole successor phase.
+TEST_F(PhaseRunTest, ConnectionsCarryOverWarmToMeasureBoundary) {
+  constexpr uint32_t kConcurrency = 2;
+  constexpr uint32_t kConnections = 4;
+  RunOutcome outcome =
+      runPhases(makeWarmMeasureOptions(listener().uri(), kConcurrency, kConnections));
+  ASSERT_TRUE(outcome.success);
+  // Events: warm start, warm drain-complete, measure start, measure
+  // drain-complete.
+  ASSERT_GE(outcome.events.size(), 3u);
+  ASSERT_EQ(1u, outcome.boundary_timings.size());
+  EXPECT_FALSE(outcome.boundary_timings[0].drain_censored);
+  const int64_t measure_start_ns = outcome.events[2].wall_time_unix_ns;
+
+  const std::vector<int64_t> accepts = listener().acceptTimestamps();
+  int accepts_before_measure = 0;
+  int accepts_during_measure = 0;
+  for (const int64_t accept_ns : accepts) {
+    if (accept_ns < measure_start_ns) {
+      accepts_before_measure++;
+    } else {
+      accepts_during_measure++;
+    }
+  }
+  EXPECT_EQ(0, accepts_during_measure)
+      << "the measure phase opened new connections: the warm set did not carry over";
+  EXPECT_EQ(static_cast<int>(kConcurrency * kConnections), accepts_before_measure)
+      << "prefetch opens connections x concurrency in the warm phase";
+
+  // Client side: the run-level counters are snapshotted before teardown
+  // drains the pools, so any close during the run would show here.
+  const nighthawk::client::Result* global = findResult(outcome.output, "global");
+  ASSERT_NE(global, nullptr);
+  EXPECT_EQ(kConcurrency * kConnections, counterValue(*global, "upstream_cx_total"));
+  EXPECT_EQ(0u, counterValue(*global, "upstream_cx_destroy"))
+      << "a connection closed during the run";
+
+  // The measure phase served traffic on those connections.
+  const std::vector<RequestSpan> spans = listener().requestSpans();
+  const int64_t served_in_measure =
+      std::count_if(spans.begin(), spans.end(), [measure_start_ns](const RequestSpan& span) {
+        return span.start_ns >= measure_start_ns;
+      });
+  EXPECT_GT(served_in_measure, 60) << "expected about 2 s x 60 rps in the measure phase";
+}
+
 // Three phases declaring concurrency [2, 4, 2]: four workers are bootstrapped
 // (the max over phases), phase traffic comes from exactly the declared subset
 // per phase, and the workers that sit out the last phase keep their
