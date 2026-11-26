@@ -303,6 +303,18 @@ TEST(OptionsPhasesTest, CliPhasesFlagParsesVector) {
   EXPECT_EQ("measure", round_trip.phases()[1].name());
 }
 
+// Review S4: the exact example --help prints parses (a JSON parser change
+// must fail here, not in a user's shell).
+TEST(OptionsPhasesTest, CliPhasesHelpExampleParses) {
+  std::unique_ptr<OptionsImpl> options = TestUtility::createOptionsImpl(std::vector<const char*>{
+      "nighthawk_client", "--phases", OptionsImpl::kPhasesHelpExample, "http://127.0.0.1/"});
+  ASSERT_EQ(2, options->phases().size());
+  EXPECT_EQ("warm", options->phases()[0].name());
+  EXPECT_EQ("measure", options->phases()[1].name());
+  EXPECT_EQ(20, options->phases()[1].duration().seconds());
+  EXPECT_EQ("4", options->phases()[1].concurrency().value());
+}
+
 // The CLI conflicts fail naming both flags; nothing is silently ignored.
 TEST(OptionsPhasesTest, CliPhasesFlagRejectsConflictingFlags) {
   const std::vector<std::pair<std::vector<const char*>, std::string>> cases = {
@@ -327,6 +339,8 @@ TEST(OptionsPhasesTest, CliPhasesFlagRejectsMalformedVectors) {
       {"not json", "Invalid value for --phases"},
       {R"json({"name":"warm"})json", "Invalid value for --phases"},
       {"[]", "--phases must declare at least one phase"},
+      {R"json([{"name":"warm","duration":"5s","requests_per_second":10}], "uri": "x")json",
+       "expected a JSON array of phases"},
       {R"json([{"name":"warm","duration":"5s","requests_per_second":10,"protocol":"h2"}])json",
        "Invalid value for --phases"},
       {R"json([{"name":"warm","duration":"0s","requests_per_second":10}])json",

@@ -29,6 +29,12 @@ public:
   // https://github.com/envoyproxy/envoy/blob/70aa8c8f0af949ee1fe965b0a826c9a3e2c634f0/api/envoy/config/core/v3/protocol.proto#L304-L316
   static constexpr uint32_t largest_acceptable_concurrent_streams_value = 2147483647;
 
+  // FORK-ONLY (We-Amp): the --phases example printed by --help, kept here so
+  // a test parses exactly the documented string.
+  static constexpr char kPhasesHelpExample[] =
+      R"json([{"name":"warm","duration":"5s","requests_per_second":1000,"concurrency":"4"},)json"
+      R"json({"name":"measure","duration":"20s","requests_per_second":1000,"concurrency":"4"}])json";
+
   OptionsImpl(int argc, const char* const* argv);
   OptionsImpl(const nighthawk::client::CommandLineOptions& options);
   Client::CommandLineOptionsPtr toCommandLineOptions() const override;

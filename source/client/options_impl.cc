@@ -21,6 +21,7 @@
 #include "source/common/version_info.h"
 
 #include "absl/status/status.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
@@ -398,16 +399,21 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
   // through the proto: the gRPC service, the TUI and the MCP server).
   TCLAP::ValueArg<std::string> phases(
       "", "phases",
-      "Run several phases in one process, as a JSON array of PhaseSpec objects in proto JSON "
-      "form. Each phase declares name (unique), duration (>= 1s), requests_per_second (the "
-      "phase's total, divided across the phase's workers) and optionally concurrency (a "
-      "positive integer), connections, max_pending_requests and max_active_requests. The output "
-      "gains one result per phase (its own histograms) and per-phase metadata (requests "
-      "initiated and completed, boundary drain times). Connections are kept across phase "
-      "boundaries when consecutive phases declare the same concurrency. Mutually exclusive with "
-      "--duration, --no-duration, --concurrency and --rps. Example (json): "
-      "[{name:\"warm\",duration:\"5s\",requests_per_second:1000,concurrency:\"4\"},"
-      "{name:\"measure\",duration:\"20s\",requests_per_second:1000,concurrency:\"4\"}]",
+      absl::StrCat(
+          "Run several phases in one process, as a JSON array of PhaseSpec objects in proto "
+          "JSON form. Each phase declares name (unique), duration (>= 1s), requests_per_second "
+          "(the phase's total, divided across the phase's workers; the remainder goes one request "
+          "per second each to the lowest worker indexes) and optionally concurrency (a positive "
+          "integer, as a string), connections, max_pending_requests and max_active_requests. A "
+          "phase without concurrency uses all workers (the maximum declared over the phases); if "
+          "no phase declares concurrency, the run uses one worker. Connections are kept across "
+          "phase boundaries; a phase whose concurrency exceeds every earlier phase's starts the "
+          "extra workers cold (new connections). For HTTP/1, use --prefetch-connections so the "
+          "first phase opens the full connection set. The output gains one result per phase (its "
+          "own histograms) and per-phase metadata (requests initiated and completed, boundary "
+          "drain times) in the json/yaml formats. Mutually exclusive with --duration, "
+          "--no-duration, --concurrency and --rps. Example: ",
+          kPhasesHelpExample),
       false, "", "string", cmd);
   TCLAP::MultiArg<std::string> stats_sinks(
       "", "stats-sinks",
@@ -1105,6 +1111,14 @@ std::string OptionsImpl::readRequestBodyFile(const std::string& path) {
 std::vector<nighthawk::client::PhaseSpec> OptionsImpl::parsePhasesJson(const std::string& json) {
   // Parsed as the phases field of a CommandLineOptions, so the accepted
   // shape is exactly the proto's PhaseSpec (unknown fields are rejected).
+  // The value must be the array itself: the wrapper below would otherwise
+  // accept '[...], "uri": "x"' and read only the phases.
+  const absl::string_view trimmed = absl::StripLeadingAsciiWhitespace(json);
+  if (trimmed.empty() || trimmed.front() != '[' ||
+      absl::StripTrailingAsciiWhitespace(trimmed).back() != ']') {
+    throw MalformedArgvException(
+        "Invalid value for --phases (expected a JSON array of phases, '[...]')");
+  }
   nighthawk::client::CommandLineOptions holder;
   try {
     Envoy::MessageUtil::loadFromJson(absl::StrCat("{\"phases\":", json, "}"), holder,
