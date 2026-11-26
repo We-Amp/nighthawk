@@ -310,7 +310,6 @@ TEST(OptionsPhasesTest, CliPhasesFlagRejectsConflictingFlags) {
       {{"--no-duration"}, "--phases and --no-duration are mutually exclusive"},
       {{"--concurrency", "4"}, "--phases and --concurrency are mutually exclusive"},
       {{"--rps", "100"}, "--phases and --rps are mutually exclusive"},
-      {{"--rps-total", "100"}, "--phases and --rps-total are mutually exclusive"},
   };
   for (const auto& [extra, message] : cases) {
     std::vector<const char*> argv{"nighthawk_client", "--phases", kWarmMeasureJson};

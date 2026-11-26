@@ -30,8 +30,7 @@ ClientWorkerImpl::ClientWorkerImpl(
     std::chrono::milliseconds live_snapshot_interval, bool phase_driven_run,
     std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
                        Nighthawk::LiveApplyFn, std::function<void()>)>
-        live_capability_cb,
-    std::optional<uint32_t> legacy_requests_per_second)
+        live_capability_cb)
     : WorkerImpl(api, tls, store), api_(api),
       time_source_(std::make_unique<CachedTimeSourceImpl>(*dispatcher_)),
       termination_predicate_factory_(termination_predicate_factory),
@@ -50,8 +49,9 @@ ClientWorkerImpl::ClientWorkerImpl(
       }),
       hardcoded_warmup_style_(hardcoded_warmup_style),
       live_snapshot_partial_cb_(live_snapshot_partial_cb),
-      live_snapshot_interval_(live_snapshot_interval), live_capability_cb_(live_capability_cb),
-      phase_driven_run_(phase_driven_run), ready_future_(ready_promise_.get_future()) {
+      live_snapshot_interval_(live_snapshot_interval),
+      live_capability_cb_(live_capability_cb), phase_driven_run_(phase_driven_run),
+      ready_future_(ready_promise_.get_future()) {
   if (!phase_driven_run) {
     // FORK-ONLY (We-Amp): a legacy run's main sequencer is built here
     // (previously in the member-init list above) so its live-update
@@ -62,8 +62,7 @@ ClientWorkerImpl::ClientWorkerImpl(
     auto sequencer = sequencer_factory_.create(
         *time_source_, *dispatcher_, sequencer_target_,
         termination_predicate_factory_.create(*time_source_, *worker_number_scope_, starting_time),
-        *worker_number_scope_, starting_time, api, legacy_requests_per_second,
-        &captured_live_tunable);
+        *worker_number_scope_, starting_time, api, std::nullopt, &captured_live_tunable);
     // The production factory only ever produces SequencerImpl; a checked
     // cast keeps that invariant load-bearing instead of silently mis-casting
     // (the T3-review UB note). A non-SequencerImpl sequencer (only possible

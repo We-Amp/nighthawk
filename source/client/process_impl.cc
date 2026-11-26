@@ -178,23 +178,12 @@ public:
         options.noDuration() ? "No time limit"
                              : fmt::format("Time limit: {} seconds", options.duration().count());
     ENVOY_LOG(info, "Starting {} threads / event loops. {}.", concurrency, duration_as_string);
-    // FORK-ONLY (We-Amp): a --rps-total run's global rate is the total; the
-    // per-worker shares differ by at most one.
-    const std::optional<uint32_t> rps_total = options.requestsPerSecondTotal();
     ENVOY_LOG(info, "Global targets: {} connections and {} calls per second.",
-              options.connections() * concurrency,
-              rps_total.has_value() ? *rps_total : options.requestsPerSecond() * concurrency);
+              options.connections() * concurrency, options.requestsPerSecond() * concurrency);
 
     if (concurrency > 1) {
-      if (rps_total.has_value()) {
-        ENVOY_LOG(info,
-                  "   (Per-worker targets: {} connections and {} calls per second, plus one for "
-                  "the first {} workers)",
-                  options.connections(), *rps_total / concurrency, *rps_total % concurrency);
-      } else {
-        ENVOY_LOG(info, "   (Per-worker targets: {} connections and {} calls per second)",
-                  options.connections(), options.requestsPerSecond());
-      }
+      ENVOY_LOG(info, "   (Per-worker targets: {} connections and {} calls per second)",
+                options.connections(), options.requestsPerSecond());
     }
 
     return concurrency;
@@ -824,14 +813,6 @@ std::chrono::nanoseconds ProcessImpl::computeInterWorkerDelay(const uint32_t con
 absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
                                         const std::optional<Envoy::SystemTime>& scheduled_start) {
   ASSERT(workers_.empty());
-  // FORK-ONLY (We-Amp): --rps-total. Validation refuses a total below a
-  // numeric --concurrency; 'auto' resolves only here, so check again before
-  // any worker is built (a zero share would build a zero-rate limiter).
-  const std::optional<uint32_t> rps_total = options_.requestsPerSecondTotal();
-  if (rps_total.has_value() && *rps_total < concurrency) {
-    return absl::InvalidArgumentError(fmt::format(
-        "--rps-total ({}) must be at least the worker count ({})", *rps_total, concurrency));
-  }
   // FORK-ONLY (We-Amp): M3 Task 3 -- each run starts from an empty
   // capability registry (before the workers are constructed: a legacy run's
   // main-sequencer capability is recorded by the worker constructor itself);
@@ -847,12 +828,8 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
   }
   const Envoy::MonotonicTime first_worker_start =
       computeFirstWorkerStart(time_system_, scheduled_start, concurrency);
-  // The stagger spaces the worker start anchors by one global inter-request
-  // interval: 1 / (rps x concurrency) for the per-worker flag. With a
-  // run-total rate the global rate is the total itself.
   const std::chrono::nanoseconds inter_worker_delay =
-      rps_total.has_value() ? computeInterWorkerDelay(/*concurrency=*/1, *rps_total)
-                            : computeInterWorkerDelay(concurrency, options_.requestsPerSecond());
+      computeInterWorkerDelay(concurrency, options_.requestsPerSecond());
   int worker_number = 0;
   // FORK-ONLY (We-Amp): when live snapshot streaming is opted in, workers
   // compute immutable partials on their own dispatcher threads and hand them
@@ -895,10 +872,7 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
         options_.simpleWarmup() ? ClientWorkerImpl::HardCodedWarmupStyle::ON
                                 : ClientWorkerImpl::HardCodedWarmupStyle::OFF,
         std::move(*plugins), live_partial_cb, live_snapshot_interval,
-        /*phase_driven_run=*/options_.hasPhaseVector(), std::move(live_capability_cb),
-        rps_total.has_value() ? std::optional<uint32_t>(PerWorkerShareOfTotalRps(
-                                    *rps_total, static_cast<uint32_t>(worker_number), concurrency))
-                              : std::nullopt));
+        /*phase_driven_run=*/options_.hasPhaseVector(), std::move(live_capability_cb)));
     // FORK-ONLY (We-Amp): M3 Task 6 -- the worker opens the boundary-drain
     // live-update gate when its non-final sequencer stops (the boundary
     // begins); runPhases closes the gate when the drain is collected. Set
@@ -1513,12 +1487,7 @@ LiveKnobDelta ComputeCurrentScheduleDelta(const Client::Options& options,
   // partial-failure rollback re-apply flag/N per worker, all under a
   // "rolled back to the prior schedule" ack.
   uint32_t declared_global_rps = options.requestsPerSecond();
-  if (options.requestsPerSecondTotal().has_value()) {
-    // FORK-ONLY (We-Amp): a --rps-total run divides the total at worker
-    // construction with the same rule PerWorkerDelta applies, so the total
-    // is already the global baseline (like a phase's declared rps).
-    declared_global_rps = *options.requestsPerSecondTotal();
-  } else if (options.hasPhaseVector()) {
+  if (options.hasPhaseVector()) {
     const auto& phases = options.phases();
     if (current_phase_index < phases.size() &&
         phases[current_phase_index].requests_per_second() > 0) {
@@ -1551,13 +1520,6 @@ LiveKnobDelta ComputeCurrentScheduleDelta(const Client::Options& options,
   }
   schedule.new_rps = declared_global_rps;
   return schedule;
-}
-
-uint32_t PerWorkerShareOfTotalRps(const uint32_t total_rps, const uint32_t worker_number,
-                                  const uint32_t worker_count) {
-  ASSERT(worker_count > 0);
-  ASSERT(worker_number < worker_count);
-  return total_rps / worker_count + (worker_number < total_rps % worker_count ? 1u : 0u);
 }
 
 LiveKnobDelta ProcessImpl::currentPhaseScheduleDelta() const {

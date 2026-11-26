@@ -13,8 +13,6 @@ class MockOptions : public Options {
 public:
   MockOptions();
   MOCK_METHOD(uint32_t, requestsPerSecond, (), (const, override));
-  // FORK-ONLY (We-Amp): --rps-total.
-  MOCK_METHOD(std::optional<uint32_t>, requestsPerSecondTotal, (), (const, override));
   MOCK_METHOD(uint32_t, connections, (), (const, override));
   MOCK_METHOD(std::chrono::seconds, duration, (), (const, override));
   MOCK_METHOD(std::chrono::seconds, timeout, (), (const, override));

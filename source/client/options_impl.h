@@ -34,10 +34,6 @@ public:
   Client::CommandLineOptionsPtr toCommandLineOptions() const override;
 
   uint32_t requestsPerSecond() const override { return requests_per_second_; }
-  // FORK-ONLY (We-Amp): --rps-total.
-  std::optional<uint32_t> requestsPerSecondTotal() const override {
-    return requests_per_second_total_;
-  }
   uint32_t connections() const override { return connections_; }
   std::chrono::seconds duration() const override { return std::chrono::seconds(duration_); }
   std::chrono::seconds timeout() const override { return std::chrono::seconds(timeout_); }
@@ -152,9 +148,6 @@ private:
   Client::CommandLineOptionsPtr toCommandLineOptionsInternal() const;
 
   uint32_t requests_per_second_{5};
-  // FORK-ONLY (We-Amp): the run-total rate; unset unless --rps-total (or the
-  // proto's requests_per_second_total) is given.
-  std::optional<uint32_t> requests_per_second_total_;
   uint32_t connections_{100};
   uint32_t duration_{5};
   uint32_t timeout_{30};

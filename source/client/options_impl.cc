@@ -53,14 +53,6 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
       "", "rps",
       fmt::format("The target requests-per-second rate. Default: {}.", requests_per_second_), false,
       0, "uint32_t", cmd);
-  // FORK-ONLY (We-Amp): the run-total rate, divided across the workers.
-  TCLAP::ValueArg<uint32_t> requests_per_second_total(
-      "", "rps-total",
-      "The target requests-per-second rate for the whole run, divided across the workers: each "
-      "worker paces total / concurrency, and the remainder goes one request per second each to "
-      "the lowest worker indexes. Must be at least the worker count. Mutually exclusive with "
-      "--rps and --phases.",
-      false, 0, "uint32_t", cmd);
   TCLAP::ValueArg<uint32_t> connections(
       "", "connections",
       fmt::format("The maximum allowed number of concurrent connections per event loop. HTTP/1 "
@@ -413,7 +405,7 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
       "gains one result per phase (its own histograms) and per-phase metadata (requests "
       "initiated and completed, boundary drain times). Connections are kept across phase "
       "boundaries when consecutive phases declare the same concurrency. Mutually exclusive with "
-      "--duration, --no-duration, --concurrency, --rps and --rps-total. Example (json): "
+      "--duration, --no-duration, --concurrency and --rps. Example (json): "
       "[{name:\"warm\",duration:\"5s\",requests_per_second:1000,concurrency:\"4\"},"
       "{name:\"measure\",duration:\"20s\",requests_per_second:1000,concurrency:\"4\"}]",
       false, "", "string", cmd);
@@ -492,24 +484,9 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
   }
 
   TCLAP_SET_IF_SPECIFIED(requests_per_second, requests_per_second_);
-  // FORK-ONLY (We-Amp): --rps-total and --phases. Each conflict fails with
-  // text naming both flags; nothing is silently ignored.
-  if (requests_per_second_total.isSet()) {
-    if (requests_per_second.isSet()) {
-      throw MalformedArgvException("--rps and --rps-total are mutually exclusive");
-    }
-    if (requests_per_second_total.getValue() < 1 ||
-        requests_per_second_total.getValue() > largest_acceptable_uint32_option_value) {
-      throw MalformedArgvException("Invalid value for --rps-total");
-    }
-    requests_per_second_total_ = requests_per_second_total.getValue();
-  }
+  // FORK-ONLY (We-Amp): --phases. Each conflict fails with text naming both
+  // flags; nothing is silently ignored.
   if (phases.isSet()) {
-    if (requests_per_second_total.isSet()) {
-      throw MalformedArgvException(
-          "--phases and --rps-total are mutually exclusive; each phase's requests_per_second "
-          "is already the phase's total");
-    }
     if (requests_per_second.isSet()) {
       throw MalformedArgvException("--phases and --rps are mutually exclusive; set "
                                    "requests_per_second on each phase instead");
@@ -918,20 +895,6 @@ OptionsImpl::OptionsImpl(const nighthawk::client::CommandLineOptions& options) {
 
   requests_per_second_ =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(options, requests_per_second, requests_per_second_);
-  // FORK-ONLY (We-Amp): the run-total rate. Mutually exclusive with the
-  // per-worker rate and with a phase vector, exactly like the CLI flags.
-  if (options.has_requests_per_second_total()) {
-    if (options.has_requests_per_second()) {
-      throw MalformedArgvException(
-          "requests_per_second and requests_per_second_total are mutually exclusive");
-    }
-    if (options.phases_size() > 0) {
-      throw MalformedArgvException(
-          "phases and requests_per_second_total are mutually exclusive; each phase's "
-          "requests_per_second is already the phase's total");
-    }
-    requests_per_second_total_ = options.requests_per_second_total().value();
-  }
   if (options.has_duration()) {
     duration_ = options.duration().seconds();
   }
@@ -1179,15 +1142,6 @@ void OptionsImpl::validate() const {
     if (parsed_concurrency <= 0) {
       throw MalformedArgvException("Value for --concurrency should be greater then 0.");
     }
-    // FORK-ONLY (We-Amp): a total below the worker count cannot be divided
-    // without a zero-rate worker. ('auto' is resolved at run time; the
-    // process applies the same check there.)
-    if (requests_per_second_total_.has_value() &&
-        *requests_per_second_total_ < static_cast<uint32_t>(parsed_concurrency)) {
-      throw MalformedArgvException(
-          fmt::format("--rps-total ({}) must be at least the worker count (--concurrency {})",
-                      *requests_per_second_total_, parsed_concurrency));
-    }
   }
   if (request_source_ != "") {
     try {
@@ -1241,14 +1195,7 @@ CommandLineOptionsPtr OptionsImpl::toCommandLineOptionsInternal() const {
   if (!no_duration_ && phases_.empty()) {
     command_line_options->mutable_duration()->set_seconds(duration_);
   }
-  // FORK-ONLY (We-Amp): a run-total rate replaces the mutually-exclusive
-  // per-worker rate, so the serialized options re-parse to the same run.
-  if (requests_per_second_total_.has_value()) {
-    command_line_options->mutable_requests_per_second_total()->set_value(
-        *requests_per_second_total_);
-  } else {
-    command_line_options->mutable_requests_per_second()->set_value(requests_per_second_);
-  }
+  command_line_options->mutable_requests_per_second()->set_value(requests_per_second_);
   command_line_options->mutable_timeout()->set_seconds(timeout_);
 
   if (h2_) {

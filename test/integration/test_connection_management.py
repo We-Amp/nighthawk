@@ -233,14 +233,3 @@ def test_h3_phases_carry_connections_over_boundary(quic_test_server_fixture):
   counters = quic_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
   _assert_one_connection_set(counters, concurrency)
 
-
-@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
-def test_http_h1_rps_total_divides_across_workers(http_test_server_fixture):
-  """Test that --rps-total paces the total, not the total per worker."""
-  parsed_json, _ = http_test_server_fixture.runNighthawkClient([
-      http_test_server_fixture.getTestServerRootUri(), "--rps-total", "30", "--concurrency", "4",
-      "--duration", "3"
-  ])
-  counters = http_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
-  # 3 s x 30 rps = 90; a per-worker reading would send about 360.
-  asserts.assertCounterBetweenInclusive(counters, "upstream_rq_total", 75, 100)

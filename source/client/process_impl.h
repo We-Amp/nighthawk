@@ -260,15 +260,6 @@ LiveKnobDelta ComputeCurrentScheduleDelta(const Client::Options& options,
                                           uint32_t active_workers, uint32_t current_phase_index,
                                           bool ramp_plugin_configured);
 
-// FORK-ONLY (We-Amp): one worker's share of a --rps-total run: total /
-// worker_count, plus one for each of the lowest (total % worker_count) worker
-// indexes, so the shares sum to the total exactly. The same rule the
-// phase-begin loop applies to a phase's declared rps. Requires worker_count
-// >= 1 and worker_number < worker_count; the caller guarantees total >=
-// worker_count (a smaller total is refused before any worker is built).
-uint32_t PerWorkerShareOfTotalRps(uint32_t total_rps, uint32_t worker_number,
-                                  uint32_t worker_count);
-
 class ProcessImpl : public Process, public Envoy::Logger::Loggable<Envoy::Logger::Id::main> {
 public:
   /**

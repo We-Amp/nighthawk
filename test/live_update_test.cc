@@ -4,7 +4,6 @@
 // (bounded ack wait off the dispatching thread; no ack after the run ended or
 // a cancellation was accepted) with precise fake-level observability.
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -2095,51 +2094,6 @@ TEST(ComputeCurrentScheduleDeltaTest, PhaseRunWithPluginBaselineIsDeclaredRpsOnT
       << "with the override consumed (factory fix), the plugin phase limiter paces at the phase's share; the declared value is global here too";
 }
 
-// N2: a --rps-total run divides the total at worker construction (the same
-// rule PerWorkerDelta applies), so its global baseline is the total itself,
-// never total x workers.
-TEST(ComputeCurrentScheduleDeltaTest, RpsTotalRunBaselineIsTheTotal) {
-  nighthawk::client::CommandLineOptions command_line = MakeLegacyCommandLine(/*rps=*/1);
-  command_line.clear_requests_per_second();
-  command_line.mutable_requests_per_second_total()->set_value(30);
-  OptionsImpl options(command_line);
-  const LiveKnobDelta baseline = ComputeCurrentScheduleDelta(options, 4, 0, false);
-  ASSERT_TRUE(baseline.new_rps.has_value());
-  EXPECT_EQ(*baseline.new_rps, 30u)
-      << "the workers were built at the total's shares; the global baseline is the total";
-}
-
-// N2: the per-worker shares of a total sum to the total exactly, differ by
-// at most one, and the remainder lands on the lowest worker indexes.
-TEST(PerWorkerShareOfTotalRpsTest, SharesSumToTheTotalRemainderFirst) {
-  EXPECT_EQ(PerWorkerShareOfTotalRps(1800, 0, 16), 113u); // 1800 = 8 x 113 + 8 x 112
-  EXPECT_EQ(PerWorkerShareOfTotalRps(1800, 7, 16), 113u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(1800, 8, 16), 112u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(1800, 15, 16), 112u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(30, 0, 4), 8u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(30, 1, 4), 8u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(30, 2, 4), 7u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(30, 3, 4), 7u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(1760, 5, 16), 110u); // even split
-  EXPECT_EQ(PerWorkerShareOfTotalRps(7, 0, 1), 7u);
-  EXPECT_EQ(PerWorkerShareOfTotalRps(4, 3, 4), 1u); // total == workers
-  for (const uint32_t workers : {1u, 3u, 12u, 16u, 20u}) {
-    for (const uint32_t total : {workers, 1000u, 1800u, 3000u, 20001u}) {
-      uint64_t sum = 0;
-      uint32_t lowest = UINT32_MAX;
-      uint32_t highest = 0;
-      for (uint32_t w = 0; w < workers; ++w) {
-        const uint32_t share = PerWorkerShareOfTotalRps(total, w, workers);
-        sum += share;
-        lowest = std::min(lowest, share);
-        highest = std::max(highest, share);
-      }
-      EXPECT_EQ(sum, total) << total << " over " << workers;
-      EXPECT_LE(highest - lowest, 1u) << total << " over " << workers;
-    }
-  }
-}
-
 // Task-8a's global-knob contract on a LEGACY run: a no-op bend AT the true
 // total (flag x active workers) must leave every worker's limiter at its
 // constructed share -- previously the tracker treated the bare flag as the
@@ -2161,32 +2115,6 @@ TEST_F(LiveCapabilityFanOutTest, LegacyNoOpBendAtTrueTotalLeavesWorkerSharesUnch
     ASSERT_TRUE(workers_[i]->applies[0].delta.new_rps.has_value());
     EXPECT_EQ(*workers_[i]->applies[0].delta.new_rps, 100u)
         << "worker " << i << " must keep its constructed per-worker share (the flag)";
-  }
-}
-
-// N2: the same contract on a --rps-total run: a no-op bend at the total
-// re-applies exactly each worker's constructed share (8, 8, 7, 7 for 30 over
-// four workers), never the total re-applied per worker.
-TEST_F(LiveCapabilityFanOutTest, RpsTotalNoOpBendAtTheTotalLeavesWorkerSharesUnchanged) {
-  for (int i = 0; i < 4; i++) {
-    workers_.push_back(std::make_unique<FakeFanOutWorker>());
-  }
-  nighthawk::client::CommandLineOptions command_line = MakeLegacyCommandLine(/*rps=*/1);
-  command_line.clear_requests_per_second();
-  command_line.mutable_requests_per_second_total()->set_value(30);
-  OptionsImpl options(command_line);
-  declared_schedule_ = ComputeCurrentScheduleDelta(options, /*active_workers=*/4, 0, false);
-  LiveCapabilityFanOutApplier applier(MakeContext());
-  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
-  const UpdateResult result =
-      applier.ApplyDeltas(RpsRequest(30), "epoch-1", bend_instant, Deadline());
-  ASSERT_TRUE(result.applied()) << result.rejection_reason();
-  for (size_t i = 0; i < workers_.size(); i++) {
-    ASSERT_EQ(workers_[i]->applies.size(), 1u);
-    ASSERT_TRUE(workers_[i]->applies[0].delta.new_rps.has_value());
-    EXPECT_EQ(*workers_[i]->applies[0].delta.new_rps,
-              PerWorkerShareOfTotalRps(30, static_cast<uint32_t>(i), 4))
-        << "worker " << i << " must keep its constructed share of the total";
   }
 }
 

@@ -372,11 +372,8 @@ FortioOutputFormatterImpl::formatProto(const nighthawk::client::Output& output) 
   fortio_output.set_labels(std::string(absl::StripSuffix(labels, " ")));
   fortio_output.set_version(VersionInfo::toVersionString(output.version()));
   *fortio_output.mutable_starttime() = output.timestamp();
-  // FORK-ONLY (We-Amp): a --rps-total run carries its global rate directly.
-  fortio_output.set_requestedqps(output.options().has_requests_per_second_total()
-                                     ? output.options().requests_per_second_total().value()
-                                     : number_of_workers *
-                                           output.options().requests_per_second().value());
+  fortio_output.set_requestedqps(number_of_workers *
+                                 output.options().requests_per_second().value());
   fortio_output.set_url(output.options().uri().value());
   *fortio_output.mutable_requestedduration() = output.options().duration();
   absl::StatusOr<std::chrono::nanoseconds> actual_duration_status =
