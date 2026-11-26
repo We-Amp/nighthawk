@@ -109,6 +109,9 @@ public:
   // FORK-ONLY (We-Amp): true iff this run opted in to live snapshot streaming
   // over the gRPC ExecutionStream.
   virtual bool liveStreamingEnabled() const PURE;
+  // FORK-ONLY (We-Amp) NH1: true iff this run opted in to the per-worker
+  // series (a point per worker at the stats flush cadence).
+  virtual bool workerSeriesEnabled() const PURE;
   virtual std::string responseHeaderWithLatencyInput() const PURE;
 
   virtual std::optional<Envoy::SystemTime> scheduled_start() const PURE;

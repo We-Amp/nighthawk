@@ -23,8 +23,18 @@
 //   protocol/TLS/uri fields, so a cross-protocol phase vector is
 //   unrepresentable. Per-phase connections/in-flight limits inherit the
 //   run-level values when absent; no cross-protocol validation is needed.
+// - worker_weights (NH1), when present on a phase: every weight >= 1, the
+//   count equal to the phase's worker count (its concurrency; without one,
+//   the maximum declared over the phases, or 1 when none declares), and
+//   every worker's share requests_per_second x w_i / sum(w) a whole number.
+//   A vector that does not divide evenly is refused: there is no remainder
+//   rule for weighted splits.
+
+#include <cstdint>
+#include <vector>
 
 #include "absl/status/status.h"
+#include "absl/types/span.h"
 
 #include "api/client/options.pb.h"
 
@@ -35,6 +45,25 @@ namespace Client {
 // (vector-less) runs, single-phase runs and valid multi-phase vectors;
 // InvalidArgumentError with a phase-index-bearing message otherwise.
 absl::Status validatePhaseVector(const nighthawk::client::CommandLineOptions& options);
+
+// FORK-ONLY (We-Amp) NH1: OkStatus iff `rps` splits by `weights` into whole
+// per-worker rates (rps x w_i is divisible by sum(w) for every i). Every
+// weight must be >= 1 and the vector non-empty. The error text states the
+// rule and the first worker whose share is not whole. Pure.
+absl::Status checkWeightedSplit(uint32_t rps, absl::Span<const uint32_t> weights);
+
+// FORK-ONLY (We-Amp) NH1: the per-worker rates of one phase, in worker-id
+// order; the single split rule every surface uses (phase begin, live
+// bends, the phase metadata).
+// - No weights: the even split. base = rps / active_workers, the remainder
+//   one request per second each to the lowest worker indexes, and a rate
+//   below the worker count floors to 1 per worker.
+// - Weights (size == active_workers, checkWeightedSplit OK): worker i gets
+//   rps x w_i / sum(w).
+// Pure; the caller guarantees active_workers >= 1 and, for weights, a
+// passing checkWeightedSplit.
+std::vector<uint32_t> perWorkerRates(uint32_t rps, uint32_t active_workers,
+                                     absl::Span<const uint32_t> weights);
 
 } // namespace Client
 } // namespace Nighthawk

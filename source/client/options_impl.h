@@ -132,6 +132,8 @@ public:
   }
   // FORK-ONLY (We-Amp): live snapshot streaming opt-in.
   bool liveStreamingEnabled() const override { return live_streaming_; }
+  // FORK-ONLY (We-Amp) NH1: the per-worker series opt-in.
+  bool workerSeriesEnabled() const override { return worker_series_; }
   std::string responseHeaderWithLatencyInput() const override {
     return latency_response_header_name_;
   };
@@ -234,6 +236,7 @@ private:
   uint32_t stats_flush_interval_{5};
   Envoy::Protobuf::Duration stats_flush_interval_duration_;
   bool live_streaming_{false};
+  bool worker_series_{false};
   std::string latency_response_header_name_;
   std::optional<Envoy::SystemTime> scheduled_start_;
   std::optional<std::string> execution_id_;

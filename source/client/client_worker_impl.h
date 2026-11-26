@@ -175,7 +175,11 @@ private:
   // collector via live_snapshot_partial_cb_. No locks are taken on request
   // hot paths; the callback only fires at the live snapshot cadence.
   void setupLiveSnapshotTimer();
-  void emitLiveSnapshotPartial();
+  // FORK-ONLY (We-Amp) NH1: run_end marks the worker's last point, computed
+  // once when its run ends (before the final phase's statistics are retired
+  // into their slab). The process routes a run_end partial to the per-worker
+  // series only, never to the live aggregation.
+  void emitLiveSnapshotPartial(bool run_end = false);
   // FORK-ONLY (We-Amp): multi-phase support. All of these run on this
   // worker's own dispatcher: beginPhase builds the per-phase sequencer
   // (fresh termination predicate and rate limiter per phase) and starts it;

@@ -15,12 +15,14 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 #include "absl/strings/match.h"
@@ -1851,6 +1853,166 @@ TEST(WorkerSubsetTest, UndeclaredConcurrencyInheritsBootstrapCount) {
   EXPECT_EQ(1, subsets[1].worker_count);
   EXPECT_TRUE(subsets[1].workers_changed_vs_prior_phase);
   EXPECT_FALSE(subsets[1].new_workers_cold_started);
+}
+
+// --- NH1: per-worker rate weights and the per-worker series ----------------
+
+// A one-phase weighted run: 2 workers at 80 rps total, weights [3, 1].
+nighthawk::client::CommandLineOptions makeWeightedOptions(const std::string& uri,
+                                                          bool worker_series) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(uri);
+  cmd.mutable_connections()->set_value(4);
+  cmd.mutable_timeout()->set_seconds(5);
+  cmd.mutable_stats_flush_interval()->set_value(1);
+  if (worker_series) {
+    cmd.mutable_worker_series()->set_value(true);
+  }
+  nighthawk::client::PhaseSpec* phase = cmd.add_phases();
+  phase->set_name("skew");
+  phase->mutable_duration()->set_seconds(4);
+  phase->set_requests_per_second(80);
+  phase->mutable_concurrency()->set_value("2");
+  phase->add_worker_weights(3);
+  phase->add_worker_weights(1);
+  return cmd;
+}
+
+uint64_t pointCounter(const nighthawk::client::WorkerLiveSnapshot& point, const char* name) {
+  const auto it = point.counters().find(name);
+  return it == point.counters().end() ? 0 : it->second;
+}
+
+// The acceptance test of NH1: under a skewed weight vector, the per-worker
+// series read from the output shows the realised split. Worker 0 paces 60
+// rps and worker 1 paces 20 rps (the metadata says so), the per-second rates
+// between consecutive series points sit at those rates, the final points
+// carry a 3:1 split of the requests, and they agree with the worker_<i>
+// results.
+TEST_F(PhaseRunTest, WeightedPhaseRealisedSplitShowsInWorkerSeries) {
+  RunOutcome outcome = runPhases(makeWeightedOptions(listener().uri(), /*worker_series=*/true));
+  ASSERT_TRUE(outcome.success);
+  ASSERT_EQ(1, outcome.output.phase_metadata_size());
+  EXPECT_THAT(outcome.output.phase_metadata(0).worker_requests_per_second(),
+              testing::ElementsAre(60, 20));
+
+  std::map<uint32_t, std::vector<nighthawk::client::WorkerLiveSnapshot>> by_worker;
+  for (const nighthawk::client::WorkerLiveSnapshot& point : outcome.output.worker_series()) {
+    by_worker[point.worker_id()].push_back(point);
+  }
+  ASSERT_EQ(2u, by_worker.size());
+  const std::array<double, 2> expected_rps{60, 20};
+  std::array<uint64_t, 2> final_requests{0, 0};
+  for (uint32_t worker = 0; worker < 2; ++worker) {
+    SCOPED_TRACE(absl::StrCat("worker ", worker));
+    const std::vector<nighthawk::client::WorkerLiveSnapshot>& points = by_worker[worker];
+    // A point per second of the 4 s phase (give or take the first), plus the
+    // run-end point.
+    ASSERT_GE(points.size(), 4u);
+    EXPECT_TRUE(points.back().run_end());
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+      EXPECT_FALSE(points[i].run_end());
+      EXPECT_LT(points[i].monotonic_ns(), points[i + 1].monotonic_ns()) << "out of time order";
+      EXPECT_EQ("skew", points[i].phase_id());
+    }
+    // Per-second rates between consecutive timer points (the run-end point
+    // closes a partial interval, so it is left out). Take the median, so one
+    // slow start does not decide.
+    std::vector<double> rates;
+    for (size_t i = 1; i + 1 < points.size(); ++i) {
+      const double seconds =
+          static_cast<double>(points[i].monotonic_ns() - points[i - 1].monotonic_ns()) / 1e9;
+      rates.push_back(static_cast<double>(pointCounter(points[i], "upstream_rq_total") -
+                                          pointCounter(points[i - 1], "upstream_rq_total")) /
+                      seconds);
+    }
+    ASSERT_FALSE(rates.empty());
+    std::sort(rates.begin(), rates.end());
+    const double median = rates[rates.size() / 2];
+    EXPECT_NEAR(median, expected_rps[worker], expected_rps[worker] * 0.25)
+        << "the realised per-second rate does not match the weighted share";
+    // The latency summary of the phase rides on the points.
+    bool saw_latency = false;
+    for (const nighthawk::client::StatisticSnapshot& stat : points.back().statistics()) {
+      if (stat.id() == "benchmark_http_client.request_to_response" && stat.count() > 0) {
+        saw_latency = true;
+        EXPECT_GT(stat.p50_ns(), 0u);
+      }
+    }
+    EXPECT_TRUE(saw_latency);
+    EXPECT_GT(pointCounter(points.back(), "upstream_cx_total"), 0u);
+    EXPECT_GT(pointCounter(points.back(), "benchmark.http_2xx"), 0u);
+    final_requests[worker] = pointCounter(points.back(), "upstream_rq_total");
+    // The run-end point is the worker's final count, as in its result.
+    const nighthawk::client::Result* result =
+        findResult(outcome.output, absl::StrCat("worker_", worker));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(final_requests[worker], counterValue(*result, "upstream_rq_total"));
+  }
+  // About 240 and 80 requests over 4 s: a 3:1 split.
+  EXPECT_NEAR(static_cast<double>(final_requests[0]), 240.0, 36.0);
+  EXPECT_NEAR(static_cast<double>(final_requests[1]), 80.0, 12.0);
+  ASSERT_GT(final_requests[1], 0u);
+  const double ratio =
+      static_cast<double>(final_requests[0]) / static_cast<double>(final_requests[1]);
+  EXPECT_NEAR(ratio, 3.0, 0.4);
+}
+
+// Without the opt-in, the output carries no series, but the per-worker rates
+// still land in the phase metadata (the even split too).
+TEST_F(PhaseRunTest, WorkerSeriesAbsentWithoutOptInAndEvenSplitInMetadata) {
+  nighthawk::client::CommandLineOptions cmd =
+      makeWeightedOptions(listener().uri(), /*worker_series=*/false);
+  cmd.mutable_phases(0)->clear_worker_weights();
+  cmd.mutable_phases(0)->set_requests_per_second(81);
+  cmd.mutable_phases(0)->mutable_duration()->set_seconds(2);
+  RunOutcome outcome = runPhases(cmd);
+  ASSERT_TRUE(outcome.success);
+  EXPECT_EQ(0, outcome.output.worker_series_size());
+  ASSERT_EQ(1, outcome.output.phase_metadata_size());
+  EXPECT_THAT(outcome.output.phase_metadata(0).worker_requests_per_second(),
+              testing::ElementsAre(41, 40));
+}
+
+// On a live-streaming run with the opt-in, every snapshot carries the
+// per-worker points (both workers, in worker-id order, each with its own
+// counters, never a run-end point); without the opt-in it carries none.
+TEST_F(PhaseRunTest, LiveSnapshotCarriesWorkerPointsOnlyWhenOptedIn) {
+  for (const bool opted_in : {true, false}) {
+    SCOPED_TRACE(opted_in ? "opted in" : "not opted in");
+    nighthawk::client::CommandLineOptions cmd = makeWeightedOptions(listener().uri(), opted_in);
+    cmd.mutable_phases(0)->mutable_duration()->set_seconds(3);
+    cmd.mutable_live_streaming();
+    RunOutcome outcome = runPhases(cmd, /*sample_live_snapshots=*/true);
+    ASSERT_TRUE(outcome.success);
+    std::lock_guard<std::mutex> lock(outcome_mutex);
+    ASSERT_FALSE(outcome.live_snapshots.empty());
+    size_t with_both = 0;
+    for (const nighthawk::client::LiveSnapshot& snapshot : outcome.live_snapshots) {
+      if (!opted_in) {
+        EXPECT_EQ(0, snapshot.workers_size());
+        continue;
+      }
+      for (const nighthawk::client::WorkerLiveSnapshot& point : snapshot.workers()) {
+        EXPECT_FALSE(point.run_end());
+      }
+      if (snapshot.workers_size() == 2) {
+        ++with_both;
+        EXPECT_EQ(0u, snapshot.workers(0).worker_id());
+        EXPECT_EQ(1u, snapshot.workers(1).worker_id());
+        // Never folded: once both workers have sent traffic, worker 0 (weight
+        // 3) carries more than worker 1 (weight 1).
+        const uint64_t w0 = pointCounter(snapshot.workers(0), "upstream_rq_total");
+        const uint64_t w1 = pointCounter(snapshot.workers(1), "upstream_rq_total");
+        if (w1 >= 10) {
+          EXPECT_GT(w0, w1);
+        }
+      }
+    }
+    if (opted_in) {
+      EXPECT_GT(with_both, 0u);
+    }
+  }
 }
 
 } // namespace

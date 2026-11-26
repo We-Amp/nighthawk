@@ -404,7 +404,10 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
           "JSON form. Each phase declares name (unique), duration (>= 1s), requests_per_second "
           "(the phase's total, divided across the phase's workers; the remainder goes one request "
           "per second each to the lowest worker indexes) and optionally concurrency (a positive "
-          "integer, as a string), connections, max_pending_requests and max_active_requests. A "
+          "integer, as a string), connections, max_pending_requests, max_active_requests and "
+          "worker_weights (one positive integer per worker of the phase: the phase's rate is "
+          "split in proportion, worker i pacing requests_per_second x w_i / sum(w); every "
+          "worker's share must be a whole number, or the vector is refused). A "
           "phase without concurrency uses all workers (the maximum declared over the phases); if "
           "no phase declares concurrency, the run uses one worker. Connections are kept across "
           "phase boundaries; a phase whose concurrency exceeds every earlier phase's starts the "
@@ -415,6 +418,16 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
           "--no-duration, --concurrency and --rps. Example: ",
           kPhasesHelpExample),
       false, "", "string", cmd);
+  // FORK-ONLY (We-Amp) NH1: the per-worker series.
+  TCLAP::SwitchArg worker_series(
+      "", "worker-series",
+      "Record a per-worker series: every worker computes a point at the stats flush cadence "
+      "(--stats-flush-interval, default 5 s; it may be set without --stats-sinks here) with its "
+      "own cumulative counters (requests, 2xx, "
+      "connections opened and closed) and its current phase's latency statistics. The points "
+      "are in the json/yaml output as worker_series. Costs one percentile extraction per worker "
+      "per point. Default is false.",
+      cmd);
   TCLAP::MultiArg<std::string> stats_sinks(
       "", "stats-sinks",
       "Stats sinks (in json) where Nighthawk "
@@ -481,12 +494,13 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
   }
 
   // Verify that if --stats-flush-interval or --stats-flush-interval-duration is
-  // set, then --stats-sinks must also be set.
+  // set, then --stats-sinks must also be set. FORK-ONLY (We-Amp) NH1: or
+  // --worker-series, whose point cadence is the flush interval.
   if ((stats_flush_interval.isSet() || stats_flush_interval_duration.isSet()) &&
-      !stats_sinks.isSet()) {
+      !stats_sinks.isSet() && !worker_series.isSet()) {
     throw MalformedArgvException(
         "if --stats-flush-interval or --stats-flush-interval-duration is set, "
-        "then --stats-sinks must also be set");
+        "then --stats-sinks must also be set (or --worker-series)");
   }
 
   TCLAP_SET_IF_SPECIFIED(requests_per_second, requests_per_second_);
@@ -663,6 +677,7 @@ OptionsImpl::OptionsImpl(int argc, const char* const* argv) {
   }
   TCLAP_SET_IF_SPECIFIED(labels, labels_);
   TCLAP_SET_IF_SPECIFIED(simple_warmup, simple_warmup_);
+  TCLAP_SET_IF_SPECIFIED(worker_series, worker_series_);
   TCLAP_SET_IF_SPECIFIED(no_duration, no_duration_);
   if (stats_sinks.isSet()) {
     for (const std::string& stats_sink : stats_sinks.getValue()) {
@@ -1036,6 +1051,8 @@ OptionsImpl::OptionsImpl(const nighthawk::client::CommandLineOptions& options) {
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(options, stats_flush_interval, stats_flush_interval_);
   // FORK-ONLY (We-Amp): live snapshot streaming opt-in.
   live_streaming_ = options.has_live_streaming();
+  // FORK-ONLY (We-Amp) NH1: the per-worker series opt-in.
+  worker_series_ = PROTOBUF_GET_WRAPPED_OR_DEFAULT(options, worker_series, worker_series_);
   if (options.has_stats_flush_interval_duration()) {
     stats_flush_interval_duration_ = options.stats_flush_interval_duration();
   }
@@ -1337,6 +1354,11 @@ CommandLineOptionsPtr OptionsImpl::toCommandLineOptionsInternal() const {
   // FORK-ONLY (We-Amp): live snapshot streaming opt-in.
   if (live_streaming_) {
     command_line_options->mutable_live_streaming();
+  }
+  // FORK-ONLY (We-Amp) NH1: emitted only when opted in, so a run without it
+  // serializes exactly as before.
+  if (worker_series_) {
+    command_line_options->mutable_worker_series()->set_value(true);
   }
   command_line_options->mutable_latency_response_header_name()->set_value(
       latency_response_header_name_);

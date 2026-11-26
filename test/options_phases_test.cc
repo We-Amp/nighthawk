@@ -203,7 +203,8 @@ TEST(OptionsPhasesTest, PhaseSpecIsWhitelistWithoutProtocolTlsUri) {
   }
   EXPECT_THAT(field_names,
               testing::ElementsAre("name", "duration", "requests_per_second", "concurrency",
-                                   "connections", "max_pending_requests", "max_active_requests"));
+                                   "connections", "max_pending_requests", "max_active_requests",
+                                   "worker_weights"));
 }
 
 // One phase is legacy-equivalent: it parses without top-level
@@ -357,6 +358,137 @@ TEST(OptionsPhasesTest, CliPhasesFlagRejectsMalformedVectors) {
                                         "http://127.0.0.1/"};
     EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(argv), MalformedArgvException, message);
   }
+}
+
+// --- NH1: per-worker rate weights ------------------------------------------
+
+// The single split rule: the even split keeps the engine's remainder and
+// floor behaviour, and a weighted split is exact.
+TEST(OptionsPhasesTest, PerWorkerRatesEvenSplitKeepsRemainderAndFloor) {
+  EXPECT_THAT(perWorkerRates(1800, 16, {}),
+              testing::ElementsAre(113, 113, 113, 113, 113, 113, 113, 113, 112, 112, 112, 112, 112,
+                                   112, 112, 112));
+  EXPECT_THAT(perWorkerRates(1000, 4, {}), testing::ElementsAre(250, 250, 250, 250));
+  // Below the worker count: 1 rps per worker (the floor).
+  EXPECT_THAT(perWorkerRates(3, 4, {}), testing::ElementsAre(1, 1, 1, 1));
+}
+
+TEST(OptionsPhasesTest, PerWorkerRatesWeightedSplitIsExact) {
+  const std::vector<uint32_t> hot_one{5, 1, 1, 1};
+  EXPECT_THAT(perWorkerRates(800, 4, hot_one), testing::ElementsAre(500, 100, 100, 100));
+  const std::vector<uint32_t> three_to_one{3, 1};
+  EXPECT_THAT(perWorkerRates(80, 2, three_to_one), testing::ElementsAre(60, 20));
+  // The rule is per worker, not rps % sum: 2 x 2 / 4 = 1 each.
+  const std::vector<uint32_t> two_two{2, 2};
+  EXPECT_THAT(perWorkerRates(2, 2, two_two), testing::ElementsAre(1, 1));
+}
+
+TEST(OptionsPhasesTest, CheckWeightedSplitRefusesFractionsAndZeroWeights) {
+  const std::vector<uint32_t> three_to_one{3, 1};
+  EXPECT_TRUE(checkWeightedSplit(80, three_to_one).ok());
+  const absl::Status fraction = checkWeightedSplit(10, three_to_one);
+  EXPECT_FALSE(fraction.ok());
+  EXPECT_THAT(std::string(fraction.message()),
+              testing::HasSubstr("does not split into whole per-worker rates"));
+  EXPECT_THAT(std::string(fraction.message()), testing::HasSubstr("worker 0 would get 10 x 3 / 4"));
+  const std::vector<uint32_t> zero{2, 0};
+  EXPECT_THAT(std::string(checkWeightedSplit(10, zero).message()),
+              testing::HasSubstr("worker_weights[1] is 0"));
+  EXPECT_FALSE(checkWeightedSplit(10, {}).ok());
+}
+
+TEST(OptionsPhasesTest, WorkerWeightsValidateAndRoundTrip) {
+  nighthawk::client::CommandLineOptions cmd = makeOptionsWithPhases(2);
+  cmd.mutable_phases(0)->set_requests_per_second(80);
+  cmd.mutable_phases(0)->mutable_concurrency()->set_value("2");
+  cmd.mutable_phases(0)->add_worker_weights(3);
+  cmd.mutable_phases(0)->add_worker_weights(1);
+  // Phase 1 declares no concurrency: it inherits the maximum (2), so two
+  // weights are right for it as well.
+  cmd.mutable_phases(1)->set_requests_per_second(60);
+  cmd.mutable_phases(1)->add_worker_weights(1);
+  cmd.mutable_phases(1)->add_worker_weights(2);
+  ASSERT_TRUE(validatePhaseVector(cmd).ok()) << validatePhaseVector(cmd);
+  OptionsImpl options(cmd);
+  ASSERT_EQ(2, options.phases().size());
+  EXPECT_THAT(options.phases()[0].worker_weights(), testing::ElementsAre(3, 1));
+  CommandLineOptionsPtr serialized = options.toCommandLineOptions();
+  EXPECT_THAT(serialized->phases(1).worker_weights(), testing::ElementsAre(1, 2));
+}
+
+TEST(OptionsPhasesTest, WorkerWeightsRejectedWhenTheyDoNotFit) {
+  const auto weighted = [](uint32_t rps, std::vector<uint32_t> weights, const char* concurrency) {
+    nighthawk::client::CommandLineOptions cmd = makeOptionsWithPhases(1);
+    cmd.mutable_phases(0)->set_requests_per_second(rps);
+    if (concurrency != nullptr) {
+      cmd.mutable_phases(0)->mutable_concurrency()->set_value(concurrency);
+    }
+    for (const uint32_t weight : weights) {
+      cmd.mutable_phases(0)->add_worker_weights(weight);
+    }
+    return validatePhaseVector(cmd);
+  };
+  // The count must equal the phase's worker count.
+  EXPECT_THAT(std::string(weighted(90, {1, 1, 1}, "2").message()),
+              testing::HasSubstr("phase[0]: worker_weights has 3 entries; it must have one per "
+                                 "worker of the phase (2)"));
+  // No concurrency anywhere: the run uses one worker.
+  EXPECT_THAT(std::string(weighted(90, {1, 2}, nullptr).message()),
+              testing::HasSubstr("one per worker of the phase (1)"));
+  EXPECT_TRUE(weighted(90, {7}, nullptr).ok());
+  // Weights must be positive.
+  EXPECT_THAT(std::string(weighted(90, {1, 0}, "2").message()),
+              testing::HasSubstr("phase[0]: worker_weights[1] is 0"));
+  // No remainder rule: a split that is not whole is refused.
+  EXPECT_THAT(std::string(weighted(100, {1, 2}, "2").message()),
+              testing::HasSubstr("phase[0]: requests_per_second 100 does not split"));
+  // And through OptionsImpl (the proto path), the same error.
+  nighthawk::client::CommandLineOptions cmd = makeOptionsWithPhases(1);
+  cmd.mutable_phases(0)->set_requests_per_second(100);
+  cmd.mutable_phases(0)->mutable_concurrency()->set_value("2");
+  cmd.mutable_phases(0)->add_worker_weights(1);
+  cmd.mutable_phases(0)->add_worker_weights(2);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(cmd), MalformedArgvException,
+                          "phase\\[0\\].*does not split into whole per-worker rates");
+}
+
+// The CLI --phases JSON carries worker_weights as a plain JSON array.
+TEST(OptionsPhasesTest, CliPhasesFlagParsesWorkerWeights) {
+  std::unique_ptr<OptionsImpl> options = TestUtility::createOptionsImpl(std::vector<const char*>{
+      "nighthawk_client", "--phases",
+      R"json([{"name":"hot","duration":"5s","requests_per_second":800,"concurrency":"4",)json"
+      R"json("worker_weights":[5,1,1,1]}])json",
+      "http://127.0.0.1/"});
+  ASSERT_EQ(1, options->phases().size());
+  EXPECT_THAT(options->phases()[0].worker_weights(), testing::ElementsAre(5, 1, 1, 1));
+  const std::vector<const char*> uneven{
+      "nighthawk_client", "--phases",
+      R"json([{"name":"hot","duration":"5s","requests_per_second":801,"concurrency":"4",)json"
+      R"json("worker_weights":[5,1,1,1]}])json",
+      "http://127.0.0.1/"};
+  EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(uneven), MalformedArgvException,
+                          "phase\\[0\\]: requests_per_second 801 does not split");
+}
+
+// --worker-series sets the opt-in and survives the proto round trip; absent,
+// nothing is serialized.
+TEST(OptionsPhasesTest, CliWorkerSeriesFlagRoundTrips) {
+  std::unique_ptr<OptionsImpl> off = TestUtility::createOptionsImpl(
+      std::vector<const char*>{"nighthawk_client", "http://127.0.0.1/"});
+  EXPECT_FALSE(off->workerSeriesEnabled());
+  EXPECT_FALSE(off->toCommandLineOptions()->has_worker_series());
+  std::unique_ptr<OptionsImpl> on = TestUtility::createOptionsImpl(
+      std::vector<const char*>{"nighthawk_client", "--worker-series", "http://127.0.0.1/"});
+  EXPECT_TRUE(on->workerSeriesEnabled());
+  CommandLineOptionsPtr serialized = on->toCommandLineOptions();
+  ASSERT_TRUE(serialized->has_worker_series());
+  EXPECT_TRUE(serialized->worker_series().value());
+  EXPECT_TRUE(OptionsImpl(*serialized).workerSeriesEnabled());
+  // The series cadence is the flush interval, so --worker-series admits
+  // --stats-flush-interval without a stats sink.
+  std::unique_ptr<OptionsImpl> cadence = TestUtility::createOptionsImpl(std::vector<const char*>{
+      "nighthawk_client", "--worker-series", "--stats-flush-interval", "1", "http://127.0.0.1/"});
+  EXPECT_EQ(1, cadence->statsFlushInterval());
 }
 
 } // namespace Client

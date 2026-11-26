@@ -79,5 +79,10 @@ void OutputCollectorImpl::addPhaseMetadata(nighthawk::client::PhaseMetadata meta
   *output_.add_phase_metadata() = std::move(metadata);
 }
 
+// FORK-ONLY (We-Amp) NH1: one per-worker series point.
+void OutputCollectorImpl::addWorkerSeriesPoint(nighthawk::client::WorkerLiveSnapshot point) {
+  *output_.add_worker_series() = std::move(point);
+}
+
 } // namespace Client
 } // namespace Nighthawk

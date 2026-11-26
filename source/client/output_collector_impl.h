@@ -34,6 +34,7 @@ public:
                  absl::string_view phase_id) override;
   // FORK-ONLY (We-Amp): per-phase metadata (M2 A1).
   void addPhaseMetadata(nighthawk::client::PhaseMetadata metadata) override;
+  void addWorkerSeriesPoint(nighthawk::client::WorkerLiveSnapshot point) override;
   void setOutput(const nighthawk::client::Output& output) override { output_ = output; }
 
   nighthawk::client::Output toProto() const override;

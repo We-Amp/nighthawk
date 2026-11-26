@@ -35,8 +35,19 @@ namespace Client {
 //   fix). Without an order set, any new stamp advances (legacy behavior).
 // Counters are cumulative from run start, so their per-worker latests fold
 // safely across stamps and the counter sums stay monotonic.
+// FORK-ONLY (We-Amp) NH1: one worker partial as a point of the per-worker
+// series (the public WorkerLiveSnapshot shape). Pure.
+nighthawk::client::WorkerLiveSnapshot
+ToWorkerLiveSnapshot(const nighthawk::client::WorkerLiveSnapshotPartial& partial);
+
 class LivePartialAggregator {
 public:
+  // FORK-ONLY (We-Amp) NH1: when true, every snapshot also carries the
+  // latest point of every worker that has reported one
+  // (LiveSnapshot.workers), in worker-id order. Off by default: the
+  // snapshot is then exactly what it was before.
+  void setIncludeWorkers(bool include_workers) { include_workers_ = include_workers; }
+
   // Sets the run's phase ids in order; latest_phase_id_ then advances only
   // to a LATER entry. Call before the first partial (ProcessImpl does, for
   // multi-phase runs; empty order keeps the legacy advance-on-new-stamp
@@ -77,7 +88,11 @@ private:
     std::string phase_id;
     std::string epoch_id;
     std::map<std::string, nighthawk::client::StatisticSnapshot> statistics;
+    // NH1: the latest partial's clock pair.
+    int64_t monotonic_ns{0};
+    int64_t wall_time_unix_ns{0};
   };
+  bool include_workers_{false};
   std::vector<std::string> phase_order_;
   std::map<uint32_t, absl::flat_hash_map<std::string, uint64_t>> worker_counter_values_;
   std::map<uint32_t, WorkerState> worker_states_;

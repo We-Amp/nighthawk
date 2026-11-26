@@ -130,6 +130,11 @@ struct LiveFanOutContext {
   std::function<absl::Status(Envoy::MonotonicTime)> bend_instant_admissible;
   std::function<uint32_t()> current_phase_index;
   std::function<uint32_t()> active_worker_count;
+  // FORK-ONLY (We-Amp) NH1: the current phase's worker_weights; empty (or an
+  // unset function) means the even split. A weighted phase splits every
+  // live rps and ramp target by these weights, and refuses a value that
+  // does not split into whole per-worker rates.
+  std::function<std::vector<uint32_t>()> current_phase_worker_weights;
   std::function<absl::StatusOr<LiveCapabilityEntry>(int worker_id, uint32_t phase_index)>
       capability_for_phase;
   // The current phase's declared schedule (the per-phase rps inheritance
@@ -443,6 +448,9 @@ private:
   absl::Status bendInstantAdmissibleForUpdate(Envoy::MonotonicTime t_bend) const;
   uint32_t currentPhaseIndexForUpdate() const;
   uint32_t activeWorkerCountForUpdate() const;
+  // FORK-ONLY (We-Amp) NH1: the current phase's worker_weights (empty for an
+  // evenly split phase and for legacy runs).
+  std::vector<uint32_t> currentPhaseWorkerWeightsForUpdate() const;
   LiveKnobDelta currentPhaseScheduleDelta() const;
   bool fanOutBegin();
   void fanOutEnd();
@@ -509,6 +517,14 @@ private:
   int64_t run_start_monotonic_ns_{0};
   std::mutex live_partials_mutex_;
   std::vector<nighthawk::client::WorkerLiveSnapshotPartial> live_partials_;
+  // FORK-ONLY (We-Amp) NH1: every per-worker series point of the run (only
+  // when the run opted in), in arrival order; sorted into the Output at the
+  // run's end.
+  std::mutex worker_series_mutex_;
+  std::vector<nighthawk::client::WorkerLiveSnapshot> worker_series_points_;
+  // FORK-ONLY (We-Amp) NH1: per phase, the rate each active worker was begun
+  // at (the split the phase-begin loop computed), for the phase metadata.
+  std::vector<std::vector<uint32_t>> phase_worker_rps_;
   // FORK-ONLY (We-Amp): running fold of the drained partials. Honors the
   // snapshot-acquisition-vs-slab-swap seam (M2 A1): statistics never fold
   // across phase stamps; counters stay cumulative. See

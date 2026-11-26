@@ -9,6 +9,20 @@
 namespace Nighthawk {
 namespace Client {
 
+nighthawk::client::WorkerLiveSnapshot
+ToWorkerLiveSnapshot(const nighthawk::client::WorkerLiveSnapshotPartial& partial) {
+  nighthawk::client::WorkerLiveSnapshot point;
+  point.set_worker_id(partial.worker_id());
+  point.set_phase_id(partial.phase_id());
+  point.set_epoch_id(partial.epoch_id());
+  point.set_monotonic_ns(partial.monotonic_ns());
+  point.set_wall_time_unix_ns(partial.wall_time_unix_ns());
+  *point.mutable_counters() = partial.counters();
+  *point.mutable_statistics() = partial.statistics();
+  point.set_run_end(partial.run_end());
+  return point;
+}
+
 void LivePartialAggregator::setPhaseOrder(std::vector<std::string> phase_order) {
   phase_order_ = std::move(phase_order);
 }
@@ -56,6 +70,8 @@ void LivePartialAggregator::addPartial(nighthawk::client::WorkerLiveSnapshotPart
       latest_phase_id_ = partial.phase_id();
     }
   }
+  worker_state.monotonic_ns = partial.monotonic_ns();
+  worker_state.wall_time_unix_ns = partial.wall_time_unix_ns();
   auto& counter_values = worker_counter_values_[partial.worker_id()];
   for (const auto& [name, value] : partial.counters()) {
     counter_values[name] = value;
@@ -144,6 +160,28 @@ nighthawk::client::LiveSnapshot LivePartialAggregator::snapshot() {
         merged->set_p50_ns(std::max(merged->p50_ns(), stat.p50_ns()));
         merged->set_p90_ns(std::max(merged->p90_ns(), stat.p90_ns()));
         merged->set_p99_ns(std::max(merged->p99_ns(), stat.p99_ns()));
+      }
+    }
+  }
+  // NH1: the per-worker view, unmerged: each worker's latest counters and
+  // its own current-slab statistics, in worker-id order (both maps are
+  // ordered by worker id).
+  if (include_workers_) {
+    for (const auto& [worker_id, worker_state] : worker_states_) {
+      nighthawk::client::WorkerLiveSnapshot* point = snapshot.add_workers();
+      point->set_worker_id(worker_id);
+      point->set_phase_id(worker_state.phase_id);
+      point->set_epoch_id(worker_state.epoch_id);
+      point->set_monotonic_ns(worker_state.monotonic_ns);
+      point->set_wall_time_unix_ns(worker_state.wall_time_unix_ns);
+      const auto counters = worker_counter_values_.find(worker_id);
+      if (counters != worker_counter_values_.end()) {
+        for (const auto& [name, value] : counters->second) {
+          (*point->mutable_counters())[name] = value;
+        }
+      }
+      for (const auto& [id, stat] : worker_state.statistics) {
+        *point->add_statistics() = stat;
       }
     }
   }

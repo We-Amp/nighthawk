@@ -47,6 +47,9 @@ public:
   // FORK-ONLY (We-Amp): appends one phase's metadata (spec 8.2/8.4/8.6) to
   // the output, in phase order.
   virtual void addPhaseMetadata(nighthawk::client::PhaseMetadata metadata) PURE;
+  // FORK-ONLY (We-Amp) NH1: appends one point of the per-worker series to the
+  // output (callers add them ordered by worker id, then by time).
+  virtual void addWorkerSeriesPoint(nighthawk::client::WorkerLiveSnapshot point) PURE;
   /**
    * Directly sets the output value.
    *

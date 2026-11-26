@@ -34,6 +34,7 @@ envoy_cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -134,6 +135,7 @@ envoy_cc_library(
         ":live_partial_aggregator_lib",
         ":live_update_validator_lib",
         ":options_impl_lib",
+        ":options_validation_phases_lib",
         ":output_collector_impl_lib",
         ":phase_orchestrator_lib",
         ":output_formatter_impl_lib",

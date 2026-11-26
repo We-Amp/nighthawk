@@ -153,12 +153,23 @@ message PhaseSpec {
   google.protobuf.UInt32Value connections = 5; // per-phase connection target (gate input)
   google.protobuf.UInt32Value max_pending_requests = 6; // per-phase client-side gate
   google.protobuf.UInt32Value max_active_requests = 7; // per-phase client-side gate
+  // FORK-ONLY (We-Amp): per-worker rate weights (NH1). Empty (the default)
+  // keeps the even split. When set, the phase's requests_per_second is split
+  // across its active workers in proportion to these weights: worker i paces
+  // requests_per_second x w_i / sum(w). Validation: every weight is >= 1, the
+  // count equals the phase's worker count (its concurrency; a phase without
+  // concurrency uses the maximum declared over the phases, or 1), and every
+  // worker's share is a whole number (no remainder rule applies: a vector that
+  // does not divide evenly is refused). A live rps or ramp-target change on a
+  // weighted phase splits by the same weights and is refused unless it also
+  // divides evenly.
+  repeated uint32 worker_weights = 8;
 }
 
 // TODO(oschaaf): Ultimately this will be a load test specification. The fact that it
 // can arrive via CLI is just a concrete detail. Change this to reflect that.
-// Next unused number is 122. (Field 911 is reserved FORK-ONLY (We-Amp): see
-// the live_streaming field below.)
+// Next unused number is 122. (Fields 911 and 912 are reserved FORK-ONLY
+// (We-Amp): see the live_streaming and worker_series fields below.)
 message CommandLineOptions {
   // The target requests-per-second rate. Default: 5.
   google.protobuf.UInt32Value requests_per_second = 1
@@ -377,4 +388,13 @@ message CommandLineOptions {
   // free upstream. Presence of this message opts a run in to live snapshot
   // streaming over ExecutionStream.
   nighthawk.client.LiveStreamingOptions live_streaming = 911;
+
+  // FORK-ONLY (We-Amp): rebase check - field number 912 is fork-specific and
+  // free upstream (NH1). True opts the run in to the per-worker series: every
+  // worker computes a point (its cumulative counters and its current phase's
+  // latency statistics) at the stats flush cadence; the points land in the
+  // Output's worker_series and, on a live-streaming run, the latest point per
+  // worker rides on every LiveSnapshot.workers. Absent or false keeps the
+  // client's behaviour unchanged.
+  google.protobuf.BoolValue worker_series = 912;
 }

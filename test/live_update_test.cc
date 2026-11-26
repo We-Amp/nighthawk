@@ -1558,6 +1558,7 @@ public:
     };
     context.current_phase_index = [this]() { return phase_index_; };
     context.active_worker_count = [this]() { return static_cast<uint32_t>(workers_.size()); };
+    context.current_phase_worker_weights = [this]() { return weights_; };
     context.capability_for_phase = [this](int worker_id, uint32_t) -> absl::StatusOr<LiveCapabilityEntry> {
       if (missing_worker_.has_value() && worker_id == *missing_worker_) {
         return absl::NotFoundError(
@@ -1607,6 +1608,8 @@ public:
   absl::Status bend_admissible_status_ = absl::OkStatus();
   uint32_t phase_index_ = 0;
   LiveKnobDelta declared_schedule_;
+  // NH1: the current phase's worker_weights (empty = the even split).
+  std::vector<uint32_t> weights_;
   bool updates_enabled_ = true;
   Envoy::MonotonicTime fake_now_;
   int in_flight_fan_outs_ = 0;
@@ -1731,6 +1734,84 @@ TEST_F(LiveCapabilityFanOutTest, BendDeltaRemainderGoesToLowestWorkerIndexes) {
     ASSERT_TRUE(workers_[i]->applies[1].delta.ramp->ramp_time.has_value());
     EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->ramp_time, std::chrono::seconds(5));
   }
+}
+
+// NH1: on a weighted phase the bend splits by the phase's worker_weights,
+// the rps knob and the ramp target alike (40 by [2, 1, 1] is 20/10/10).
+TEST_F(LiveCapabilityFanOutTest, WeightedPhaseBendSplitsByWeights) {
+  for (int i = 0; i < 3; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  weights_ = {2, 1, 1};
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result =
+      applier.ApplyDeltas(RpsRequest(40), "epoch-1", bend_instant, Deadline());
+  ASSERT_TRUE(result.applied()) << result.rejection_reason();
+  EXPECT_EQ(*workers_[0]->applies[0].delta.new_rps, 20u);
+  EXPECT_EQ(*workers_[1]->applies[0].delta.new_rps, 10u);
+  EXPECT_EQ(*workers_[2]->applies[0].delta.new_rps, 10u);
+
+  UpdateRequest ramp_bend;
+  nighthawk::client::RampShapeDelta* ramp_delta = ramp_bend.add_deltas()->mutable_ramp();
+  ramp_delta->mutable_ramp_time()->set_seconds(5);
+  ramp_delta->mutable_target_rps()->set_value(80);
+  const EngineInstant second_instant{2000, fake_now_.time_since_epoch().count() + 1000000000};
+  const UpdateResult ramp_result =
+      applier.ApplyDeltas(ramp_bend, "epoch-2", second_instant, Deadline());
+  ASSERT_TRUE(ramp_result.applied()) << ramp_result.rejection_reason();
+  const uint32_t expected_targets[3] = {40u, 20u, 20u};
+  for (size_t i = 0; i < workers_.size(); i++) {
+    ASSERT_EQ(workers_[i]->applies.size(), 2u);
+    EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->target_rps, expected_targets[i]);
+    EXPECT_EQ(*workers_[i]->applies[1].delta.ramp->ramp_time, std::chrono::seconds(5));
+  }
+}
+
+// NH1: a weighted bend that does not split into whole per-worker rates is
+// refused before a single post (no remainder rule for weighted phases).
+TEST_F(LiveCapabilityFanOutTest, WeightedPhaseBendRefusesFractionalSplit) {
+  for (int i = 0; i < 3; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  weights_ = {2, 1, 1};
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result =
+      applier.ApplyDeltas(RpsRequest(42), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("weighted phase: live rps:"));
+  EXPECT_THAT(result.rejection_reason(), HasSubstr("does not split into whole per-worker rates"));
+  EXPECT_TRUE(post_order_.empty()) << "a refused weighted bend must not reach any worker";
+
+  UpdateRequest ramp_bend;
+  ramp_bend.add_deltas()->mutable_ramp()->mutable_target_rps()->set_value(42);
+  const UpdateResult ramp_result =
+      applier.ApplyDeltas(ramp_bend, "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(ramp_result.applied());
+  EXPECT_THAT(ramp_result.rejection_reason(), HasSubstr("weighted phase: ramp target:"));
+  EXPECT_TRUE(post_order_.empty());
+}
+
+// NH1: the rollback of a weighted phase restores each worker's WEIGHTED
+// share of the prior schedule (40 by [3, 1] is 30 for worker 0).
+TEST_F(LiveCapabilityFanOutTest, WeightedPhaseRollbackRestoresWeightedShares) {
+  for (int i = 0; i < 2; i++) {
+    workers_.push_back(std::make_unique<FakeFanOutWorker>());
+  }
+  weights_ = {3, 1};
+  declared_schedule_.new_rps = 40;
+  workers_[1]->apply_ok = false;
+  workers_[1]->apply_status = absl::InternalError("limiter cannot honor the delta");
+  LiveCapabilityFanOutApplier applier(MakeContext());
+  const EngineInstant bend_instant{1000, fake_now_.time_since_epoch().count()};
+  const UpdateResult result =
+      applier.ApplyDeltas(RpsRequest(80), "epoch-1", bend_instant, Deadline());
+  ASSERT_FALSE(result.applied());
+  ASSERT_EQ(workers_[0]->applies.size(), 2u);
+  EXPECT_EQ(*workers_[0]->applies[0].delta.new_rps, 60u);
+  EXPECT_EQ(*workers_[0]->applies[1].delta.new_rps, 30u) << "the weighted prior share";
+  EXPECT_EQ(*workers_[1]->applies[0].delta.new_rps, 20u);
 }
 
 // A single-worker phase is the identity: the declared global rate IS the

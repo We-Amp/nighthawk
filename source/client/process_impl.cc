@@ -52,9 +52,11 @@
 
 #include "source/client/process_bootstrap.h"
 
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_replace.h"
 #include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_replace.h"
+#include "absl/types/span.h"
 
 // TODO(oschaaf): See if we can leverage a static module registration like Envoy does to avoid the
 // ifdefs in this file.
@@ -76,6 +78,7 @@
 #include "source/client/client_worker_impl.h"
 #include "source/client/factories_impl.h"
 #include "source/client/options_impl.h"
+#include "source/client/options_validation_phases.h"
 #include "source/client/sni_utility.h"
 
 #include "source/user_defined_output/user_defined_output_plugin_creator.h"
@@ -834,9 +837,13 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
   // FORK-ONLY (We-Amp): when live snapshot streaming is opted in, workers
   // compute immutable partials on their own dispatcher threads and hand them
   // to this process, which aggregates them into LiveSnapshots.
+  // FORK-ONLY (We-Amp) NH1: the per-worker series uses the same partials at
+  // the same cadence, so it turns them on as well (a series-only run folds
+  // nothing into live snapshots: see recordLiveSnapshotPartial).
   std::function<void(nighthawk::client::WorkerLiveSnapshotPartial)> live_partial_cb;
   std::chrono::milliseconds live_snapshot_interval{0};
-  if (options_.liveStreamingEnabled()) {
+  live_aggregator_.setIncludeWorkers(options_.workerSeriesEnabled());
+  if (options_.liveStreamingEnabled() || options_.workerSeriesEnabled()) {
     live_partial_cb = [this](nighthawk::client::WorkerLiveSnapshotPartial partial) {
       recordLiveSnapshotPartial(std::move(partial));
     };
@@ -892,7 +899,15 @@ absl::Status ProcessImpl::createWorkers(const uint32_t concurrency,
 }
 
 void ProcessImpl::recordLiveSnapshotPartial(nighthawk::client::WorkerLiveSnapshotPartial partial) {
-  {
+  // FORK-ONLY (We-Amp) NH1: every partial is a point of the per-worker series
+  // when the run opted in; only the live-streaming run folds partials into
+  // snapshots, and never a worker's run-end point (no partial may reach the
+  // live fold after the run's end).
+  if (options_.workerSeriesEnabled()) {
+    std::lock_guard<std::mutex> lock(worker_series_mutex_);
+    worker_series_points_.push_back(ToWorkerLiveSnapshot(partial));
+  }
+  if (options_.liveStreamingEnabled() && !partial.run_end()) {
     std::lock_guard<std::mutex> lock(live_partials_mutex_);
     live_partials_.push_back(std::move(partial));
   }
@@ -962,15 +977,19 @@ constexpr absl::Duration kLiveUpdateFenceDrainBound = absl::Seconds(8);
 // at this one point, so a no-op bend at the declared rps is a true no-op on
 // every worker and a rollback restores each worker's true per-worker
 // operating point (never the full global value re-applied N times).
+//
+// FORK-ONLY (We-Amp) NH1: a weighted phase divides by its worker_weights
+// instead (perWorkerRates, the one split rule); the fan-out refuses a delta
+// that does not split into whole rates before it reaches this point.
 LiveKnobDelta PerWorkerDelta(const LiveKnobDelta& global_delta, uint32_t worker_id,
-                             uint32_t active_workers) {
+                             uint32_t active_workers, absl::Span<const uint32_t> weights) {
   ASSERT(active_workers > 0);
   ASSERT(worker_id < active_workers);
   LiveKnobDelta per_worker = global_delta;
-  const auto divide = [worker_id, active_workers](uint32_t declared) -> uint32_t {
-    const uint32_t base = declared / active_workers;
-    const uint32_t remainder = declared % active_workers;
-    return base > 0 ? base + (worker_id < remainder ? 1u : 0u) : 1u;
+  const auto divide = [worker_id, active_workers, weights](uint32_t declared) -> uint32_t {
+    return perWorkerRates(
+        declared, active_workers,
+        weights.size() == active_workers ? weights : absl::Span<const uint32_t>())[worker_id];
   };
   if (per_worker.new_rps.has_value()) {
     per_worker.new_rps = divide(*per_worker.new_rps);
@@ -1106,6 +1125,37 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
   // single post: never a silent skip, never a mutation through a dead
   // handle.
   const uint32_t active_workers = context_.active_worker_count();
+  // FORK-ONLY (We-Amp) NH1: a weighted phase splits the delta by its
+  // weights, and only into whole per-worker rates (the owner's rule: no
+  // fractional or remainder splits). A delta that does not divide is
+  // refused before a single post.
+  const std::vector<uint32_t> weights = context_.current_phase_worker_weights != nullptr
+                                            ? context_.current_phase_worker_weights()
+                                            : std::vector<uint32_t>();
+  if (!weights.empty()) {
+    if (weights.size() != active_workers) {
+      return reject(absl::StrCat("the phase declares ", weights.size(), " worker weights for ",
+                                 active_workers, " active workers"));
+    }
+    const auto check = [&weights](absl::string_view knob, uint32_t value) -> absl::Status {
+      const absl::Status split = checkWeightedSplit(value, weights);
+      if (!split.ok()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("weighted phase: ", knob, " ", split.message()));
+      }
+      return absl::OkStatus();
+    };
+    if (delta.new_rps.has_value()) {
+      if (absl::Status split = check("live rps:", *delta.new_rps); !split.ok()) {
+        return reject(split.message());
+      }
+    }
+    if (delta.ramp.has_value() && delta.ramp->target_rps.has_value()) {
+      if (absl::Status split = check("ramp target:", *delta.ramp->target_rps); !split.ok()) {
+        return reject(split.message());
+      }
+    }
+  }
   std::vector<LiveCapabilityEntry> entries;
   entries.reserve(active_workers);
   for (uint32_t worker_id = 0; worker_id < active_workers; ++worker_id) {
@@ -1140,7 +1190,8 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
     // Task 8a: the delta is GLOBAL; each worker is posted its own share (the
     // phase-begin division), so a no-op bend at the declared rps re-arms
     // every worker at exactly the rate it is already pacing.
-    entries[worker_id].apply(t_bend, epoch_id, PerWorkerDelta(delta, worker_id, active_workers),
+    entries[worker_id].apply(t_bend, epoch_id,
+                             PerWorkerDelta(delta, worker_id, active_workers, weights),
                              stage_cb(worker_id), apply_cb(worker_id));
   }
 
@@ -1311,9 +1362,9 @@ nighthawk::client::UpdateResult LiveCapabilityFanOutApplier::ApplyDeltas(
         if (!outcome.status.ok()) {
           continue; // never mutated: nothing to roll back
         }
-        entries[outcome.worker_id].apply(t_r, prior_epoch,
-                                         PerWorkerDelta(prior, outcome.worker_id, active_workers),
-                                         rollback_stage, rollback_cb(outcome.worker_id));
+        entries[outcome.worker_id].apply(
+            t_r, prior_epoch, PerWorkerDelta(prior, outcome.worker_id, active_workers, weights),
+            rollback_stage, rollback_cb(outcome.worker_id));
         rolled_back_workers.push_back(outcome.worker_id);
       }
       std::string rollback_failures;
@@ -1470,6 +1521,18 @@ uint32_t ProcessImpl::activeWorkerCountForUpdate() const {
   return active_worker_count_;
 }
 
+std::vector<uint32_t> ProcessImpl::currentPhaseWorkerWeightsForUpdate() const {
+  if (!options_.hasPhaseVector()) {
+    return {};
+  }
+  const uint32_t phase_index = currentPhaseIndexForUpdate();
+  if (phase_index >= options_.phases().size()) {
+    return {};
+  }
+  const auto& weights = options_.phases()[phase_index].worker_weights();
+  return {weights.begin(), weights.end()};
+}
+
 LiveKnobDelta ComputeCurrentScheduleDelta(const Client::Options& options,
                                           const uint32_t active_workers,
                                           const uint32_t current_phase_index,
@@ -1571,6 +1634,7 @@ std::unique_ptr<LiveUpdateApplier> ProcessImpl::MakeLiveUpdateApplier() {
   };
   context.current_phase_index = [this]() { return currentPhaseIndexForUpdate(); };
   context.active_worker_count = [this]() { return activeWorkerCountForUpdate(); };
+  context.current_phase_worker_weights = [this]() { return currentPhaseWorkerWeightsForUpdate(); };
   context.capability_for_phase = [this](int worker_id, uint32_t phase_index) {
     return live_capability_registry_.CapabilityForPhase(worker_id, phase_index);
   };
@@ -1759,7 +1823,21 @@ void ProcessImpl::runPhases() {
     const uint32_t declared_rps = phase.requests_per_second();
     const uint32_t rps_base = declared_rps / active_workers;
     const uint32_t rps_remainder = declared_rps % active_workers;
-    if (rps_base == 0) {
+    // FORK-ONLY (We-Amp) NH1: a phase with worker_weights splits by weight
+    // (validation guaranteed one weight per active worker and whole
+    // per-worker rates); every other phase keeps the even split above.
+    const absl::Span<const uint32_t> weights(phase.worker_weights().data(),
+                                             phase.worker_weights_size());
+    const std::vector<uint32_t> worker_rps = perWorkerRates(declared_rps, active_workers, weights);
+    if (phase_worker_rps_.size() <= phase_index) {
+      phase_worker_rps_.resize(phase_index + 1);
+    }
+    phase_worker_rps_[phase_index] = worker_rps;
+    if (!weights.empty()) {
+      ENVOY_LOG(info, "phase {} ('{}'): {} rps over {} workers by weights [{}] = [{}]", phase_index,
+                phase.name(), declared_rps, active_workers, absl::StrJoin(weights, ","),
+                absl::StrJoin(worker_rps, ","));
+    } else if (rps_base == 0) {
       // FORK-ONLY (We-Amp): the 1-rps floor below offers more than declared;
       // say so once per phase.
       ENVOY_LOG(info,
@@ -1776,8 +1854,7 @@ void ProcessImpl::runPhases() {
     for (uint32_t w = 0; w < active_workers; ++w) {
       worker_begun_phases_[w].push_back(phase_index);
       nighthawk::client::PhaseSpec worker_phase = effective_phase;
-      worker_phase.set_requests_per_second(rps_base > 0 ? rps_base + (w < rps_remainder ? 1 : 0)
-                                                        : 1);
+      worker_phase.set_requests_per_second(worker_rps[w]);
       drain_acks.push_back(
           workers_[w]->beginPhaseAsync(phase_index, worker_phase, final_phase));
     }
@@ -2464,7 +2541,34 @@ bool ProcessImpl::runInternal(OutputCollector& collector, const UriPtr& tracing_
       for (uint32_t worker_number = 0; worker_number < phase_active_workers; ++worker_number) {
         *metadata.add_pool_health() = readWorkerPoolHealth(store_root_, worker_number);
       }
+      // FORK-ONLY (We-Amp) NH1: the per-worker rates this phase was begun at.
+      if (phase_index < phase_worker_rps_.size()) {
+        for (const uint32_t rate : phase_worker_rps_[phase_index]) {
+          metadata.add_worker_requests_per_second(rate);
+        }
+      }
       collector.addPhaseMetadata(std::move(metadata));
+    }
+  }
+  if (options_.workerSeriesEnabled()) {
+    // FORK-ONLY (We-Amp) NH1: the per-worker series, ordered by worker id and
+    // then by time. The workers are joined, so no point can still arrive.
+    std::vector<nighthawk::client::WorkerLiveSnapshot> points;
+    {
+      std::lock_guard<std::mutex> lock(worker_series_mutex_);
+      points = std::move(worker_series_points_);
+      worker_series_points_.clear();
+    }
+    std::stable_sort(points.begin(), points.end(),
+                     [](const nighthawk::client::WorkerLiveSnapshot& a,
+                        const nighthawk::client::WorkerLiveSnapshot& b) {
+                       if (a.worker_id() != b.worker_id()) {
+                         return a.worker_id() < b.worker_id();
+                       }
+                       return a.monotonic_ns() < b.monotonic_ns();
+                     });
+    for (nighthawk::client::WorkerLiveSnapshot& point : points) {
+      collector.addWorkerSeriesPoint(std::move(point));
     }
   }
   if (counters.find("sequencer.failed_terminations") == counters.end()) {

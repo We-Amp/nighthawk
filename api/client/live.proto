@@ -66,6 +66,38 @@ message LiveSnapshot {
   // split marker: a window straddling a marker-bearing snapshot is split at
   // it, the way M2 taught consumers to split at phase changes.
   bool epoch_changed = 7;
+  // FORK-ONLY (We-Amp) NH1: the latest point of every worker that has
+  // reported one, in worker-id order. Present only when the run opted in to
+  // the per-worker series (CommandLineOptions.worker_series); empty
+  // otherwise. Unlike `statistics` above, nothing here is merged: each entry
+  // is one worker's own view.
+  repeated WorkerLiveSnapshot workers = 8;
+}
+
+// FORK-ONLY (We-Amp) NH1: one worker's point of the per-worker series,
+// computed on that worker's dispatcher at the stats flush cadence.
+// - counters are the worker's own, cumulative from run start (for example
+//   upstream_rq_total, benchmark.http_2xx, upstream_cx_total and
+//   upstream_cx_destroy), with the same name normalization as the worker's
+//   final counters; counters still at zero are omitted.
+// - statistics are the worker's statistics of its current phase slab: counts
+//   and percentiles cover the phase so far, not the last interval.
+// - phase_id is the slab the statistics came from; a retired worker keeps
+//   its last phase's stamp.
+message WorkerLiveSnapshot {
+  uint32 worker_id = 1;
+  string phase_id = 2;
+  string epoch_id = 3;
+  // The worker's clock pair at computation time (steady clock and wall
+  // clock, nanoseconds), the same clocks LiveSnapshot uses.
+  int64 monotonic_ns = 4;
+  int64 wall_time_unix_ns = 5;
+  map<string, uint64> counters = 6;
+  repeated StatisticSnapshot statistics = 7;
+  // True on the worker's last point, computed once when its run ended: its
+  // counters are the worker's final values (the same as the worker_<i>
+  // result's), its statistics those of the last phase it ran.
+  bool run_end = 8;
 }
 
 // Internal: the immutable partial snapshot one worker computes on its own
@@ -87,6 +119,13 @@ message WorkerLiveSnapshotPartial {
   // serialized). Empty until the run's first applied change reaches this
   // worker's limiter.
   string epoch_id = 5;
+  // FORK-ONLY (We-Amp) NH1: the clock pair at computation time, stamped on
+  // the worker dispatcher (steady clock and wall clock, nanoseconds).
+  int64 monotonic_ns = 6;
+  int64 wall_time_unix_ns = 7;
+  // FORK-ONLY (We-Amp) NH1: the worker's last point, computed once when its
+  // run ended. Routed to the per-worker series only.
+  bool run_end = 8;
 }
 
 // FORK-ONLY (We-Amp): rebase check - fork-specific. One completed phase

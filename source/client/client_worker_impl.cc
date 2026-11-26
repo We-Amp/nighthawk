@@ -153,6 +153,11 @@ void ClientWorkerImpl::work() {
     live_snapshot_timer_->disableTimer();
     live_snapshot_timer_.reset();
   }
+  // FORK-ONLY (We-Amp) NH1: the worker's last series point, carrying its
+  // final cumulative counters and its last phase's statistics (read before
+  // the finalize below retires them into the slab). Series-only: the process
+  // never folds a run_end partial into a live snapshot.
+  emitLiveSnapshotPartial(/*run_end=*/true);
   if (phase_driven_run_) {
     // Fresh-per-phase statistics (M2 A1): retire the final phase's live set
     // into its slab, on this dispatcher, so the end-of-run fold can emit
@@ -193,12 +198,23 @@ void ClientWorkerImpl::setupLiveSnapshotTimer() {
   live_snapshot_timer_->enableTimer(live_snapshot_interval_);
 }
 
-void ClientWorkerImpl::emitLiveSnapshotPartial() {
+void ClientWorkerImpl::emitLiveSnapshotPartial(bool run_end) {
   if (live_snapshot_partial_cb_ == nullptr) {
     return;
   }
   nighthawk::client::WorkerLiveSnapshotPartial partial;
   partial.set_worker_id(worker_number_);
+  // FORK-ONLY (We-Amp) NH1: the computation instant, on this dispatcher's
+  // time source (the real time system's steady and system clocks in
+  // production, the same clocks the LiveSnapshot stamps use).
+  Envoy::TimeSource& time_source = dispatcher_->timeSource();
+  partial.set_monotonic_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               time_source.monotonicTime().time_since_epoch())
+                               .count());
+  partial.set_wall_time_unix_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    time_source.systemTime().time_since_epoch())
+                                    .count());
+  partial.set_run_end(run_end);
   // Stamp the partial with the phase id of the slab its statistics came from,
   // computed here on this dispatcher: the same dispatcher the benchmark
   // client swaps slabs on, so within this worker the stamp is always in sync

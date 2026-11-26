@@ -7,6 +7,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "envoy/config/core/v3/base.proto";
 
+import "api/client/live.proto";
 import "api/client/options.proto";
 
 message Counter {
@@ -142,6 +143,10 @@ message PhaseMetadata {
   // streamed boundary event carries the same mark live, this field keeps it
   // alive after the run (the post-run metadata rebuild's censoring source).
   bool drain_censored = 911;
+  // FORK-ONLY (We-Amp) NH1: the rate each active worker paced in this phase,
+  // in worker-id order (the even split with its remainder, or the
+  // worker_weights split). Their sum is the phase's offered rate.
+  repeated uint32 worker_requests_per_second = 912;
 }
 
 // The full set of output returned by a Nighthawk run, including the Results from every worker.
@@ -153,4 +158,8 @@ message Output {
   // FORK-ONLY (We-Amp): rebase check (fork-only fields >= 911). One entry per
   // phase, in phase order; empty for legacy single-phase runs.
   repeated PhaseMetadata phase_metadata = 911;
+  // FORK-ONLY (We-Amp) NH1: the per-worker series, present when the run
+  // opted in (CommandLineOptions.worker_series): every point every worker
+  // computed, ordered by worker id, then by time.
+  repeated WorkerLiveSnapshot worker_series = 912;
 }

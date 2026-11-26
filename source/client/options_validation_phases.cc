@@ -108,6 +108,31 @@ absl::Status validatePhaseVector(const nighthawk::client::CommandLineOptions& op
     }
   }
 
+  // NH1: per-worker rate weights. The count must match the phase's worker
+  // count (declared, else the maximum over the phases, else 1 -- the same
+  // rule determineConcurrency and computeWorkerSubsets apply), and the
+  // phase's rate must split into whole per-worker rates.
+  for (int i = 0; i < phase_count; ++i) {
+    const nighthawk::client::PhaseSpec& phase = options.phases(i);
+    if (phase.worker_weights().empty()) {
+      continue;
+    }
+    const uint32_t workers = declared_concurrency[i] > 0
+                                 ? declared_concurrency[i]
+                                 : (max_concurrency > 0 ? max_concurrency : 1);
+    if (static_cast<uint32_t>(phase.worker_weights_size()) != workers) {
+      return phaseError(i, absl::StrCat("worker_weights has ", phase.worker_weights_size(),
+                                        " entries; it must have one per worker of the phase (",
+                                        workers, ")"));
+    }
+    const absl::Status split = checkWeightedSplit(
+        phase.requests_per_second(),
+        absl::MakeConstSpan(phase.worker_weights().data(), phase.worker_weights_size()));
+    if (!split.ok()) {
+      return phaseError(i, split.message());
+    }
+  }
+
   // Names must be unique across the vector.
   absl::flat_hash_set<std::string> seen;
   for (int i = 0; i < phase_count; ++i) {
@@ -118,6 +143,54 @@ absl::Status validatePhaseVector(const nighthawk::client::CommandLineOptions& op
   }
 
   return absl::OkStatus();
+}
+
+absl::Status checkWeightedSplit(uint32_t rps, absl::Span<const uint32_t> weights) {
+  if (weights.empty()) {
+    return absl::InvalidArgumentError("worker_weights must not be empty");
+  }
+  uint64_t sum = 0;
+  for (size_t w = 0; w < weights.size(); ++w) {
+    if (weights[w] < 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("worker_weights[", w, "] is 0; every weight must be >= 1"));
+    }
+    sum += weights[w];
+  }
+  for (size_t w = 0; w < weights.size(); ++w) {
+    const uint64_t scaled = static_cast<uint64_t>(rps) * weights[w];
+    if (scaled % sum != 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("requests_per_second ", rps,
+                       " does not split into whole per-worker rates by "
+                       "worker_weights (sum ",
+                       sum, "): worker ", w, " would get ", rps, " x ", weights[w], " / ", sum,
+                       ", not a whole number; choose a rate where rate x weight is divisible by "
+                       "the weight sum for every worker"));
+    }
+  }
+  return absl::OkStatus();
+}
+
+std::vector<uint32_t> perWorkerRates(uint32_t rps, uint32_t active_workers,
+                                     absl::Span<const uint32_t> weights) {
+  std::vector<uint32_t> rates(active_workers, 0);
+  if (!weights.empty() && weights.size() == active_workers) {
+    uint64_t sum = 0;
+    for (const uint32_t weight : weights) {
+      sum += weight;
+    }
+    for (uint32_t w = 0; w < active_workers; ++w) {
+      rates[w] = static_cast<uint32_t>(static_cast<uint64_t>(rps) * weights[w] / sum);
+    }
+    return rates;
+  }
+  const uint32_t base = rps / active_workers;
+  const uint32_t remainder = rps % active_workers;
+  for (uint32_t w = 0; w < active_workers; ++w) {
+    rates[w] = base > 0 ? base + (w < remainder ? 1u : 0u) : 1u;
+  }
+  return rates;
 }
 
 } // namespace Client

@@ -279,6 +279,63 @@ TEST(LivePartialAggregatorTest, EpochIdsOrderNumerically) {
   EXPECT_TRUE(snapshot.epoch_changed());
 }
 
+// NH1: off by default the snapshot carries no per-worker points; with
+// setIncludeWorkers(true) it carries every reporting worker's latest point,
+// in worker-id order, unmerged (its own counters, its own statistics, its
+// own clock stamp), next to the unchanged aggregate.
+TEST(LivePartialAggregatorTest, IncludeWorkersCarriesLatestPointPerWorker) {
+  LivePartialAggregator off;
+  off.addPartial(
+      makePartial(0, "main", {makeSnapshot("lat", 4, 10, 20, 30)}, {{"upstream_rq_total", 4}}));
+  EXPECT_EQ(0, off.snapshot().workers_size());
+
+  LivePartialAggregator aggregator;
+  aggregator.setIncludeWorkers(true);
+  nighthawk::client::WorkerLiveSnapshotPartial w1 =
+      makePartial(1, "main", {makeSnapshot("lat", 2, 50, 60, 70)}, {{"upstream_rq_total", 2}});
+  w1.set_monotonic_ns(2000);
+  w1.set_wall_time_unix_ns(9000);
+  nighthawk::client::WorkerLiveSnapshotPartial w0_old =
+      makePartial(0, "main", {makeSnapshot("lat", 3, 10, 20, 30)}, {{"upstream_rq_total", 3}});
+  w0_old.set_monotonic_ns(1000);
+  nighthawk::client::WorkerLiveSnapshotPartial w0 =
+      makePartial(0, "main", {makeSnapshot("lat", 6, 11, 21, 31)}, {{"upstream_rq_total", 6}});
+  w0.set_monotonic_ns(3000);
+  aggregator.addPartial(w1);
+  aggregator.addPartial(w0_old);
+  aggregator.addPartial(w0);
+  const nighthawk::client::LiveSnapshot snapshot = aggregator.snapshot();
+  // The aggregate is unchanged by the opt-in.
+  EXPECT_EQ(8u, snapshot.counters().at("upstream_rq_total"));
+  ASSERT_EQ(2, snapshot.workers_size());
+  EXPECT_EQ(0u, snapshot.workers(0).worker_id());
+  EXPECT_EQ(3000, snapshot.workers(0).monotonic_ns());
+  EXPECT_EQ(6u, snapshot.workers(0).counters().at("upstream_rq_total"));
+  ASSERT_EQ(1, snapshot.workers(0).statistics_size());
+  EXPECT_EQ(6u, snapshot.workers(0).statistics(0).count());
+  EXPECT_EQ(11u, snapshot.workers(0).statistics(0).p50_ns());
+  EXPECT_EQ(1u, snapshot.workers(1).worker_id());
+  EXPECT_EQ(9000, snapshot.workers(1).wall_time_unix_ns());
+  EXPECT_EQ(70u, snapshot.workers(1).statistics(0).p99_ns());
+  EXPECT_EQ("main", snapshot.workers(1).phase_id());
+}
+
+TEST(LivePartialAggregatorTest, ToWorkerLiveSnapshotCopiesThePartial) {
+  nighthawk::client::WorkerLiveSnapshotPartial partial = makePartial(
+      3, "measure", {makeSnapshot("lat", 1, 1, 2, 3)}, {{"benchmark.http_2xx", 9}}, "epoch-2");
+  partial.set_monotonic_ns(42);
+  partial.set_wall_time_unix_ns(43);
+  partial.set_run_end(true);
+  const nighthawk::client::WorkerLiveSnapshot point = ToWorkerLiveSnapshot(partial);
+  EXPECT_EQ(3u, point.worker_id());
+  EXPECT_EQ("measure", point.phase_id());
+  EXPECT_EQ("epoch-2", point.epoch_id());
+  EXPECT_EQ(42, point.monotonic_ns());
+  EXPECT_EQ(43, point.wall_time_unix_ns());
+  EXPECT_EQ(9u, point.counters().at("benchmark.http_2xx"));
+  EXPECT_EQ(1, point.statistics_size());
+  EXPECT_TRUE(point.run_end());
+}
 
 } // namespace
 } // namespace Client
