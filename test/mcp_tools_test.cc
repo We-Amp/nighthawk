@@ -750,6 +750,132 @@ TEST(McpToolsTest, HeadersRefuseUnsafeEntries) {
   EXPECT_TRUE(harness->service->startRequests().empty());
 }
 
+// N3a: the protocol argument maps h1/h2/h3 onto the StartRequest's protocol
+// option (one fresh harness per value: one run per harness).
+TEST(McpToolsTest, ProtocolRoundTrips) {
+  const std::vector<std::pair<std::string, nighthawk::client::Protocol::ProtocolOptions>> cases = {
+      {"h1", nighthawk::client::Protocol::HTTP1},
+      {"h2", nighthawk::client::Protocol::HTTP2},
+      {"h3", nighthawk::client::Protocol::HTTP3}};
+  for (const auto& [argument, expected] : cases) {
+    auto harness = MakeHarness(absl::ZeroDuration(), false, {},
+                               [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+                                 return std::vector<std::string>{"127.0.0.1"};
+                               });
+    Struct result =
+        CallToolOrDie(*harness, "start_run",
+                      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                                   R"json(/", "rps": 10, "duration_s": 60, "protocol": ")json",
+                                   argument, R"json("})json"));
+    ASSERT_FALSE(IsIsError(result)) << argument << ": " << ErrorText(result);
+    WaitForStartRequest(*harness);
+    ASSERT_EQ(harness->service->startRequests().size(), 1) << argument;
+    const nighthawk::client::StartRequest received = harness->service->startRequests()[0];
+    ASSERT_TRUE(received.options().has_protocol()) << argument;
+    EXPECT_EQ(received.options().protocol().value(), expected) << argument;
+  }
+}
+
+// N3a: without the new arguments the built request is unchanged: no protocol
+// and no body size are written (the engine defaults apply).
+TEST(McpToolsTest, ProtocolAndBodySizeAbsentStayUnset) {
+  auto harness = MakeHarness(absl::ZeroDuration(), false, {},
+                             [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+                               return std::vector<std::string>{"127.0.0.1"};
+                             });
+  Struct result =
+      CallToolOrDie(*harness, "start_run",
+                    absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                                 R"json(/", "rps": 10, "duration_s": 60})json"));
+  ASSERT_FALSE(IsIsError(result)) << ErrorText(result);
+  WaitForStartRequest(*harness);
+  ASSERT_EQ(harness->service->startRequests().size(), 1);
+  const nighthawk::client::StartRequest received = harness->service->startRequests()[0];
+  EXPECT_FALSE(received.options().has_protocol());
+  EXPECT_FALSE(received.options().request_options().has_request_body_size());
+}
+
+// N3a: a protocol outside h1/h2/h3 is refused naming the field, before any
+// engine connection (the schema's enum is advisory; the boundary enforces it).
+TEST(McpToolsTest, ProtocolRefusesUnknownValues) {
+  auto harness = MakeHarness();
+  for (const std::string& value : {"http2", "H2", "h4", ""}) {
+    Struct result = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5,
+                            "protocol": ")json",
+                     value, R"json("})json"));
+    EXPECT_TRUE(IsIsError(result)) << "'" << value << "' must be refused";
+    EXPECT_EQ(ErrorText(result),
+              absl::StrCat("protocol must be one of h1, h2, h3 (got '", value, "')"))
+        << value << ": " << ErrorText(result);
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// N3a: request_body_size lands on the static RequestOptions (the CLI's
+// --request-body-size surface); an explicit 0 is written as 0.
+TEST(McpToolsTest, RequestBodySizeRoundTrips) {
+  for (const uint32_t size : {0u, 1024u, 4194304u}) {
+    auto harness = MakeHarness(absl::ZeroDuration(), false, {},
+                               [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+                                 return std::vector<std::string>{"127.0.0.1"};
+                               });
+    Struct result = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                     R"json(/", "rps": 10, "duration_s": 60, "request_body_size": )json", size,
+                     R"json(})json"));
+    ASSERT_FALSE(IsIsError(result)) << size << ": " << ErrorText(result);
+    WaitForStartRequest(*harness);
+    ASSERT_EQ(harness->service->startRequests().size(), 1) << size;
+    const nighthawk::client::StartRequest received = harness->service->startRequests()[0];
+    ASSERT_TRUE(received.options().request_options().has_request_body_size()) << size;
+    EXPECT_EQ(received.options().request_options().request_body_size().value(), size);
+  }
+}
+
+// N3a: the body-size floor and cap: a negative (which would wrap the uint32
+// cast) or a size above the proto's 4194304 cap is refused naming the range.
+TEST(McpToolsTest, RequestBodySizeRefusesOutOfRange) {
+  auto harness = MakeHarness();
+  for (const std::string& value : {"-1", "4194305"}) {
+    Struct result = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5,
+                            "request_body_size": )json",
+                     value, R"json(})json"));
+    EXPECT_TRUE(IsIsError(result)) << value << " must be refused";
+    EXPECT_EQ(
+        ErrorText(result),
+        absl::StrCat("request_body_size must be an integer from 0 to 4194304 (got ", value, ")"))
+        << value << ": " << ErrorText(result);
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// N3a: both new arguments compose with a phase run and the existing request
+// shape (one StartRequest carries protocol, body size and the phase vector).
+TEST(McpToolsTest, ProtocolAndBodySizeComposeWithPhases) {
+  auto harness = MakeHarness(absl::ZeroDuration(), false, {},
+                             [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+                               return std::vector<std::string>{"127.0.0.1"};
+                             });
+  Struct result =
+      CallToolOrDie(*harness, "start_run",
+                    absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
+                                 R"json(/", "rps": 10, "phases": "warm:100:5:2,measure:100:20:2",
+                   "protocol": "h2", "request_body_size": 512})json"));
+  ASSERT_FALSE(IsIsError(result)) << ErrorText(result);
+  WaitForStartRequest(*harness);
+  ASSERT_EQ(harness->service->startRequests().size(), 1);
+  const nighthawk::client::StartRequest received = harness->service->startRequests()[0];
+  EXPECT_EQ(received.options().protocol().value(), nighthawk::client::Protocol::HTTP2);
+  EXPECT_EQ(received.options().request_options().request_body_size().value(), 512);
+  ASSERT_EQ(received.options().phases_size(), 2);
+  EXPECT_EQ(received.options().phases(1).name(), "measure");
+}
+
 // Steering without a run surfaces the feed's refusal verbatim.
 TEST(McpToolsTest, SteerWithoutRunSurfacesFeedRefusal) {
   auto harness = MakeHarness();

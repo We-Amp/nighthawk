@@ -77,6 +77,28 @@ TEST(StartRunDialogTest, ConnectionsFieldRoundTrips) {
   EXPECT_EQ(request.options().connections().value(), 64);
 }
 
+// N3a: the steering surface's protocol and request body size round-trip onto
+// the built options; unset stays unset (the engine defaults apply), and an
+// explicit body size of 0 is written as 0.
+TEST(StartRunDialogTest, ProtocolAndRequestBodySizeRoundTrip) {
+  StartRunDialogModel dialog = validDialog();
+  EXPECT_FALSE(dialog.build_request().options().has_protocol());
+  EXPECT_FALSE(dialog.build_request().options().request_options().has_request_body_size());
+
+  dialog.set_protocol(nighthawk::client::Protocol::HTTP3);
+  dialog.set_request_body_size(0);
+  ASSERT_TRUE(dialog.valid());
+  nighthawk::client::StartRequest request = dialog.build_request();
+  ASSERT_TRUE(request.options().has_protocol());
+  EXPECT_EQ(request.options().protocol().value(), nighthawk::client::Protocol::HTTP3);
+  ASSERT_TRUE(request.options().request_options().has_request_body_size());
+  EXPECT_EQ(request.options().request_options().request_body_size().value(), 0);
+
+  dialog.set_request_body_size(2048);
+  request = dialog.build_request();
+  EXPECT_EQ(request.options().request_options().request_body_size().value(), 2048);
+}
+
 // Routed from the Task 5 review: a whitespace-only uri must not pass — set_uri
 // trims, so blank input lands on the invalid empty-uri path, and a
 // fat-fingered submit with surrounding whitespace still works.

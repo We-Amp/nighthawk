@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,22 @@ public:
   // owns the positive-integer floor.
   void set_max_requests_per_connection(uint32_t max_requests_per_connection);
   uint32_t max_requests_per_connection() const { return max_requests_per_connection_; }
+
+  // N3a (the steering surface's protocol and body-size passthrough). The
+  // protocol build_request() writes; unset (the default) leaves the options'
+  // protocol unset — the engine default (HTTP/1). The tool boundary maps its
+  // h1/h2/h3 argument onto this.
+  void set_protocol(nighthawk::client::Protocol::ProtocolOptions protocol);
+  const std::optional<nighthawk::client::Protocol::ProtocolOptions>& protocol() const {
+    return protocol_;
+  }
+
+  // The request body size in bytes, written onto the static RequestOptions
+  // (the surface the CLI's --request-body-size fills). Unset leaves it
+  // unset; an explicit 0 is written as 0 (no body). The tool boundary owns
+  // the range floor (the proto pins lte 4194304).
+  void set_request_body_size(uint32_t request_body_size);
+  const std::optional<uint32_t>& request_body_size() const { return request_body_size_; }
 
   // The request headers to set on every request, as (name, value) pairs.
   // build_request() appends them verbatim as HeaderValueOptions; the tool
@@ -109,6 +126,8 @@ private:
   uint32_t connections_ = 0;
   uint32_t max_requests_per_connection_ = 0;
   std::vector<std::pair<std::string, std::string>> request_headers_;
+  std::optional<nighthawk::client::Protocol::ProtocolOptions> protocol_;
+  std::optional<uint32_t> request_body_size_;
   std::vector<nighthawk::client::PhaseSpec> phases_;
   std::string phases_field_;
 };

@@ -30,6 +30,14 @@ void StartRunDialogModel::set_max_requests_per_connection(uint32_t max_requests_
   max_requests_per_connection_ = max_requests_per_connection;
 }
 
+void StartRunDialogModel::set_protocol(nighthawk::client::Protocol::ProtocolOptions protocol) {
+  protocol_ = protocol;
+}
+
+void StartRunDialogModel::set_request_body_size(uint32_t request_body_size) {
+  request_body_size_ = request_body_size;
+}
+
 void StartRunDialogModel::add_request_headers(std::string name, std::string value) {
   request_headers_.emplace_back(std::move(name), std::move(value));
 }
@@ -144,6 +152,16 @@ nighthawk::client::StartRequest StartRunDialogModel::build_request() const {
   // default. The tool boundary validates the positive floor before this.
   if (max_requests_per_connection_ > 0) {
     options->mutable_max_requests_per_connection()->set_value(max_requests_per_connection_);
+  }
+  // N3a: the steering surface's protocol; unset stays unset — the engine
+  // default (HTTP/1).
+  if (protocol_.has_value()) {
+    options->mutable_protocol()->set_value(*protocol_);
+  }
+  // N3a: the steering surface's request body size, on the static
+  // RequestOptions (the CLI's --request-body-size surface).
+  if (request_body_size_.has_value()) {
+    options->mutable_request_options()->mutable_request_body_size()->set_value(*request_body_size_);
   }
   // The steering surface's request headers, verbatim (the tool boundary
   // validates the entries; the model is the single builder). They live under

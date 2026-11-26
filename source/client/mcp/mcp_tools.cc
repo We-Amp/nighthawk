@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "absl/status/status.h"
 #include "absl/strings/ascii.h"
@@ -320,7 +321,12 @@ constexpr char kStartRunSchema[] = R"json(
        "headers": {"type": "array",
                    "description": "Request headers set on EVERY request: an array of at most 64 objects of the shape {\"name\": <string>, \"value\": <string>}. Names and values are request VALUES: an entry that is not a name/value string pair, has an empty or malformed name (colons, spaces), or smuggles CR/LF/NUL framing into a name or value is refused before any engine connection."},
        "duration_s": {"type": "integer",
-                      "description": "Run duration in seconds (legacy single-phase run; mutually exclusive with phases)."}},
+                      "description": "Run duration in seconds (legacy single-phase run; mutually exclusive with phases)."},
+       "protocol": {"type": "string",
+                    "enum": ["h1", "h2", "h3"],
+                    "description": "The protocol requests are encapsulated in: h1 (HTTP/1.1, the default), h2 (HTTP/2) or h3 (HTTP/3 over QUIC; needs an https target)."},
+       "request_body_size": {"type": "integer",
+                             "description": "The request body size in bytes, sent on every request (0 = no body). At most 4194304."}},
      "required": ["uri"],
      "additionalProperties": false})json";
 
@@ -332,10 +338,14 @@ constexpr char kStartRunDescription[] =
     "max_requests_per_connection (integer, optional; close the connection "
     "after this many requests — 1 composes the connection-churn storm "
     "shape), headers (array, optional; at most 64 {name, value} string "
-    "pairs set on every request), duration_s (integer, optional). "
+    "pairs set on every request), duration_s (integer, optional), "
+    "protocol (string, optional; h1, h2 or h3), request_body_size "
+    "(integer, optional; bytes, 0 to 4194304). "
     "Non-positive rps, connections, max_requests_per_connection, or "
     "duration_s is refused naming the field ('must be a positive "
-    "integer'). Header entries are request VALUES: a non-{name,value} "
+    "integer'); a protocol other than h1/h2/h3 and a request_body_size "
+    "outside 0..4194304 are refused the same way. Header entries are "
+    "request VALUES: a non-{name,value} "
     "entry, an empty or malformed name, or CR/LF/NUL in a name or value is "
     "refused before any engine connection. The target host is resolved and "
     "EVERY resolved address is checked against loopback and "
@@ -351,6 +361,25 @@ constexpr char kStartRunDescription[] =
 // The request-header array's security-floor cap (named in the schema and the
 // refusal).
 constexpr int kMaxStartRunHeaders = 64;
+
+// N3a: the request body size cap (the proto's RequestOptions pins lte this).
+constexpr int64_t kMaxStartRunRequestBodySize = 4194304;
+
+// N3a: the start_run protocol argument onto the engine's protocol option.
+// Unknown values map to nullopt (the caller refuses them naming the field).
+std::optional<nighthawk::client::Protocol::ProtocolOptions>
+StartRunProtocolOf(absl::string_view value) {
+  if (value == "h1") {
+    return nighthawk::client::Protocol::HTTP1;
+  }
+  if (value == "h2") {
+    return nighthawk::client::Protocol::HTTP2;
+  }
+  if (value == "h3") {
+    return nighthawk::client::Protocol::HTTP3;
+  }
+  return std::nullopt;
+}
 
 // Whether a header name/value carries CR/LF/NUL framing (the header-
 // injection floor: names and values are single-line request values, never
@@ -876,6 +905,28 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
     // Carried on the dialog's side channel: build_request() writes it (the
     // connections pattern — the dialog model stays the single builder).
     dialog.set_max_requests_per_connection(static_cast<uint32_t>(value));
+  }
+  // N3a: the protocol and request body size, validated at this boundary so
+  // the engine's validator text is never the first refusal.
+  if (const Value* protocol = FindField(arguments, "protocol"); protocol != nullptr) {
+    const std::optional<nighthawk::client::Protocol::ProtocolOptions> mapped =
+        StartRunProtocolOf(protocol->string_value());
+    if (!mapped.has_value()) {
+      return absl::InvalidArgumentError(absl::StrCat("protocol must be one of h1, h2, h3 (got '",
+                                                     absl::CHexEscape(protocol->string_value()),
+                                                     "')"));
+    }
+    dialog.set_protocol(*mapped);
+  }
+  if (const Value* body_size = FindField(arguments, "request_body_size"); body_size != nullptr) {
+    const int64_t value = IntegerOf(*body_size);
+    if (value < 0 || value > kMaxStartRunRequestBodySize) {
+      // Before the uint32 cast: a negative would wrap to a huge body.
+      return absl::InvalidArgumentError(
+          absl::StrCat("request_body_size must be an integer from 0 to ",
+                       kMaxStartRunRequestBodySize, " (got ", value, ")"));
+    }
+    dialog.set_request_body_size(static_cast<uint32_t>(value));
   }
   if (const Value* headers = FindField(arguments, "headers"); headers != nullptr) {
     if (headers->kind_case() != Value::kListValue) {
