@@ -106,6 +106,15 @@ public:
   tls_context() const {
     return tls_context_;
   }
+  // - the run-level pending-request limit (the cluster's pending breaker,
+  //   bootstrapped at the maximum over the phases; a phase that does not set
+  //   its own max_pending_requests inherits it);
+  void set_max_pending_requests(uint32_t max_pending_requests);
+  const std::optional<uint32_t>& max_pending_requests() const { return max_pending_requests_; }
+  // - HTTP/1 connection prefetching (each worker's pool opens its whole
+  //   connection set on its first request);
+  void set_prefetch_connections(bool prefetch_connections);
+  const std::optional<bool>& prefetch_connections() const { return prefetch_connections_; }
   // - the per-worker series opt-in (NH1).
   void set_worker_series(bool worker_series);
   bool worker_series() const { return worker_series_; }
@@ -182,6 +191,8 @@ private:
   std::optional<envoy::config::core::v3::RequestMethod> request_method_;
   std::vector<nighthawk::client::RequestOptions> request_mix_;
   std::optional<envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext> tls_context_;
+  std::optional<uint32_t> max_pending_requests_;
+  std::optional<bool> prefetch_connections_;
   bool worker_series_ = false;
   std::vector<nighthawk::client::PhaseSpec> phases_;
   std::string phases_field_;

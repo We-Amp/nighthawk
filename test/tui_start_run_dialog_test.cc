@@ -243,6 +243,8 @@ TEST(StartRunDialogTest, ShapeSettersBuildOptions) {
   tls.mutable_max_session_keys()->set_value(0);
   dialog.set_tls_context(tls);
   dialog.set_worker_series(true);
+  dialog.set_max_pending_requests(32);
+  dialog.set_prefetch_connections(true);
   const nighthawk::client::CommandLineOptions options = dialog.build_request().options();
   EXPECT_EQ(options.burst_size().value(), 16u);
   EXPECT_TRUE(options.open_loop().value());
@@ -253,6 +255,8 @@ TEST(StartRunDialogTest, ShapeSettersBuildOptions) {
   EXPECT_EQ(options.request_options().request_body_size().value(), 64u);
   EXPECT_TRUE(options.tls_context().has_max_session_keys());
   EXPECT_TRUE(options.worker_series().value());
+  EXPECT_EQ(options.max_pending_requests().value(), 32u);
+  EXPECT_TRUE(options.prefetch_connections().value());
 
   const nighthawk::client::CommandLineOptions plain = validDialog().build_request().options();
   EXPECT_FALSE(plain.has_burst_size());
@@ -261,6 +265,13 @@ TEST(StartRunDialogTest, ShapeSettersBuildOptions) {
   EXPECT_FALSE(plain.has_max_concurrent_streams());
   EXPECT_FALSE(plain.has_tls_context());
   EXPECT_FALSE(plain.has_worker_series());
+  EXPECT_FALSE(plain.has_max_pending_requests());
+  EXPECT_FALSE(plain.has_prefetch_connections());
+  // An explicit 0 pending limit is written as 0, not dropped.
+  StartRunDialogModel zero = validDialog();
+  zero.set_max_pending_requests(0);
+  ASSERT_TRUE(zero.build_request().options().has_max_pending_requests());
+  EXPECT_EQ(zero.build_request().options().max_pending_requests().value(), 0u);
   EXPECT_FALSE(plain.has_request_options());
 }
 

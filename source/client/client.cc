@@ -28,6 +28,7 @@
 #include "source/client/output_collector_impl.h"
 #include "source/client/process_impl.h"
 #include "source/client/remote_process_impl.h"
+#include "source/client/tui/run_feed.h"
 #include "source/common/frequency.h"
 #include "source/common/signal_handler.h"
 #include "source/common/uri_impl.h"
@@ -67,8 +68,10 @@ bool Main::run() {
       return false;
     }
 
-    channel = grpc::CreateChannel(fmt::format("{}:{}", uri->hostWithoutPort(), uri->port()),
-                                  grpc::InsecureChannelCredentials());
+    // FORK-ONLY (We-Amp) NH1 review M1 residue: the shared service channel,
+    // without gRPC's 4 MB receive cap (the final Output of a --worker-series
+    // run can pass it).
+    channel = Tui::MakeServiceChannel(fmt::format("{}:{}", uri->hostWithoutPort(), uri->port()));
     stub = std::make_unique<nighthawk::client::NighthawkService::Stub>(channel);
     process = std::make_unique<RemoteProcessImpl>(*options_, *stub);
   } else {

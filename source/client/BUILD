@@ -141,6 +141,8 @@ envoy_cc_library(
         ":output_formatter_impl_lib",
         ":process_bootstrap",
         "//api/client:base_cc_proto",
+        # The shared service channel (MakeServiceChannel) for --nighthawk-service.
+        "//source/client/tui:run_feed_lib",
         "//api/rate_limiter:rate_limiter_plugin_cc_proto",
         "//include/nighthawk/client:client_includes",
         "//include/nighthawk/common:base_includes",

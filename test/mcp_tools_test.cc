@@ -1047,7 +1047,8 @@ TEST(McpToolsTest, ShapeFieldsRoundTrip) {
   const nighthawk::client::StartRequest received = StartAndCapture(
       *harness, "http",
       R"json(, "protocol": "h2", "burst_size": 8, "open_loop": true, "idle_strategy": "sleep",
-             "max_concurrent_streams": 4, "worker_series": true)json");
+             "max_concurrent_streams": 4, "worker_series": true, "max_pending_requests": 16,
+             "prefetch_connections": true)json");
   const nighthawk::client::CommandLineOptions& options = received.options();
   EXPECT_EQ(options.burst_size().value(), 8);
   EXPECT_TRUE(options.open_loop().value());
@@ -1055,6 +1056,8 @@ TEST(McpToolsTest, ShapeFieldsRoundTrip) {
             nighthawk::client::SequencerIdleStrategy::SLEEP);
   EXPECT_EQ(options.max_concurrent_streams().value(), 4);
   EXPECT_TRUE(options.worker_series().value());
+  EXPECT_EQ(options.max_pending_requests().value(), 16);
+  EXPECT_TRUE(options.prefetch_connections().value());
 
   auto plain = MakeLoopbackHarness();
   const nighthawk::client::CommandLineOptions absent =
@@ -1064,6 +1067,8 @@ TEST(McpToolsTest, ShapeFieldsRoundTrip) {
   EXPECT_FALSE(absent.has_sequencer_idle_strategy());
   EXPECT_FALSE(absent.has_max_concurrent_streams());
   EXPECT_FALSE(absent.has_worker_series());
+  EXPECT_FALSE(absent.has_max_pending_requests());
+  EXPECT_FALSE(absent.has_prefetch_connections());
   EXPECT_FALSE(absent.has_tls_context());
   EXPECT_FALSE(absent.has_request_source_plugin_config());
 }
@@ -1088,6 +1093,13 @@ TEST(McpToolsTest, ShapeFieldsRefuseBadValues) {
       {R"json("protocol": "h2", "max_concurrent_streams": 0})json",
        "max_concurrent_streams must be an integer from 1 to 2147483647 (got 0)"},
       {R"json("worker_series": 1})json", "worker_series must be a boolean"},
+      {R"json("max_pending_requests": -1})json",
+       "max_pending_requests must be an integer from 0 to 1000000 (got -1)"},
+      {R"json("max_pending_requests": 1000001})json",
+       "max_pending_requests must be an integer from 0 to 1000000 (got 1000001)"},
+      {R"json("max_pending_requests": 1.5})json",
+       "max_pending_requests must be an integer from 0 to 1000000 (got 1.5)"},
+      {R"json("prefetch_connections": "yes"})json", "prefetch_connections must be a boolean"},
   };
   for (const auto& [arguments, message] : cases) {
     EXPECT_EQ(StartRunRefusal(*harness, base + arguments), message) << arguments;
@@ -1252,6 +1264,23 @@ TEST(McpToolsTest, TlsRefusals) {
                 .tls_params()
                 .tls_maximum_protocol_version(),
             envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3);
+}
+
+// The run-level pending limit with a phase vector: an explicit 0 is written
+// as 0, and the phase vector carries no per-phase value, so every phase
+// inherits the run-level limit (phaseResourceLimits, the engine's rule).
+TEST(McpToolsTest, MaxPendingRequestsAndPrefetchComposeWithPhases) {
+  auto harness = MakeLoopbackHarness();
+  const nighthawk::client::StartRequest received =
+      StartAndCapture(*harness, "http",
+                      R"json(, "phases": "hot:800:5:4::5/1/1/1", "max_pending_requests": 0,
+             "prefetch_connections": false)json");
+  ASSERT_TRUE(received.options().has_max_pending_requests());
+  EXPECT_EQ(received.options().max_pending_requests().value(), 0);
+  ASSERT_TRUE(received.options().has_prefetch_connections());
+  EXPECT_FALSE(received.options().prefetch_connections().value());
+  ASSERT_EQ(received.options().phases_size(), 1);
+  EXPECT_FALSE(received.options().phases(0).has_max_pending_requests());
 }
 
 // NH1: the phases string carries per-worker weights as a sixth part, with

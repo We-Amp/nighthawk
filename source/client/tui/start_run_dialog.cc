@@ -70,6 +70,14 @@ void StartRunDialogModel::set_tls_context(
 
 void StartRunDialogModel::set_worker_series(bool worker_series) { worker_series_ = worker_series; }
 
+void StartRunDialogModel::set_max_pending_requests(uint32_t max_pending_requests) {
+  max_pending_requests_ = max_pending_requests;
+}
+
+void StartRunDialogModel::set_prefetch_connections(bool prefetch_connections) {
+  prefetch_connections_ = prefetch_connections;
+}
+
 void StartRunDialogModel::add_request_headers(std::string name, std::string value) {
   request_headers_.emplace_back(std::move(name), std::move(value));
 }
@@ -259,6 +267,14 @@ nighthawk::client::StartRequest StartRunDialogModel::build_request() const {
     // transport socket: the engine keeps adding the protocol's ALPN, the SNI
     // and the QUIC wrapper for h3 around it.
     *options->mutable_tls_context() = *tls_context_;
+  }
+  // The run-level pending limit (an explicit 0 is written as 0) and
+  // prefetching; unset stays unset.
+  if (max_pending_requests_.has_value()) {
+    options->mutable_max_pending_requests()->set_value(*max_pending_requests_);
+  }
+  if (prefetch_connections_.has_value()) {
+    options->mutable_prefetch_connections()->set_value(*prefetch_connections_);
   }
   // NH1: the per-worker series opt-in; false stays unset.
   if (worker_series_) {

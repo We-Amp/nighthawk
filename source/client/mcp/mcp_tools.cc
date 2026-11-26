@@ -346,6 +346,10 @@ constexpr char kStartRunSchema[] = R"json(
                                   "description": "The stream limit per connection (1 to 2147483647); h2 and h3 only."},
        "tls": {"type": "object",
                "description": "TLS parameters for an https uri: {min_version?, max_version? ('1.0', '1.1', '1.2' or '1.3'), cipher_suites? (array of strings), ecdh_curves? (array of strings), session_resumption? (boolean; false disables session resumption)}. The engine still sets the ALPN and the SNI for the protocol. With h3, max_version must be 1.3 or unset (QUIC is TLS 1.3 only). cipher_suites shape TLS 1.2 and below only: BoringSSL ignores them for TLS 1.3, so a 1.3 row is not changed by them."},
+       "max_pending_requests": {"type": "integer",
+                                "description": "The run-level pending-request limit, 0 to 1000000 (default 0: a request that finds no ready connection is dropped and counted as pool overflow). A phase that does not set its own inherits it. A priced HTTP/1 row needs zero overflow on every worker; a non-zero limit lets a burst wait for a connection instead."},
+       "prefetch_connections": {"type": "boolean",
+                                "description": "HTTP/1: each worker's pool opens its whole connection set on its first request (default false). On its own it does not guarantee zero overflow (a request arriving while the connections are still connecting has nowhere to wait); combine it with max_pending_requests."},
        "worker_series": {"type": "boolean",
                          "description": "Record the per-worker series: every snapshot then carries each worker's own counters and latency statistics, readable as nighthawk://workers and in the final output (default false)."}},
      "required": ["uri"],
@@ -370,7 +374,9 @@ constexpr char kStartRunDescription[] =
     "idle_strategy (string, optional; spin, poll or sleep), "
     "max_concurrent_streams (integer, optional; h2/h3 only), tls (object, "
     "optional; https only: min_version, max_version, cipher_suites, "
-    "ecdh_curves, session_resumption), worker_series (boolean, optional; "
+    "ecdh_curves, session_resumption), max_pending_requests (integer, "
+    "optional; 0 to 1000000, inherited by phases without their own), "
+    "prefetch_connections (boolean, optional), worker_series (boolean, optional; "
     "the per-worker series, read as nighthawk://workers). Weighted phases "
     "('...:weights' in phases) refuse a split that is not whole. "
     "Non-positive rps, connections, max_requests_per_connection, or "
@@ -814,6 +820,21 @@ absl::Status ApplyStartRunShape(const Struct& arguments, const std::string& uri,
           "or unset");
     }
     dialog.set_tls_context(std::move(context));
+  }
+  // The pending limit and prefetching: the two settings a priced HTTP/1 row
+  // needs to meet the per-worker zero-overflow gate.
+  if (const Value* pending = FindField(arguments, "max_pending_requests"); pending != nullptr) {
+    auto value = StartRunWholeNumber(*pending, "max_pending_requests", 0, 1000000);
+    if (!value.ok()) {
+      return value.status();
+    }
+    dialog.set_max_pending_requests(static_cast<uint32_t>(*value));
+  }
+  if (const Value* prefetch = FindField(arguments, "prefetch_connections"); prefetch != nullptr) {
+    if (prefetch->kind_case() != Value::kBoolValue) {
+      return absl::InvalidArgumentError("prefetch_connections must be a boolean");
+    }
+    dialog.set_prefetch_connections(prefetch->bool_value());
   }
   if (const Value* series = FindField(arguments, "worker_series"); series != nullptr) {
     if (series->kind_case() != Value::kBoolValue) {
