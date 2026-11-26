@@ -233,3 +233,60 @@ def test_h3_phases_carry_connections_over_boundary(quic_test_server_fixture):
   counters = quic_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
   _assert_one_connection_set(counters, concurrency)
 
+
+
+# FORK-ONLY (We-Amp): NH1. Per-worker rate weights split a phase's rate by
+# weight, and the per-worker series (--worker-series) shows the realised split
+# in the JSON output: one point per worker per stats flush, plus a run-end
+# point carrying the worker's final counters.
+def _weighted_phase(rps, weights, duration="4s"):
+  return json.dumps([{
+      "name": "skew",
+      "duration": duration,
+      "requests_per_second": rps,
+      "concurrency": str(len(weights)),
+      "worker_weights": weights
+  }])
+
+
+@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
+def test_http_h1_weighted_phase_worker_series_shows_split(http_test_server_fixture):
+  """Test that weights [3, 1] at 80 rps pace 60 and 20 rps, as the series shows."""
+  parsed_json, _ = http_test_server_fixture.runNighthawkClient([
+      http_test_server_fixture.getTestServerRootUri(), "--phases",
+      _weighted_phase(80, [3, 1]), "--worker-series", "--stats-flush-interval", "1"
+  ])
+  metadata = parsed_json["phase_metadata"]
+  assert len(metadata) == 1, metadata
+  assert metadata[0]["worker_requests_per_second"] == [60, 20], metadata[0]
+
+  points = {}
+  for point in parsed_json["worker_series"]:
+    points.setdefault(int(point.get("worker_id", 0)), []).append(point)
+  assert sorted(points) == [0, 1], sorted(points)
+  final = {}
+  for worker, series in points.items():
+    # Proto JSON omits false booleans: only the run-end point carries the mark.
+    assert series[-1].get("run_end") is True, series[-1]
+    assert all(not p.get("run_end", False) for p in series[:-1])
+    stamps = [int(p["monotonic_ns"]) for p in series]
+    assert stamps == sorted(stamps), stamps
+    final[worker] = int(series[-1]["counters"]["upstream_rq_total"])
+    worker_result = next(r for r in parsed_json["results"] if r["name"] == "worker_%d" % worker)
+    worker_counters = {c["name"]: int(c["value"]) for c in worker_result["counters"]}
+    assert final[worker] == worker_counters["upstream_rq_total"], (worker, final[worker])
+  assert final[1] > 0, final
+  ratio = final[0] / final[1]
+  asserts.assertBetweenInclusive(ratio, 2.5, 3.5)
+
+
+@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
+def test_http_h1_weighted_phase_refuses_uneven_split(http_test_server_fixture):
+  """Test that a rate the weights cannot split into whole per-worker rates is refused."""
+  _, logs = http_test_server_fixture.runNighthawkClient([
+      http_test_server_fixture.getTestServerRootUri(), "--phases",
+      _weighted_phase(81, [3, 1])
+  ],
+                                                        expect_failure=True,
+                                                        as_json=False)
+  assert "does not split into whole per-worker rates" in logs, logs
