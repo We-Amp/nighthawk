@@ -324,7 +324,7 @@ constexpr char kStartRunSchema[] = R"json(
                       "description": "Run duration in seconds (legacy single-phase run; mutually exclusive with phases)."},
        "protocol": {"type": "string",
                     "enum": ["h1", "h2", "h3"],
-                    "description": "The protocol requests are encapsulated in: h1 (HTTP/1.1, the default), h2 (HTTP/2) or h3 (HTTP/3 over QUIC; needs an https target)."},
+                    "description": "The protocol requests are encapsulated in: h1 (HTTP/1.1, the default), h2 (HTTP/2) or h3 (HTTP/3 over QUIC). h3 needs an https uri and a Host header (a headers entry naming the certificate hostname): the target is rewritten to its IP and QUIC cannot skip certificate verification."},
        "request_body_size": {"type": "integer",
                              "description": "The request body size in bytes, sent on every request (0 = no body). At most 4194304."}},
      "required": ["uri"],
@@ -339,7 +339,8 @@ constexpr char kStartRunDescription[] =
     "after this many requests — 1 composes the connection-churn storm "
     "shape), headers (array, optional; at most 64 {name, value} string "
     "pairs set on every request), duration_s (integer, optional), "
-    "protocol (string, optional; h1, h2 or h3), request_body_size "
+    "protocol (string, optional; h1, h2 or h3; h3 needs an https uri "
+    "and a Host header), request_body_size "
     "(integer, optional; bytes, 0 to 4194304). "
     "Non-positive rps, connections, max_requests_per_connection, or "
     "duration_s is refused naming the field ('must be a positive "
@@ -364,6 +365,37 @@ constexpr int kMaxStartRunHeaders = 64;
 
 // N3a: the request body size cap (the proto's RequestOptions pins lte this).
 constexpr int64_t kMaxStartRunRequestBodySize = 4194304;
+
+// Renders a JSON number for a refusal: integral values in the exactly
+// representable range print as integers (4194305, -1), anything else in
+// absl's shortest %g form (1.5, 1e+30).
+std::string JsonNumberText(double value) {
+  if (std::isfinite(value) && value == std::floor(value) && std::fabs(value) < 1e15) {
+    return absl::StrCat(static_cast<int64_t>(value));
+  }
+  return absl::StrCat(value);
+}
+
+// N3a: whether the start_run headers argument carries a Host entry (name
+// compared case-insensitively). Malformed entries are skipped here; the
+// headers validation below refuses them with its own text.
+bool StartRunHasHostHeader(const Struct& arguments) {
+  const Value* headers = FindField(arguments, "headers");
+  if (headers == nullptr || headers->kind_case() != Value::kListValue) {
+    return false;
+  }
+  for (const Value& entry : headers->list_value().values()) {
+    if (entry.kind_case() != Value::kStructValue) {
+      continue;
+    }
+    const Value* name = FindField(entry.struct_value(), "name");
+    if (name != nullptr && name->kind_case() == Value::kStringValue &&
+        absl::AsciiStrToLower(name->string_value()) == "host") {
+      return true;
+    }
+  }
+  return false;
+}
 
 // N3a: the start_run protocol argument onto the engine's protocol option.
 // Unknown values map to nullopt (the caller refuses them naming the field).
@@ -916,17 +948,38 @@ SteeringController::StartRun(const google::protobuf::Struct& arguments) {
                                                      absl::CHexEscape(protocol->string_value()),
                                                      "')"));
     }
+    // M1 (review): an h3 run that cannot complete a QUIC handshake is
+    // refused here, before any engine connection, instead of failing late.
+    // HTTP/3 needs TLS (an https uri), and the engine target is rewritten to
+    // the resolved IP, so without a Host header the SNI would be that IP and
+    // certificate verification (which QUIC cannot skip) fails.
+    if (*mapped == nighthawk::client::Protocol::HTTP3) {
+      auto parsed_target = ParseTargetUri(uri->string_value());
+      if (!parsed_target.ok() || absl::AsciiStrToLower(parsed_target->scheme) != "https") {
+        return absl::InvalidArgumentError(
+            "protocol h3 needs an https uri (HTTP/3 runs over QUIC with TLS)");
+      }
+      if (!StartRunHasHostHeader(arguments)) {
+        return absl::InvalidArgumentError(
+            "protocol h3 needs a headers entry {\"name\": \"Host\", \"value\": <certificate "
+            "hostname>}: the target is rewritten to its IP and QUIC cannot skip certificate "
+            "verification");
+      }
+    }
     dialog.set_protocol(*mapped);
   }
   if (const Value* body_size = FindField(arguments, "request_body_size"); body_size != nullptr) {
-    const int64_t value = IntegerOf(*body_size);
-    if (value < 0 || value > kMaxStartRunRequestBodySize) {
-      // Before the uint32 cast: a negative would wrap to a huge body.
+    // S2 (review): range- and integrality-check the JSON number itself,
+    // before any integer conversion: casting an out-of-range double (1e30)
+    // is undefined behaviour, and 1.5 would truncate silently to 1.
+    const double raw = body_size->number_value();
+    if (!(raw >= 0 && raw <= static_cast<double>(kMaxStartRunRequestBodySize)) ||
+        raw != std::floor(raw)) {
       return absl::InvalidArgumentError(
           absl::StrCat("request_body_size must be an integer from 0 to ",
-                       kMaxStartRunRequestBodySize, " (got ", value, ")"));
+                       kMaxStartRunRequestBodySize, " (got ", JsonNumberText(raw), ")"));
     }
-    dialog.set_request_body_size(static_cast<uint32_t>(value));
+    dialog.set_request_body_size(static_cast<uint32_t>(raw));
   }
   if (const Value* headers = FindField(arguments, "headers"); headers != nullptr) {
     if (headers->kind_case() != Value::kListValue) {

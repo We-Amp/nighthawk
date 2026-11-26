@@ -751,29 +751,78 @@ TEST(McpToolsTest, HeadersRefuseUnsafeEntries) {
 }
 
 // N3a: the protocol argument maps h1/h2/h3 onto the StartRequest's protocol
-// option (one fresh harness per value: one run per harness).
+// option (one fresh harness per value: one run per harness). The h3 case uses
+// the only shape that can run: an https uri plus a Host header.
 TEST(McpToolsTest, ProtocolRoundTrips) {
-  const std::vector<std::pair<std::string, nighthawk::client::Protocol::ProtocolOptions>> cases = {
-      {"h1", nighthawk::client::Protocol::HTTP1},
-      {"h2", nighthawk::client::Protocol::HTTP2},
-      {"h3", nighthawk::client::Protocol::HTTP3}};
-  for (const auto& [argument, expected] : cases) {
+  struct Case {
+    std::string argument;
+    nighthawk::client::Protocol::ProtocolOptions expected;
+    std::string scheme;
+    std::string extra;
+  };
+  const std::vector<Case> cases = {
+      {"h1", nighthawk::client::Protocol::HTTP1, "http", ""},
+      {"h2", nighthawk::client::Protocol::HTTP2, "http", ""},
+      {"h3", nighthawk::client::Protocol::HTTP3, "https",
+       R"json(, "headers": [{"name": "Host", "value": "www.lyft.com"}])json"}};
+  for (const Case& test_case : cases) {
     auto harness = MakeHarness(absl::ZeroDuration(), false, {},
                                [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
                                  return std::vector<std::string>{"127.0.0.1"};
                                });
-    Struct result =
-        CallToolOrDie(*harness, "start_run",
-                      absl::StrCat(R"json({"uri": "http://127.0.0.1:)json", harness->grpc_port,
-                                   R"json(/", "rps": 10, "duration_s": 60, "protocol": ")json",
-                                   argument, R"json("})json"));
-    ASSERT_FALSE(IsIsError(result)) << argument << ": " << ErrorText(result);
+    Struct result = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": ")json", test_case.scheme, "://127.0.0.1:", harness->grpc_port,
+                     R"json(/", "rps": 10, "duration_s": 60, "protocol": ")json",
+                     test_case.argument, R"json(")json", test_case.extra, "}"));
+    ASSERT_FALSE(IsIsError(result)) << test_case.argument << ": " << ErrorText(result);
     WaitForStartRequest(*harness);
-    ASSERT_EQ(harness->service->startRequests().size(), 1) << argument;
+    ASSERT_EQ(harness->service->startRequests().size(), 1) << test_case.argument;
     const nighthawk::client::StartRequest received = harness->service->startRequests()[0];
-    ASSERT_TRUE(received.options().has_protocol()) << argument;
-    EXPECT_EQ(received.options().protocol().value(), expected) << argument;
+    ASSERT_TRUE(received.options().has_protocol()) << test_case.argument;
+    EXPECT_EQ(received.options().protocol().value(), test_case.expected) << test_case.argument;
   }
+}
+
+// M1 (review): an h3 start_run that cannot complete a QUIC handshake is
+// refused at the tool boundary, before any engine connection: an http uri
+// (no TLS, so no QUIC transport), and an https uri without a Host header
+// (the target is rewritten to its IP, so the SNI would be the IP and QUIC
+// cannot skip certificate verification). The Host name match is
+// case-insensitive.
+TEST(McpToolsTest, ProtocolH3RefusesHttpUriAndMissingHost) {
+  auto harness = MakeHarness();
+  Struct http_uri = CallToolOrDie(
+      *harness, "start_run",
+      R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5, "protocol": "h3",
+              "headers": [{"name": "Host", "value": "www.lyft.com"}]})json");
+  EXPECT_TRUE(IsIsError(http_uri));
+  EXPECT_EQ(ErrorText(http_uri), "protocol h3 needs an https uri (HTTP/3 runs over QUIC with TLS)");
+
+  for (const std::string& headers :
+       {std::string(""), std::string(R"json(, "headers": [{"name": "x-a", "value": "b"}])json")}) {
+    Struct no_host = CallToolOrDie(
+        *harness, "start_run",
+        absl::StrCat(R"json({"uri": "https://127.0.0.1:443/", "rps": 10, "duration_s": 5,
+                            "protocol": "h3")json",
+                     headers, "}"));
+    EXPECT_TRUE(IsIsError(no_host)) << headers;
+    EXPECT_NE(ErrorText(no_host).find("protocol h3 needs a headers entry"), std::string::npos)
+        << headers << ": " << ErrorText(no_host);
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+
+  // A lower-case "host" entry satisfies the check.
+  auto accepting = MakeHarness(absl::ZeroDuration(), false, {},
+                               [](absl::string_view) -> absl::StatusOr<std::vector<std::string>> {
+                                 return std::vector<std::string>{"127.0.0.1"};
+                               });
+  Struct lower =
+      CallToolOrDie(*accepting, "start_run",
+                    absl::StrCat(R"json({"uri": "https://127.0.0.1:)json", accepting->grpc_port,
+                                 R"json(/", "rps": 10, "duration_s": 60, "protocol": "h3",
+                   "headers": [{"name": "host", "value": "www.lyft.com"}]})json"));
+  EXPECT_FALSE(IsIsError(lower)) << ErrorText(lower);
 }
 
 // N3a: without the new arguments the built request is unchanged: no protocol
@@ -850,6 +899,30 @@ TEST(McpToolsTest, RequestBodySizeRefusesOutOfRange) {
         ErrorText(result),
         absl::StrCat("request_body_size must be an integer from 0 to 4194304 (got ", value, ")"))
         << value << ": " << ErrorText(result);
+  }
+  EXPECT_TRUE(harness->service->startRequests().empty());
+}
+
+// S2 (review): the body size is range- and integrality-checked on the JSON
+// number itself, before any integer conversion (1e30 would be undefined
+// behaviour in the cast; 1.5 would truncate to 1). The server's schema check
+// already refuses non-integers over the wire, so this drives the handler
+// directly to pin the boundary's own floor.
+TEST(McpToolsTest, RequestBodySizeRefusesNonIntegerNumbersAtTheHandler) {
+  auto harness = MakeHarness();
+  const std::vector<std::pair<std::string, std::string>> cases = {{"1.5", "1.5"},
+                                                                  {"1e30", "1e+30"}};
+  for (const auto& [json_value, printed] : cases) {
+    auto arguments = ParseJsonObject(
+        absl::StrCat(R"json({"uri": "http://127.0.0.1:80/", "rps": 10, "duration_s": 5,
+                            "request_body_size": )json",
+                     json_value, "}"));
+    ASSERT_TRUE(arguments.ok()) << json_value;
+    auto started = harness->controller->StartRun(*arguments);
+    ASSERT_FALSE(started.ok()) << json_value;
+    EXPECT_EQ(
+        started.status().message(),
+        absl::StrCat("request_body_size must be an integer from 0 to 4194304 (got ", printed, ")"));
   }
   EXPECT_TRUE(harness->service->startRequests().empty());
 }
