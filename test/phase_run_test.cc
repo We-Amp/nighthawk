@@ -953,6 +953,54 @@ TEST_F(PhaseRunTest, ConnectionsCarryOverWarmToMeasureBoundary) {
   EXPECT_GT(served_in_measure, 60) << "expected about 2 s x 60 rps in the measure phase";
 }
 
+// --- N2: --rps-total on a legacy (vector-less) run. ---
+
+// The run-total rate divided across four workers (30 = 8 + 8 + 7 + 7): the
+// SUT sees about total x duration requests, not total x workers x duration
+// (which the per-worker --rps would pace at the same number).
+TEST_F(PhaseRunTest, RpsTotalPacesTheTotalAcrossWorkers) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(listener().uri());
+  cmd.mutable_concurrency()->set_value("4");
+  cmd.mutable_duration()->set_seconds(2);
+  cmd.mutable_timeout()->set_seconds(5);
+  cmd.mutable_requests_per_second_total()->set_value(30);
+  RunOutcome outcome = runPhases(cmd);
+  ASSERT_TRUE(outcome.success);
+  EXPECT_EQ(30, outcome.output.options().requests_per_second_total().value());
+  const size_t served = listener().requestSpans().size();
+  // 2 s x 30 rps = 60. A per-worker reading of the flag would serve ~240.
+  EXPECT_GE(served, 45u);
+  EXPECT_LE(served, 75u);
+  // Every one of the four workers carried a share of the total.
+  uint64_t worker_total = 0;
+  for (int w = 0; w < 4; ++w) {
+    const nighthawk::client::Result* worker =
+        findResult(outcome.output, fmt::format("worker_{}", w));
+    ASSERT_NE(worker, nullptr) << w;
+    const uint64_t worker_requests = counterValue(*worker, "upstream_rq_total");
+    EXPECT_GT(worker_requests, 0u) << "worker " << w << " paced no share";
+    worker_total += worker_requests;
+  }
+  EXPECT_NEAR(static_cast<double>(worker_total), static_cast<double>(served), 4.0);
+}
+
+// --rps-total below the resolved worker count fails the run before any
+// worker is built (the options-level check cannot see 'auto').
+TEST_F(PhaseRunTest, RpsTotalBelowWorkerCountFailsTheRun) {
+  nighthawk::client::CommandLineOptions cmd;
+  cmd.mutable_uri()->set_value(listener().uri());
+  cmd.mutable_concurrency()->set_value("auto");
+  cmd.mutable_duration()->set_seconds(1);
+  cmd.mutable_requests_per_second_total()->set_value(1);
+  if (std::thread::hardware_concurrency() < 2) {
+    GTEST_SKIP() << "needs at least two vCPUs so 'auto' resolves above the total";
+  }
+  RunOutcome outcome = runPhases(cmd);
+  EXPECT_FALSE(outcome.success);
+  EXPECT_TRUE(listener().requestSpans().empty());
+}
+
 // Three phases declaring concurrency [2, 4, 2]: four workers are bootstrapped
 // (the max over phases), phase traffic comes from exactly the declared subset
 // per phase, and the workers that sit out the last phase keep their

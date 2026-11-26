@@ -1,11 +1,14 @@
 """Test connection management of nighthawk's load generator."""
 
+import json
 import logging
 import os
 import sys
 import pytest
 
-from test.integration.integration_test_fixtures import (http_test_server_fixture, server_config)
+from test.integration.integration_test_fixtures import (http_test_server_fixture,
+                                                        quic_test_server_fixture, server_config,
+                                                        server_config_quic)
 from test.integration import asserts
 from test.integration import utility
 
@@ -156,3 +159,88 @@ def test_h1_pool_strategy_lru(http_test_server_fixture):
         # provide a little slack. Minimum of 2 as envoy logs "message complete" twice per request.
         average_line_count - 2,
         average_line_count + 2)
+
+
+# FORK-ONLY (We-Amp): N2 / O-F1. A warm phase and a measure phase in one
+# process (--phases) keep their connections across the boundary: the run opens
+# exactly the warm phase's connection set and closes none before teardown.
+def _warm_measure_phases(concurrency, rps=60, duration="2s"):
+  return json.dumps([{
+      "name": name,
+      "duration": duration,
+      "requests_per_second": rps,
+      "concurrency": str(concurrency)
+  } for name in ("warm", "measure")])
+
+
+def _assert_one_connection_set(counters, expected_connections):
+  asserts.assertCounterEqual(counters, "upstream_cx_total", expected_connections)
+  # Counters are read before teardown drains the pools: a close during the run
+  # would show here.
+  assert "upstream_cx_destroy" not in counters, counters
+
+
+@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
+def test_http_h1_phases_carry_connections_over_boundary(http_test_server_fixture):
+  """Test that h1 connections opened in the warm phase serve the measure phase."""
+  concurrency = 2
+  connections = 3
+  parsed_json, _ = http_test_server_fixture.runNighthawkClient([
+      http_test_server_fixture.getTestServerRootUri(), "--phases",
+      _warm_measure_phases(concurrency), "--connections",
+      str(connections), "--prefetch-connections"
+  ])
+  counters = http_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
+  _assert_one_connection_set(counters, concurrency * connections)
+  # Both phases report their own result and metadata.
+  phase_results = [r["name"] for r in parsed_json["results"] if r["name"].startswith("phase_")]
+  assert phase_results == ["phase_0_warm", "phase_1_measure"], phase_results
+  assert len(parsed_json["phase_metadata"]) == 2, parsed_json["phase_metadata"]
+
+
+@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
+def test_http_h2_phases_carry_connections_over_boundary(http_test_server_fixture):
+  """Test that each worker's h2 connection serves both phases."""
+  concurrency = 2
+  parsed_json, _ = http_test_server_fixture.runNighthawkClient([
+      "--protocol", "http2",
+      http_test_server_fixture.getTestServerRootUri(), "--phases",
+      _warm_measure_phases(concurrency), "--max-active-requests", "1"
+  ])
+  counters = http_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
+  # One multiplexed connection per worker.
+  _assert_one_connection_set(counters, concurrency)
+
+
+@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
+def test_h3_phases_carry_connections_over_boundary(quic_test_server_fixture):
+  """Test that each worker's h3 (QUIC) connection serves both phases."""
+  concurrency = 2
+  parsed_json, _ = quic_test_server_fixture.runNighthawkClient([
+      "--protocol",
+      "http3",
+      quic_test_server_fixture.getTestServerRootUri(),
+      "--phases",
+      _warm_measure_phases(concurrency),
+      "--max-active-requests",
+      "1",
+      # Envoy doesn't support disabling certificate verification on Quic
+      # connections, so the host in our requests has to match the hostname in
+      # the leaf certificate.
+      "--request-header",
+      "Host:www.lyft.com"
+  ])
+  counters = quic_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
+  _assert_one_connection_set(counters, concurrency)
+
+
+@pytest.mark.skipif(utility.isSanitizerRun(), reason="Unstable in sanitizer runs")
+def test_http_h1_rps_total_divides_across_workers(http_test_server_fixture):
+  """Test that --rps-total paces the total, not the total per worker."""
+  parsed_json, _ = http_test_server_fixture.runNighthawkClient([
+      http_test_server_fixture.getTestServerRootUri(), "--rps-total", "30", "--concurrency", "4",
+      "--duration", "3"
+  ])
+  counters = http_test_server_fixture.getNighthawkCounterMapFromJson(parsed_json)
+  # 3 s x 30 rps = 90; a per-worker reading would send about 360.
+  asserts.assertCounterBetweenInclusive(counters, "upstream_rq_total", 75, 100)

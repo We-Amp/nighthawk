@@ -1485,5 +1485,75 @@ TEST_F(OptionsImplTest, TunnelModeMissingParams) {
       MalformedArgvException, "--tunnel-tls-context is required to use --tunnel-protocol http3");
 }
 
+// FORK-ONLY (We-Amp): N2 --rps-total. The run-total rate parses, replaces
+// the per-worker rate in the serialized options, and round-trips.
+TEST_F(OptionsImplTest, RpsTotalParsesAndRoundTrips) {
+  std::unique_ptr<OptionsImpl> options = TestUtility::createOptionsImpl(
+      fmt::format("{} --rps-total 1800 --concurrency 16 {}", client_name_, good_test_uri_));
+  ASSERT_TRUE(options->requestsPerSecondTotal().has_value());
+  EXPECT_EQ(1800, *options->requestsPerSecondTotal());
+
+  CommandLineOptionsPtr cmd = options->toCommandLineOptions();
+  ASSERT_TRUE(cmd->has_requests_per_second_total());
+  EXPECT_EQ(1800, cmd->requests_per_second_total().value());
+  EXPECT_FALSE(cmd->has_requests_per_second())
+      << "the total and the per-worker rate are mutually exclusive";
+
+  OptionsImpl options_from_proto(*cmd);
+  ASSERT_TRUE(options_from_proto.requestsPerSecondTotal().has_value());
+  EXPECT_EQ(1800, *options_from_proto.requestsPerSecondTotal());
+  Envoy::MessageUtil util;
+  EXPECT_TRUE(util(*options_from_proto.toCommandLineOptions(), *cmd));
+}
+
+TEST_F(OptionsImplTest, RpsTotalIsUnsetByDefault) {
+  std::unique_ptr<OptionsImpl> options =
+      TestUtility::createOptionsImpl(fmt::format("{} --rps 10 {}", client_name_, good_test_uri_));
+  EXPECT_FALSE(options->requestsPerSecondTotal().has_value());
+  EXPECT_FALSE(options->toCommandLineOptions()->has_requests_per_second_total());
+  EXPECT_EQ(10, options->toCommandLineOptions()->requests_per_second().value());
+}
+
+TEST_F(OptionsImplTest, RpsTotalRejectsConflictsAndBadValues) {
+  EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(fmt::format(
+                              "{} --rps 10 --rps-total 100 {}", client_name_, good_test_uri_)),
+                          MalformedArgvException, "--rps and --rps-total are mutually exclusive");
+  EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(
+                              fmt::format("{} --rps-total 0 {}", client_name_, good_test_uri_)),
+                          MalformedArgvException, "Invalid value for --rps-total");
+  // A total below a numeric worker count cannot be divided without a
+  // zero-rate worker.
+  EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(fmt::format(
+                              "{} --rps-total 3 --concurrency 4 {}", client_name_, good_test_uri_)),
+                          MalformedArgvException, "must be at least the worker count");
+  // 'auto' is resolved at run time (the process applies the same check).
+  EXPECT_NO_THROW(TestUtility::createOptionsImpl(
+      fmt::format("{} --rps-total 3 --concurrency auto {}", client_name_, good_test_uri_)));
+}
+
+TEST_F(OptionsImplTest, RpsTotalProtoRejectsConflicts) {
+  nighthawk::client::CommandLineOptions both;
+  both.mutable_uri()->set_value(good_test_uri_);
+  both.mutable_requests_per_second()->set_value(10);
+  both.mutable_requests_per_second_total()->set_value(100);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(both), MalformedArgvException,
+                          "mutually exclusive");
+
+  nighthawk::client::CommandLineOptions with_phases;
+  with_phases.mutable_uri()->set_value(good_test_uri_);
+  with_phases.mutable_requests_per_second_total()->set_value(100);
+  nighthawk::client::PhaseSpec* phase = with_phases.add_phases();
+  phase->set_name("warm");
+  phase->mutable_duration()->set_seconds(2);
+  phase->set_requests_per_second(10);
+  EXPECT_THROW_WITH_REGEX((void)std::make_unique<OptionsImpl>(with_phases), MalformedArgvException,
+                          "phases and requests_per_second_total");
+
+  nighthawk::client::CommandLineOptions zero;
+  zero.mutable_uri()->set_value(good_test_uri_);
+  zero.mutable_requests_per_second_total()->set_value(0);
+  EXPECT_THROW((void)std::make_unique<OptionsImpl>(zero), MalformedArgvException);
+}
+
 } // namespace Client
 } // namespace Nighthawk

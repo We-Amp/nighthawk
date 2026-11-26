@@ -34,6 +34,10 @@ public:
   virtual ~Options() = default;
 
   virtual uint32_t requestsPerSecond() const PURE;
+  // FORK-ONLY (We-Amp): the run-total rate (--rps-total). When set, the
+  // workers divide it (remainder to the lowest worker indexes) and
+  // requestsPerSecond() is not used for pacing.
+  virtual std::optional<uint32_t> requestsPerSecondTotal() const PURE;
   virtual uint32_t connections() const PURE;
   virtual std::chrono::seconds duration() const PURE;
   virtual std::chrono::seconds timeout() const PURE;

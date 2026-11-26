@@ -157,7 +157,7 @@ message PhaseSpec {
 
 // TODO(oschaaf): Ultimately this will be a load test specification. The fact that it
 // can arrive via CLI is just a concrete detail. Change this to reflect that.
-// Next unused number is 122. (Field 911 is reserved FORK-ONLY (We-Amp): see
+// Next unused number is 123. (Field 911 is reserved FORK-ONLY (We-Amp): see
 // the live_streaming field below.)
 message CommandLineOptions {
   // The target requests-per-second rate. Default: 5.
@@ -372,6 +372,17 @@ message CommandLineOptions {
   // or more entries turn the run into a multi-phase run. Mutually exclusive
   // with the top-level duration and concurrency options.
   repeated nighthawk.client.PhaseSpec phases = 121;
+
+  // FORK-ONLY (We-Amp): rebase check - field number 122 is a fork addition to
+  // this shared file, upstream-shaped like field 121. The target
+  // requests-per-second rate for the whole run, divided across the workers:
+  // each worker paces total / workers, and the remainder goes one request per
+  // second each to the lowest worker indexes (the rule the phase path uses for
+  // PhaseSpec.requests_per_second). Mutually exclusive with
+  // requests_per_second and with phases (a phase's rps is already a run
+  // total). The worker count must not exceed this value.
+  google.protobuf.UInt32Value requests_per_second_total = 122
+      [(validate.rules).uint32 = {gte: 1}];
 
   // FORK-ONLY (We-Amp): rebase check - field number 911 is fork-specific and
   // free upstream. Presence of this message opts a run in to live snapshot

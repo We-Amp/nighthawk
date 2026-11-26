@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "nighthawk/client/options.h"
 #include "nighthawk/common/exception.h"
@@ -33,6 +34,10 @@ public:
   Client::CommandLineOptionsPtr toCommandLineOptions() const override;
 
   uint32_t requestsPerSecond() const override { return requests_per_second_; }
+  // FORK-ONLY (We-Amp): --rps-total.
+  std::optional<uint32_t> requestsPerSecondTotal() const override {
+    return requests_per_second_total_;
+  }
   uint32_t connections() const override { return connections_; }
   std::chrono::seconds duration() const override { return std::chrono::seconds(duration_); }
   std::chrono::seconds timeout() const override { return std::chrono::seconds(timeout_); }
@@ -147,6 +152,9 @@ private:
   Client::CommandLineOptionsPtr toCommandLineOptionsInternal() const;
 
   uint32_t requests_per_second_{5};
+  // FORK-ONLY (We-Amp): the run-total rate; unset unless --rps-total (or the
+  // proto's requests_per_second_total) is given.
+  std::optional<uint32_t> requests_per_second_total_;
   uint32_t connections_{100};
   uint32_t duration_{5};
   uint32_t timeout_{30};
@@ -184,6 +192,14 @@ private:
    * maximum request body size.
    */
   static std::string readRequestBodyFile(const std::string& path);
+
+  /**
+   * FORK-ONLY (We-Amp): parses the --phases value, a JSON array of PhaseSpec objects in proto
+   * JSON form (field names as in api/client/options.proto, e.g.
+   * [{"name":"warm","duration":"5s","requests_per_second":1800,"concurrency":"16"}, ...]).
+   * @throws MalformedArgvException when the value is not such an array.
+   */
+  static std::vector<nighthawk::client::PhaseSpec> parsePhasesJson(const std::string& json);
   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context_;
   std::optional<envoy::config::core::v3::BindConfig> upstream_bind_config_;
   std::optional<envoy::config::core::v3::TransportSocket> transport_socket_;

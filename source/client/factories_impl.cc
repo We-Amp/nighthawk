@@ -120,6 +120,10 @@ SequencerPtr SequencerFactoryImpl::create(
     const Options* options_for_plugin = &options_;
     if (requests_per_second_override.has_value()) {
       auto command_line = options_.toCommandLineOptions();
+      // FORK-ONLY (We-Amp): the override is this worker's share of a
+      // --rps-total run (or of a phase's total); the total and the per-worker
+      // rate are mutually exclusive, so the copy carries only the share.
+      command_line->clear_requests_per_second_total();
       command_line->mutable_requests_per_second()->set_value(*requests_per_second_override);
       plugin_options_storage = std::make_unique<OptionsImpl>(*command_line);
       options_for_plugin = plugin_options_storage.get();
@@ -286,9 +290,11 @@ RequestSourceFactoryImpl::create(const Envoy::Upstream::ClusterManagerPtr& clust
     RELEASE_ASSERT(!service_cluster_name.empty(), "expected cluster name to be set");
     // We pass in options_.requestsPerSecond() as the header buffer length so the grpc client
     // will shoot for maintaining an amount of headers of at least one second.
-    return std::make_unique<RemoteRequestSourceImpl>(cluster_manager, dispatcher, scope,
-                                                     service_cluster_name, std::move(header),
-                                                     options_.requestsPerSecond());
+    // FORK-ONLY (We-Amp): with --rps-total the per-worker flag is unused; the
+    // total is an upper bound on any one worker's share.
+    return std::make_unique<RemoteRequestSourceImpl>(
+        cluster_manager, dispatcher, scope, service_cluster_name, std::move(header),
+        options_.requestsPerSecondTotal().value_or(options_.requestsPerSecond()));
   } else if (options_.requestSourcePluginConfig().has_value()) {
     absl::StatusOr<RequestSourcePtr> plugin_or = LoadRequestSourcePlugin(
         options_.requestSourcePluginConfig().value(), api_, std::move(header));

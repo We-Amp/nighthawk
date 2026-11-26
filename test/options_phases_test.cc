@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "fmt/format.h"
@@ -266,6 +267,83 @@ TEST(OptionsPhasesTest, PureValidationEntry) {
   const absl::Status status = validatePhaseVector(conflict);
   EXPECT_FALSE(status.ok());
   EXPECT_THAT(std::string(status.message()), testing::HasSubstr("mutually exclusive"));
+}
+
+// --- N2: the phase vector on the CLI (--phases) ---------------------------
+
+// The canonical warm-then-measure vector, in proto JSON form.
+constexpr char kWarmMeasureJson[] =
+    R"json([{"name":"warm","duration":"5s","requests_per_second":1800,"concurrency":"16"},)json"
+    R"json({"name":"measure","duration":"20s","requests_per_second":1800,"concurrency":"16",)json"
+    R"json("connections":32}])json";
+
+// --phases parses the JSON vector into the same PhaseSpec entries the proto
+// path carries, and the serialized options re-parse to the same run.
+TEST(OptionsPhasesTest, CliPhasesFlagParsesVector) {
+  std::unique_ptr<OptionsImpl> options = TestUtility::createOptionsImpl(std::vector<const char*>{
+      "nighthawk_client", "--phases", kWarmMeasureJson, "http://127.0.0.1/"});
+  ASSERT_TRUE(options->hasPhaseVector());
+  ASSERT_EQ(2, options->phases().size());
+  EXPECT_EQ("warm", options->phases()[0].name());
+  EXPECT_EQ(5, options->phases()[0].duration().seconds());
+  EXPECT_EQ(1800, options->phases()[0].requests_per_second());
+  EXPECT_EQ("16", options->phases()[0].concurrency().value());
+  EXPECT_FALSE(options->phases()[0].has_connections());
+  EXPECT_EQ("measure", options->phases()[1].name());
+  EXPECT_EQ(20, options->phases()[1].duration().seconds());
+  EXPECT_EQ(32, options->phases()[1].connections().value());
+
+  CommandLineOptionsPtr cmd = options->toCommandLineOptions();
+  ASSERT_EQ(2, cmd->phases_size());
+  // The vector replaces the top-level duration and concurrency.
+  EXPECT_FALSE(cmd->has_duration());
+  EXPECT_FALSE(cmd->has_concurrency());
+  OptionsImpl round_trip(*cmd);
+  ASSERT_EQ(2, round_trip.phases().size());
+  EXPECT_EQ("measure", round_trip.phases()[1].name());
+}
+
+// The CLI conflicts fail naming both flags; nothing is silently ignored.
+TEST(OptionsPhasesTest, CliPhasesFlagRejectsConflictingFlags) {
+  const std::vector<std::pair<std::vector<const char*>, std::string>> cases = {
+      {{"--duration", "5"}, "--phases and --duration are mutually exclusive"},
+      {{"--no-duration"}, "--phases and --no-duration are mutually exclusive"},
+      {{"--concurrency", "4"}, "--phases and --concurrency are mutually exclusive"},
+      {{"--rps", "100"}, "--phases and --rps are mutually exclusive"},
+      {{"--rps-total", "100"}, "--phases and --rps-total are mutually exclusive"},
+  };
+  for (const auto& [extra, message] : cases) {
+    std::vector<const char*> argv{"nighthawk_client", "--phases", kWarmMeasureJson};
+    argv.insert(argv.end(), extra.begin(), extra.end());
+    argv.push_back("http://127.0.0.1/");
+    EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(argv), MalformedArgvException, message);
+  }
+}
+
+// Malformed JSON, an empty array, unknown fields and a vector failing the
+// shared per-phase rules are all refused (the per-phase errors name the
+// offending phase index, exactly like the proto path).
+TEST(OptionsPhasesTest, CliPhasesFlagRejectsMalformedVectors) {
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"not json", "Invalid value for --phases"},
+      {R"json({"name":"warm"})json", "Invalid value for --phases"},
+      {"[]", "--phases must declare at least one phase"},
+      {R"json([{"name":"warm","duration":"5s","requests_per_second":10,"protocol":"h2"}])json",
+       "Invalid value for --phases"},
+      {R"json([{"name":"warm","duration":"0s","requests_per_second":10}])json",
+       "phase\\[0\\].*duration"},
+      {R"json([{"name":"a","duration":"2s","requests_per_second":10},)json"
+       R"json({"name":"a","duration":"2s","requests_per_second":10}])json",
+       "phase\\[1\\].*duplicate"},
+      {R"json([{"name":"warm","duration":"2s","requests_per_second":10,"concurrency":"auto"}])json",
+       "phase\\[0\\].*concurrency"},
+  };
+  for (const auto& [json, message] : cases) {
+    SCOPED_TRACE(json);
+    const std::vector<const char*> argv{"nighthawk_client", "--phases", json.c_str(),
+                                        "http://127.0.0.1/"};
+    EXPECT_THROW_WITH_REGEX(TestUtility::createOptionsImpl(argv), MalformedArgvException, message);
+  }
 }
 
 } // namespace Client

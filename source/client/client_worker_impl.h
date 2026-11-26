@@ -4,6 +4,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "api/client/live.pb.h"
@@ -116,7 +117,13 @@ public:
                    // bend (M3 Task 6's staging-failure path).
                    std::function<void(uint32_t phase_index, Nighthawk::LiveTunableRateLimiter*,
                                       Nighthawk::LiveApplyFn, std::function<void()>)>
-                       live_capability_cb = {});
+                       live_capability_cb = {},
+                   // FORK-ONLY (We-Amp): a legacy (vector-less) run's pacing
+                   // rate for THIS worker, when it is not the top-level
+                   // per-worker flag: the worker's share of --rps-total.
+                   // Ignored by phase-driven runs (each phase carries its
+                   // own divided rate).
+                   std::optional<uint32_t> legacy_requests_per_second = std::nullopt);
   StatisticPtrMap statistics() const override;
 
   const std::map<std::string, uint64_t>& threadLocalCounterValues() override {
