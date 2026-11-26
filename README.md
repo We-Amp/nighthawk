@@ -166,8 +166,8 @@ bazel-bin/nighthawk_client  [--user-defined-plugin-config <string>] ...
 [--latency-response-header-name <string>]
 [--stats-flush-interval-duration <duration>]
 [--stats-flush-interval <uint32_t>]
-[--stats-sinks <string>] ... [--no-duration]
-[--simple-warmup]
+[--stats-sinks <string>] ... [--phases
+<string>] [--no-duration] [--simple-warmup]
 [--rate-limiter-plugin-config <string>]
 [--request-source-plugin-config <string>]
 [--request-source <uri format>] [--label
@@ -245,6 +245,27 @@ argument is intended to be specified multiple times. Example (json):
 ,typed_config:{"@type":"type.googleapis.com/envoy.config.metrics.v3.St
 atsdSink",address:{socket_address:{address:"127.0.0.1"
 ,port_value:8125}}}}
+
+--phases <string>
+Run several phases in one process, as a JSON array of PhaseSpec
+objects in proto JSON form. Each phase declares name (unique),
+duration (>= 1s), requests_per_second (the phase's total, divided
+across the phase's workers; the remainder goes one request per second
+each to the lowest worker indexes) and optionally concurrency (a
+positive integer, as a string), connections, max_pending_requests and
+max_active_requests. A phase without concurrency uses all workers (the
+maximum declared over the phases); if no phase declares concurrency,
+the run uses one worker. Connections are kept across phase boundaries;
+a phase whose concurrency exceeds every earlier phase's starts the
+extra workers cold (new connections). For HTTP/1, use
+--prefetch-connections so the first phase opens the full connection
+set. The output gains one result per phase (its own histograms) and
+per-phase metadata (requests initiated and completed, boundary drain
+times) in the json/yaml formats. Mutually exclusive with --duration,
+--no-duration, --concurrency and --rps. Example: [{"name":"warm"
+,"duration":"5s","requests_per_second":1000,"concurrency":"4"}
+,{"name":"measure","duration":"20s","requests_per_second":1000
+,"concurrency":"4"}]
 
 --no-duration
 Request infinite execution. Note that the default failure predicates
